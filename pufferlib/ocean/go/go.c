@@ -10,7 +10,10 @@ void demo(int grid_size) {
         .board_height = 64*(grid_size+1),
         .grid_square_size = 64,
         .moves_made = 0,
-        .komi = 7.5
+        .komi = 7.5,
+	.reward_move_pass = -0.25,
+	.reward_move_invalid = -0.1,
+	.reward_move_valid = 0.1
     };
     allocate(&env);
     reset(&env);
@@ -65,12 +68,15 @@ void performance_test() {
     CGo env = {
         .width = 1000,
         .height = 800,
-        .grid_size = 9,
+        .grid_size = 19,
         .board_width = 600,
         .board_height = 600,
         .grid_square_size = 600/9,
         .moves_made = 0,
-        .komi = 7.5
+        .komi = 7.5,
+	.reward_move_pass = -0.25,
+	.reward_move_invalid = -0.1,
+	.reward_move_valid = 0.1
     };
     allocate(&env);
     reset(&env);
@@ -88,7 +94,7 @@ void performance_test() {
 }
 
 int main() {
-    demo(9);
-    // performance_test();
+    //demo(9);
+    performance_test();
     return 0;
 }
