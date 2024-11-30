@@ -139,6 +139,8 @@ struct CGo {
     float reward_move_pass;
     float reward_move_invalid;
     float reward_move_valid;
+    float reward_player_capture;
+    float reward_opponent_capture;
 };
 
 void generate_board_positions(CGo* env) {
@@ -349,11 +351,11 @@ void capture_group(CGo* env, int* board, int root, int* affected_groups, int* af
         board[pos] = 0;  // Remove stone
         env->capture_count[capturing_player - 1]++;  // Update capturing player's count
 	if(capturing_player-1 == 0){
-		env->rewards[0]=0.25;
-		env->log.episode_return +=0.25;
+		env->rewards[0] += env->reward_player_capture;
+		env->log.episode_return += env->reward_player_capture;
 	} else{
-		env->rewards[0]= -0.25;
-		env->log.episode_return -=0.25;
+		env->rewards[0] += env->reward_opponent_capture;
+		env->log.episode_return += env->reward_opponent_capture;
 	}
         int x = pos % (env->grid_size);
         int y = pos / (env->grid_size);
@@ -690,8 +692,8 @@ void step(CGo* env) {
          return;
     }
     if(action == NOOP){
-        env->rewards[0] = env->reward_move_pass / max_moves;
-        env->log.episode_return += env->reward_move_pass / max_moves;
+        env->rewards[0] = env->reward_move_pass;
+        env->log.episode_return += env->reward_move_pass;
         enemy_greedy_hard(env);
         if (env->dones[0] == 1) {
             end_game(env);
@@ -704,13 +706,13 @@ void step(CGo* env) {
         memcpy(env->previous_board_state, env->board_states, sizeof(int) * (env->grid_size) * (env->grid_size));
         if(make_move(env, action-1, 1)) {
             env->moves_made++;
-            env->rewards[0] += env->reward_move_valid / max_moves;
-            env->log.episode_return += env->reward_move_valid / max_moves;
+            env->rewards[0] = env->reward_move_valid;
+            env->log.episode_return += env->reward_move_valid;
             enemy_greedy_hard(env);
 
         } else {
-            env->rewards[0] = env->reward_move_invalid / max_moves;
-            env->log.episode_return += env->reward_move_invalid / max_moves;
+            env->rewards[0] = env->reward_move_invalid;
+            env->log.episode_return += env->reward_move_invalid;
         }
         compute_observations(env);
     }
@@ -719,10 +721,18 @@ void step(CGo* env) {
         env->dones[0] = 1;
     }
 
+    if(env->rewards[0] > 1){
+	    env->rewards[0] = 1;
+    } 
+    if(env->rewards[0] < -1){
+	    env->rewards[0] = -1;
+    }
+
     if (env->dones[0] == 1) {
         end_game(env);
         return;
     }
+    
     compute_observations(env);
 }
 

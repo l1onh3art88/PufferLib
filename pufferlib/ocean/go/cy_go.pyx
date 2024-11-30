@@ -61,6 +61,8 @@ cdef extern from "go.h":
         float reward_move_pass
         float reward_move_invalid
         float reward_move_valid
+        float reward_player_capture
+        float reward_opponent_capture
 
     ctypedef struct Client
 
@@ -85,7 +87,7 @@ cdef class CyGo:
             int width, int height, int grid_size, int board_width, int board_height,
             int grid_square_size, int moves_made, float komi,
             float score, int last_capture_position, float reward_move_pass,
-            float reward_move_invalid, float reward_move_valid ):
+            float reward_move_invalid, float reward_move_valid, float reward_player_capture,  float reward_opponent_capture ):
 
         self.num_envs = num_envs
         self.client = NULL
