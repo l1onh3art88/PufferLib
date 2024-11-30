@@ -14,7 +14,7 @@ from pufferlib.ocean.go.cy_go import CyGo
 class Go(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, report_interval=1,
             width=1200, height=800,
-            grid_size=9,
+            grid_size=7,
             board_width=600, board_height=600,
             grid_square_size=600/9,
             moves_made=0,
@@ -52,7 +52,6 @@ class Go(pufferlib.PufferEnv):
         self.actions[:] = actions
         self.c_envs.step()
         self.tick += 1
-
         info = []
         if self.tick % self.report_interval == 0:
             log = self.c_envs.log()

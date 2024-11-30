@@ -68,7 +68,7 @@ void performance_test() {
     CGo env = {
         .width = 1000,
         .height = 800,
-        .grid_size = 19,
+        .grid_size = 9,
         .board_width = 600,
         .board_height = 600,
         .grid_square_size = 600/9,

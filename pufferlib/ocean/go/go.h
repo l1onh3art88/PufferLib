@@ -317,7 +317,6 @@ void compute_score_tromp_taylor(CGo* env) {
     }
     
     env->score = (float)player_score - (float)opponent_score - env->komi;
-    printf("Score: %f\n", env->score);
 }
 
 int find_in_group(int* group, int group_size, int value) {
@@ -349,7 +348,13 @@ void capture_group(CGo* env, int* board, int root, int* affected_groups, int* af
         int pos = queue[front++];
         board[pos] = 0;  // Remove stone
         env->capture_count[capturing_player - 1]++;  // Update capturing player's count
-
+	if(capturing_player-1 == 0){
+		env->rewards[0]=0.25;
+		env->log.episode_return +=0.25;
+	} else{
+		env->rewards[0]= -0.25;
+		env->log.episode_return -=0.25;
+	}
         int x = pos % (env->grid_size);
         int y = pos / (env->grid_size);
 
@@ -665,7 +670,6 @@ void end_game(CGo* env){
         env->rewards[0] = 0.0;
 	    env->log.winrate = 0.0;
     }
-    printf("winrate: %f\n", env->log.winrate);
     env->log.score = env->score;
     env->log.games_played++;
     env->log.episode_return += env->rewards[0];
@@ -678,15 +682,16 @@ void step(CGo* env) {
     env->rewards[0] = 0.0;
     int action = (int)env->actions[0];
     // useful for training , can prob be a hyper param. Recommend to increase with larger board size
-    if (env->log.episode_length > (3 * env->grid_size * env->grid_size)) {
+    float max_moves = 3 * env->grid_size * env->grid_size;
+    if (env->log.episode_length > max_moves) {
          env->dones[0] = 1;
          end_game(env);
          compute_observations(env);
          return;
     }
     if(action == NOOP){
-        env->rewards[0] -= env->reward_move_pass;
-        env->log.episode_return -= env->reward_move_pass;
+        env->rewards[0] = env->reward_move_pass / max_moves;
+        env->log.episode_return += env->reward_move_pass / max_moves;
         enemy_greedy_hard(env);
         if (env->dones[0] == 1) {
             end_game(env);
@@ -699,13 +704,13 @@ void step(CGo* env) {
         memcpy(env->previous_board_state, env->board_states, sizeof(int) * (env->grid_size) * (env->grid_size));
         if(make_move(env, action-1, 1)) {
             env->moves_made++;
-            env->rewards[0] += env->reward_move_valid;
-            env->log.episode_return += env->reward_move_valid;
+            env->rewards[0] += env->reward_move_valid / max_moves;
+            env->log.episode_return += env->reward_move_valid / max_moves;
             enemy_greedy_hard(env);
 
         } else {
-            env->rewards[0] -= env->reward_move_invalid;
-            env->log.episode_return -= env->reward_move_invalid;
+            env->rewards[0] = env->reward_move_invalid / max_moves;
+            env->log.episode_return += env->reward_move_invalid / max_moves;
         }
         compute_observations(env);
     }
