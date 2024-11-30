@@ -247,50 +247,77 @@ void flood_fill(CGo* env, int x, int y, int* territory, int player) {
 void compute_score_tromp_taylor(CGo* env) {
     int player_score = 0;
     int opponent_score = 0;
-    int territory[3] = {0, 0, 0}; // [neutral, player, opponent]
     reset_visited(env);
-    // Count stones and mark them as visited
-    for (int i = 0; i < (env->grid_size) * (env->grid_size); i++) {
-        env->visited[i] = 0;
+    
+    // Queue for BFS
+    int queue_size = (env->grid_size) * (env->grid_size);
+    int queue[queue_size];
+    
+    // First count stones
+    for (int i = 0; i < queue_size; i++) {
         if (env->board_states[i] == 1) {
             player_score++;
-            env->visited[i] = 1;
         } else if (env->board_states[i] == 2) {
             opponent_score++;
-            env->visited[i] = 1;
         }
     }
-    for (int pos = 0; pos < (env->grid_size) * (env->grid_size); pos++) {
-        int x = pos % (env->grid_size);
-        int y = pos / (env->grid_size);
-        if (env->visited[pos]) {
+    
+    // Then process empty territories
+    for (int start_pos = 0; start_pos < queue_size; start_pos++) {
+        // Skip if not empty or already visited
+        if (env->board_states[start_pos] != 0 || env->visited[start_pos]) {
             continue;
         }
-        int player = 0; // Start as neutral
-        // Check adjacent positions to determine territory owner
-        for (int i = 0; i < 4; i++) {
-            int nx = x + DIRECTIONS[i][0];
-            int ny = y + DIRECTIONS[i][1];
-            if (!is_valid_position(env, nx, ny)) {
-                continue;
-            }
-            int npos = ny * (env->grid_size) + nx;
-            if (env->board_states[npos] == 0) {
-                continue;
-            }
-            if (player == 0) {
-                player = env->board_states[npos];
-            } else if (player != env->board_states[npos]) {
-                player = 0; // Neutral if bordered by both players
-                break;
+        
+        // Initialize BFS
+        int front = 0, rear = 0;
+        int territory_size = 0;
+        int bordering_player = 0;  // 0=neutral, 1=player1, 2=player2, 3=mixed
+        
+        queue[rear++] = start_pos;
+        env->visited[start_pos] = 1;
+        
+        // Process connected empty points
+        while (front < rear) {
+            int pos = queue[front++];
+            territory_size++;
+            int x = pos % env->grid_size;
+            int y = pos / env->grid_size;
+            
+            // Check all adjacent positions
+            for (int i = 0; i < 4; i++) {
+                int nx = x + DIRECTIONS[i][0];
+                int ny = y + DIRECTIONS[i][1];
+                
+                if (!is_valid_position(env, nx, ny)) {
+                    continue;
+                }
+                
+                int npos = ny * env->grid_size + nx;
+                
+                if (env->board_states[npos] == 0 && !env->visited[npos]) {
+                    // Add unvisited empty points to queue
+                    queue[rear++] = npos;
+                    env->visited[npos] = 1;
+                } else if (bordering_player == 0) {
+                    bordering_player = env->board_states[npos];
+                } else if (bordering_player != env->board_states[npos]) {
+                    bordering_player = 3;  // Mixed territory
+                }
             }
         }
-        flood_fill(env, x, y, territory, player);
+        
+        // Assign territory points
+        if (bordering_player == 1) {
+            player_score += territory_size;
+        } else if (bordering_player == 2) {
+            opponent_score += territory_size;
+        }
+        // Mixed territories (bordering_player == 3) are neutral and not counted
     }
-    // Calculate final scores
-    player_score += territory[1];
-    opponent_score += territory[2];
+    
     env->score = (float)player_score - (float)opponent_score - env->komi;
+    printf("Score: %f\n", env->score);
 }
 
 int find_in_group(int* group, int group_size, int value) {
@@ -628,16 +655,17 @@ void end_game(CGo* env){
     compute_score_tromp_taylor(env);
     if (env->score > 0) {
         env->rewards[0] = 1.0 ;
-	env->log.winrate = 1.0;
+	    env->log.winrate = 1.0;
     }
     else if (env->score < 0) {
         env->rewards[0] = -1.0;
-	env->log.winrate = -1.0;
+	    env->log.winrate = -1.0;
     }
     else {
         env->rewards[0] = 0.0;
-	env->log.winrate = 0.0;
+	    env->log.winrate = 0.0;
     }
+    printf("winrate: %f\n", env->log.winrate);
     env->log.score = env->score;
     env->log.games_played++;
     env->log.episode_return += env->rewards[0];
