@@ -179,7 +179,7 @@ void init(CGo* env) {
 
 void allocate(CGo* env) {
     init(env);
-    env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*2 + 3, sizeof(float));
+    env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*2 + 1, sizeof(float));
     env->actions = (int*)calloc(1, sizeof(int));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->dones = (unsigned char*)calloc(1, sizeof(unsigned char));
@@ -715,10 +715,6 @@ void step(CGo* env) {
             env->log.episode_return += env->reward_move_invalid;
         }
         compute_observations(env);
-    }
-
-    if (env->moves_made >= (env->grid_size)*(env->grid_size)*2) {        
-        env->dones[0] = 1;
     }
 
     if(env->rewards[0] > 1){

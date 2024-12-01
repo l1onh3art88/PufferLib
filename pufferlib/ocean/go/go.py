@@ -33,7 +33,7 @@ class Go(pufferlib.PufferEnv):
         self.render_mode = render_mode
         self.report_interval = report_interval
         
-        self.num_obs = (grid_size) * (grid_size)*2 + 3
+        self.num_obs = (grid_size) * (grid_size)*2 + 1
         self.num_act = (grid_size) * (grid_size) + 1
         self.single_observation_space = gymnasium.spaces.Box(low=0, high=1,
             shape=(self.num_obs,), dtype=np.float32)

@@ -6,8 +6,9 @@ from functools import partial
 import pufferlib.models
 
 from pufferlib.models import Default as Policy
+from pufferlib.models import Convolutional as Conv
 Recurrent = pufferlib.models.LSTMWrapper
-
+import numpy as np
 class Snake(nn.Module):
     def __init__(self, env, cnn_channels=32, hidden_size=128, **kwargs):
         super().__init__()
@@ -98,6 +99,55 @@ class Grid(nn.Module):
             action = self.actor(flat_hidden).split(3, dim=1)
             return action, value
 
+class Go(nn.Module):
+    def __init__(self, env, cnn_channels=128, hidden_size=128, **kwargs):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(2, cnn_channels, 3, stride=1)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(
+                nn.Conv2d(cnn_channels, cnn_channels, 3, stride = 1)),
+            nn.Flatten(),
+        )
+        
+        self.flat = pufferlib.pytorch.layer_init(nn.Linear(1,32))
+
+        cnn_flat_size = cnn_channels * 2 * 2
+
+        self.proj = pufferlib.pytorch.layer_init(nn.Linear(cnn_flat_size + 32, hidden_size))
+
+        self.actor = pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
+
+        self.value_fn = pufferlib.pytorch.layer_init(
+                nn.Linear(hidden_size, 1), std=1)
+   
+    def forward(self, observations):
+        hidden, lookup = self.encode_observations(observations)
+        actions, value = self.decode_actions(hidden, lookup)
+        return actions, value
+
+    def encode_observations(self, observations):
+        grid_size = int(np.sqrt((observations.shape[1] - 1) / 2))
+        board_features = observations[:,:-1].view(-1,2,grid_size,grid_size).float()
+        flat_feature = observations[:, -1].unsqueeze(1).float()
+
+        # Pass board through cnn
+        cnn_features = self.cnn(board_features)
+        # Pass extra feature
+        flat_features = self.flat(flat_feature)
+        # Combine features
+        features = torch.cat([cnn_features, flat_features], dim=1)
+        features = F.relu(self.proj(features))
+
+        return features, None
+
+    def decode_actions(self, flat_hidden, lookup, concat=None):
+        value = self.value_fn(flat_hidden)
+        action = self.actor(flat_hidden)
+        return action, value
+    
 class MOBA(nn.Module):
     def __init__(self, env, cnn_channels=128, hidden_size=128, **kwargs):
         super().__init__()
