@@ -210,11 +210,21 @@ void free_allocated(CGo* env) {
 void compute_observations(CGo* env) {
     int observation_indx=0;
     for (int i = 0; i < (env->grid_size)*(env->grid_size); i++) {
-        env->observations[observation_indx] = (float)env->board_states[i];
+	if(env->board_states[i] ==1 ){
+		env->observations[observation_indx] = 1.0;
+	}	
+	else {
+		env->observations[observation_indx] = 0.0;
+	}
         observation_indx++;
     }
     for (int i = 0; i < (env->grid_size)*(env->grid_size); i++) {
-        env->observations[observation_indx] = (float)env->previous_board_state[i];
+	if(env->board_states[i] ==2 ){
+		env->observations[observation_indx] = 1.0;
+	}	
+	else {
+		env->observations[observation_indx] = 0.0;
+	}
         observation_indx++;
     }
     env->observations[observation_indx] = env->score;

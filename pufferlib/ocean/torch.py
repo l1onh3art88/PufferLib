@@ -107,7 +107,7 @@ class Go(nn.Module):
         # boards = current, previous
         self.cnn = nn.Sequential(
             pufferlib.pytorch.layer_init(
-                nn.Conv2d(3*2, cnn_channels, 3, stride=1)),
+                nn.Conv2d(2, cnn_channels, 3, stride=1)),
             nn.ReLU(),
             pufferlib.pytorch.layer_init(
                 nn.Conv2d(cnn_channels, cnn_channels, 3, stride = 1)),
@@ -136,14 +136,12 @@ class Go(nn.Module):
 
     def encode_observations(self, observations):
         grid_size = int(np.sqrt((observations.shape[1] - 1) / 2))
-        #print(grid_size)
-        current_board = observations[:, :grid_size*grid_size].view(-1, grid_size,grid_size).long()
-        previous_board = observations[:, grid_size*grid_size:-1].view(-1, grid_size, grid_size).long()
-
-        current_board = F.one_hot(current_board, 3).permute(0,3,1,2).float()
-        previous_board = F.one_hot(previous_board,3).permute(0,3,1,2).float()
-
-        board_features = torch.cat([current_board, previous_board],dim=1)
+        full_board = grid_size * grid_size
+        
+        black_board = observations[:, :full_board].view(-1,1, grid_size,grid_size).float()
+        white_board = observations[:, full_board:-1].view(-1,1, grid_size, grid_size).float()
+        
+        board_features = torch.cat([black_board, white_board],dim=1)
 
         flat_feature = observations[:, -1].unsqueeze(1).float()
 
