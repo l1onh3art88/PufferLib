@@ -227,7 +227,8 @@ void compute_observations(CGo* env) {
 	}
         observation_indx++;
     }
-    env->observations[observation_indx] = env->score;
+    env->observations[observation_indx] = env->capture_count[0];
+    env->observations[observation_indx+1] = env->capture_count[0];
 
 }
 

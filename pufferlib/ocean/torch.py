@@ -115,11 +115,11 @@ class Go(nn.Module):
         )
 
         obs_size = env.single_observation_space.shape[0]
-        self.grid_size = int(np.sqrt((obs_size-1)/2))
+        self.grid_size = int(np.sqrt((obs_size-2)/2))
         output_size = self.grid_size - 4
         cnn_flat_size = cnn_channels * output_size * output_size
         
-        self.flat = pufferlib.pytorch.layer_init(nn.Linear(1,32))
+        self.flat = pufferlib.pytorch.layer_init(nn.Linear(2,32))
         
         self.proj = pufferlib.pytorch.layer_init(nn.Linear(cnn_flat_size + 32, hidden_size))
 
@@ -135,20 +135,22 @@ class Go(nn.Module):
         return actions, value
 
     def encode_observations(self, observations):
-        grid_size = int(np.sqrt((observations.shape[1] - 1) / 2))
+        print(observations.shape)
+        grid_size = int(np.sqrt((observations.shape[1] - 2) / 2))
         full_board = grid_size * grid_size
-        
+        print(grid_size)
         black_board = observations[:, :full_board].view(-1,1, grid_size,grid_size).float()
-        white_board = observations[:, full_board:-1].view(-1,1, grid_size, grid_size).float()
+        white_board = observations[:, full_board:-2].view(-1,1, grid_size, grid_size).float()
         
         board_features = torch.cat([black_board, white_board],dim=1)
 
-        flat_feature = observations[:, -1].unsqueeze(1).float()
-
+        flat_feature1 = observations[:, -2].unsqueeze(1).float()
+        flat_feature2 = observations[:, -1].unsqueeze(1).float()
         # Pass board through cnn
         cnn_features = self.cnn(board_features)
         # Pass extra feature
-        flat_features = self.flat(flat_feature)
+        flat_features = torch.cat([flat_feature1, flat_feature2],dim=1)
+        flat_features = self.flat(flat_features)
         # Combine features
         features = torch.cat([cnn_features, flat_features], dim=1)
         features = F.relu(self.proj(features))

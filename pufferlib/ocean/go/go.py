@@ -33,7 +33,7 @@ class Go(pufferlib.PufferEnv):
         self.render_mode = render_mode
         self.report_interval = report_interval
         
-        self.num_obs = (grid_size) * (grid_size)*2 + 1
+        self.num_obs = (grid_size) * (grid_size)*2 + 2
         self.num_act = (grid_size) * (grid_size) + 1
         self.single_observation_space = gymnasium.spaces.Box(low=0, high=1,
             shape=(self.num_obs,), dtype=np.float32)
@@ -54,6 +54,7 @@ class Go(pufferlib.PufferEnv):
         self.actions[:] = actions
         self.c_envs.step()
         self.tick += 1
+        breakpoint()
         info = []
         if self.tick % self.report_interval == 0:
             log = self.c_envs.log()
