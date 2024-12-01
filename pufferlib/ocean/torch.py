@@ -135,10 +135,8 @@ class Go(nn.Module):
         return actions, value
 
     def encode_observations(self, observations):
-        print(observations.shape)
         grid_size = int(np.sqrt((observations.shape[1] - 2) / 2))
         full_board = grid_size * grid_size
-        print(grid_size)
         black_board = observations[:, :full_board].view(-1,1, grid_size,grid_size).float()
         white_board = observations[:, full_board:-2].view(-1,1, grid_size, grid_size).float()
         
@@ -151,7 +149,7 @@ class Go(nn.Module):
         # Pass extra feature
         flat_features = torch.cat([flat_feature1, flat_feature2],dim=1)
         flat_features = self.flat(flat_features)
-        # Combine features
+        # pass all features
         features = torch.cat([cnn_features, flat_features], dim=1)
         features = F.relu(self.proj(features))
 

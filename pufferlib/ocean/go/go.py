@@ -54,7 +54,6 @@ class Go(pufferlib.PufferEnv):
         self.actions[:] = actions
         self.c_envs.step()
         self.tick += 1
-        breakpoint()
         info = []
         if self.tick % self.report_interval == 0:
             log = self.c_envs.log()
