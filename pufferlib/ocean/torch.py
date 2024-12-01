@@ -110,11 +110,14 @@ class Go(nn.Module):
                 nn.Conv2d(cnn_channels, cnn_channels, 3, stride = 1)),
             nn.Flatten(),
         )
+
+        obs_size = env.single_observation_space.shape[0]
+        self.grid_size = int(np.sqrt((obs_size-1)/2))
+        output_size = self.grid_size - 4
+        cnn_flat_size = cnn_channels * output_size * output_size
         
         self.flat = pufferlib.pytorch.layer_init(nn.Linear(1,32))
-
-        cnn_flat_size = cnn_channels * 2 * 2
-
+        
         self.proj = pufferlib.pytorch.layer_init(nn.Linear(cnn_flat_size + 32, hidden_size))
 
         self.actor = pufferlib.pytorch.layer_init(
@@ -130,6 +133,7 @@ class Go(nn.Module):
 
     def encode_observations(self, observations):
         grid_size = int(np.sqrt((observations.shape[1] - 1) / 2))
+        #print(grid_size)
         board_features = observations[:,:-1].view(-1,2,grid_size,grid_size).float()
         flat_feature = observations[:, -1].unsqueeze(1).float()
 
