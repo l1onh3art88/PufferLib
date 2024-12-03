@@ -100,7 +100,7 @@ class Grid(nn.Module):
             return action, value
 
 class Go(nn.Module):
-    def __init__(self, env, cnn_channels=128, hidden_size=128, **kwargs):
+    def __init__(self, env, cnn_channels=64, hidden_size=128, **kwargs):
         super().__init__()
         # 3 categories 2 boards. 
         # categories = player, opponent, empty
@@ -136,12 +136,10 @@ class Go(nn.Module):
 
     def encode_observations(self, observations):
         grid_size = int(np.sqrt((observations.shape[1] - 2) / 2))
-        full_board = grid_size * grid_size
+        full_board = grid_size * grid_size 
         black_board = observations[:, :full_board].view(-1,1, grid_size,grid_size).float()
         white_board = observations[:, full_board:-2].view(-1,1, grid_size, grid_size).float()
-        
         board_features = torch.cat([black_board, white_board],dim=1)
-
         flat_feature1 = observations[:, -2].unsqueeze(1).float()
         flat_feature2 = observations[:, -1].unsqueeze(1).float()
         # Pass board through cnn
