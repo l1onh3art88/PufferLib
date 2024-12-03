@@ -179,7 +179,7 @@ void init(CGo* env) {
 
 void allocate(CGo* env) {
     init(env);
-    env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*2 + 1, sizeof(float));
+    env->observations = (float*)calloc((env->grid_size)*(env->grid_size)*2 + 2, sizeof(float));
     env->actions = (int*)calloc(1, sizeof(int));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->dones = (unsigned char*)calloc(1, sizeof(unsigned char));
@@ -734,6 +734,7 @@ void step(CGo* env) {
     if(env->rewards[0] < -1){
 	    env->rewards[0] = -1;
     }
+    printf("rewards[0]: %f\n", env->rewards[0]);
 
     if (env->dones[0] == 1) {
         end_game(env);
