@@ -12,9 +12,9 @@ struct GoNet {
     Conv2D* conv2;
     Linear* flat;
     CatDim1* cat;
-    ReLU* relu2;
     Linear* proj;
     ReLU* relu3;
+    LSTM* lstm;
     Linear* actor;
     Linear* value_fn;
 };
@@ -34,10 +34,10 @@ GoNet* init_gonet(Weights* weights, int num_agents, int grid_size) {
     net->conv2 = make_conv2d(weights, num_agents, output_size, output_size, cnn_channels, cnn_channels, 3, 1);
     net->flat = make_linear(weights, num_agents, 2, 32);
     net->cat = make_cat_dim1(num_agents, cnn_flat_size, 32);
-    net->relu2 = make_relu(num_agents, cnn_flat_size + 32);
     net->proj = make_linear(weights, num_agents, cnn_flat_size + 32, hidden_size);
     net->relu3 = make_relu(num_agents, hidden_size);
-    net->actor = make_linear(weights, num_agents, hidden_size, grid_size*grid_size + 1); // Replace with actual action space size
+    net->lstm = make_lstm(weights, num_agents, hidden_size, 128);
+    net->actor = make_linear(weights, num_agents, hidden_size, grid_size*grid_size + 1); // +1 for pass move
     net->value_fn = make_linear(weights, num_agents, hidden_size, 1);
 
     return net;
@@ -51,19 +51,19 @@ void free_gonet(GoNet* net) {
     free(net->conv2);
     free(net->flat);
     free(net->cat);
-    free(net->relu2);
-    free(net->proj);
     free(net->relu3);
+    free(net->proj);
+    free(net->lstm);
     free(net->actor);
     free(net->value_fn);
     free(net);
 }
 
 void forward(GoNet* net, float* observations, int* actions, int grid_size) {
-    int full_board = grid_size * grid_size;
-    
+    int full_board = grid_size * grid_size;    
     // Clear previous observations
     memset(net->obs_2d, 0, net->num_agents * grid_size * grid_size * 2 * sizeof(float));
+    memset(net->obs_1d, 0, net->num_agents * 2 * sizeof(float));
     
     // Reshape observations into 2D boards and additional features
     float (*obs_2d)[2][grid_size][grid_size] = (float (*)[2][grid_size][grid_size])net->obs_2d;
@@ -99,12 +99,12 @@ void forward(GoNet* net, float* observations, int* actions, int grid_size) {
     linear(net->flat, net->obs_1d);
 
     cat_dim1(net->cat, net->conv2->output, net->flat->output);
-    relu(net->relu2, net->cat->output);
-    linear(net->proj, net->relu2->output);
+    linear(net->proj, net->cat->output);
     relu(net->relu3, net->proj->output);
     
-    linear(net->actor, net->relu3->output);
-    linear(net->value_fn, net->relu3->output);
+    lstm(net->lstm, net->relu3->output);
+    linear(net->actor, net->lstm->state_h);
+    linear(net->value_fn, net->lstm->state_h);
 
     // Get action by taking argmax of actor output
     for (int i = 0; i < net->num_agents; i++) {
@@ -118,7 +118,6 @@ void forward(GoNet* net, float* observations, int* actions, int grid_size) {
             }
         }
         actions[i] = max_idx;
-        printf("action[%d]: %d\n", i, actions[i]);
     }
 }
 
@@ -229,7 +228,7 @@ void performance_test() {
 }
 
 int main() {
-    demo(7);
+    demo(6);
     // performance_test();
     return 0;
 }

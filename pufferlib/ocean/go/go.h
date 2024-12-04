@@ -219,12 +219,12 @@ void compute_observations(CGo* env) {
         observation_indx++;
     }
     for (int i = 0; i < (env->grid_size)*(env->grid_size); i++) {
-	if(env->board_states[i] ==2 ){
-		env->observations[observation_indx] = 1.0;
-	}	
-	else {
-		env->observations[observation_indx] = 0.0;
-	}
+        if(env->board_states[i] ==2 ){
+            env->observations[observation_indx] = 1.0;
+        }	
+        else {
+            env->observations[observation_indx] = 0.0;
+        }
         observation_indx++;
     }
     env->observations[observation_indx] = env->capture_count[0];
@@ -734,7 +734,6 @@ void step(CGo* env) {
     if(env->rewards[0] < -1){
 	    env->rewards[0] = -1;
     }
-    printf("rewards[0]: %f\n", env->rewards[0]);
 
     if (env->dones[0] == 1) {
         end_game(env);
