@@ -17,11 +17,13 @@ struct GoNet {
     LSTM* lstm;
     Linear* actor;
     Linear* value_fn;
+    Multidiscrete* multidiscrete;
 };
 GoNet* init_gonet(Weights* weights, int num_agents, int grid_size) {
     GoNet* net = calloc(1, sizeof(GoNet));
     int hidden_size = 128;
     int cnn_channels = 64;
+    int conv1_output_size = grid_size - 2;
     int output_size = grid_size - 4;
     int cnn_flat_size = cnn_channels * output_size * output_size;
 
@@ -30,16 +32,17 @@ GoNet* init_gonet(Weights* weights, int num_agents, int grid_size) {
     net->obs_1d = calloc(num_agents * 2, sizeof(float)); // 2 additional features
 
     net->conv1 = make_conv2d(weights, num_agents, grid_size, grid_size, 2, cnn_channels, 3, 1);
-    net->relu1 = make_relu(num_agents, cnn_channels * output_size * output_size);
-    net->conv2 = make_conv2d(weights, num_agents, output_size, output_size, cnn_channels, cnn_channels, 3, 1);
+    net->relu1 = make_relu(num_agents, cnn_channels * conv1_output_size * conv1_output_size);
+    net->conv2 = make_conv2d(weights, num_agents, conv1_output_size, conv1_output_size, cnn_channels, cnn_channels, 3, 1);
     net->flat = make_linear(weights, num_agents, 2, 32);
     net->cat = make_cat_dim1(num_agents, cnn_flat_size, 32);
     net->proj = make_linear(weights, num_agents, cnn_flat_size + 32, hidden_size);
     net->relu3 = make_relu(num_agents, hidden_size);
-    net->lstm = make_lstm(weights, num_agents, hidden_size, 128);
     net->actor = make_linear(weights, num_agents, hidden_size, grid_size*grid_size + 1); // +1 for pass move
     net->value_fn = make_linear(weights, num_agents, hidden_size, 1);
-
+    net->lstm = make_lstm(weights, num_agents, hidden_size, 128);
+    int logit_sizes[6] = {grid_size*grid_size+1};
+    net->multidiscrete = make_multidiscrete(num_agents, logit_sizes, 1);
     return net;
 }
 
@@ -107,18 +110,8 @@ void forward(GoNet* net, float* observations, int* actions, int grid_size) {
     linear(net->value_fn, net->lstm->state_h);
 
     // Get action by taking argmax of actor output
-    for (int i = 0; i < net->num_agents; i++) {
-        float max_val = net->actor->output[i * (grid_size * grid_size + 1)];
-        int max_idx = 0;
-        for (int j = 1; j < grid_size * grid_size + 1; j++) {
-            float val = net->actor->output[i * (grid_size * grid_size + 1) + j];
-            if (val > max_val) {
-                max_val = val;
-                max_idx = j;
-            }
-        }
-        actions[i] = max_idx;
-    }
+    softmax_multidiscrete(net->multidiscrete, net->actor->output, actions);
+
 }
 
 void demo(int grid_size) {
@@ -228,7 +221,7 @@ void performance_test() {
 }
 
 int main() {
-    demo(6);
+    demo(7);
     // performance_test();
     return 0;
 }
