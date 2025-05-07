@@ -1,3 +1,7 @@
+#TODO:
+# --no-build-isolation for 5090
+# Make c and torch compile at the same time
+
 from setuptools import find_packages, find_namespace_packages, setup, Extension
 from Cython.Build import cythonize
 import numpy
@@ -6,9 +10,54 @@ import urllib.request
 import zipfile
 import tarfile
 import platform
+
+from setuptools.command.build_ext import build_ext as DefaultBuildExt
 	
 #  python3 setup.py built_ext --inplace
 
+class CustomBuildExt(DefaultBuildExt):
+    def run(self):
+        # Split extensions into PyTorch and non-PyTorch
+        pytorch_extensions = [ext for ext in self.extensions if ext.name == 'pufferlib._C']
+        other_extensions = [ext for ext in self.extensions if ext.name != 'pufferlib._C']
+
+        # Build PyTorch extensions with cpp_extension.BuildExtension
+        if pytorch_extensions:
+            pytorch_build_ext = cpp_extension.BuildExtension(self.distribution)
+            # Temporarily set extensions to only PyTorch ones
+            original_extensions = self.extensions
+            self.extensions = pytorch_extensions
+            pytorch_build_ext.run()
+            self.extensions = original_extensions  # Restore original extensions
+
+        # Build other extensions with default setuptools build_ext
+        if other_extensions:
+            self.extensions = other_extensions
+            super().run()
+
+'''
+        + cythonize(
+        [
+            "pufferlib/extensions.pyx",
+            "c_advantage.pyx",
+            "pufferlib/puffernet.pyx",
+            *extensions,
+        ], 
+        compiler_directives={
+            'language_level': 3,
+            'boundscheck': False,
+            'initializedcheck': False,
+            'wraparound': False,
+            'cdivision': True,
+            'nonecheck': False,
+            'profile': False,
+        },
+           #nthreads=6,
+           #annotate=True,
+           #compiler_directives={'profile': True},# annotate=True
+    ),
+'''
+ 
 VERSION = '2.0.6'
 
 RAYLIB_BASE = 'https://github.com/raysan5/raylib/releases/download/5.5/'
@@ -317,7 +366,7 @@ extensions = [Extension(
 
 pure_c_extensions = ['squared', 'pong', 'breakout', 'enduro', 'blastar', 'grid', 'nmmo3', 'tactical', 'go', 'cartpole', 'connect4']
 
-extensions += [
+c_extensions = [
     Extension(
         f'pufferlib.ocean.{name}.binding',
         sources=[f'pufferlib/ocean/{name}/binding.c'],
@@ -327,6 +376,23 @@ extensions += [
         extra_objects=[f'{RAYLIB_NAME}/lib/libraylib.a'],
     )
     for name in pure_c_extensions
+]
+
+from torch.utils import cpp_extension
+torch_extensions = [
+    cpp_extension.CUDAExtension(
+        "pufferlib._C",
+        ["pufferlib.cpp", "pufferlib/pufferlib.cu"],
+        extra_compile_args = {
+            "cxx": [
+                "-fdiagnostics-color=always",
+                #"-DPy_LIMITED_API=0x03090000",  # min CPython version 3.9
+            ],
+            "nvcc": [
+            ],
+        },
+        #py_limited_api=True,
+    ),
 ]
 
 # Prevent Conda from injecting garbage compile flags
@@ -341,7 +407,7 @@ for key in ('CC', 'CXX', 'LDSHARED'):
 for key, value in cfg_vars.items():
     if value and '-fno-strict-overflow' in str(value):
         cfg_vars[key] = value.replace('-fno-strict-overflow', '')
- 
+
 setup(
     name="pufferlib",
     description="PufferAI Library"
@@ -362,6 +428,7 @@ setup(
         f'gym<={GYM_VERSION}',
         f'gymnasium<={GYMNASIUM_VERSION}',
         f'pettingzoo<={PETTINGZOO_VERSION}',
+        'torch',
         'shimmy[gym-v21]',
         'psutil==5.9.5',
         'pynvml',
@@ -375,25 +442,8 @@ setup(
         'common': common,
         **environments,
     },
-    ext_modules = cythonize([
-        "pufferlib/extensions.pyx",
-        "c_advantage.pyx",
-        "pufferlib/puffernet.pyx",
-        *extensions,
-    ], 
-    compiler_directives={
-        'language_level': 3,
-        'boundscheck': False,
-        'initializedcheck': False,
-        'wraparound': False,
-        'cdivision': True,
-        'nonecheck': False,
-        'profile': False,
-    },
-       #nthreads=6,
-       #annotate=True,
-       #compiler_directives={'profile': True},# annotate=True
-    ),
+    ext_modules = c_extensions,
+    #cmdclass={"build_ext": cpp_extension.BuildExtension},
     include_dirs=[numpy.get_include(), RAYLIB_NAME + '/include'],
     python_requires=">=3.9",
     license="MIT",
@@ -409,7 +459,9 @@ setup(
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
+    #options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
 #stable_baselines3
 #supersuit==3.3.5

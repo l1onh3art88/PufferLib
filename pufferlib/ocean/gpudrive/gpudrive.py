@@ -19,7 +19,6 @@ class GPUDrive(pufferlib.PufferEnv):
         self.num_agents = num_envs
         self.render_mode = render_mode
         self.report_interval = report_interval
-        print("Num envs: ", num_envs)
         
         self.num_obs = 6 + 63*7 + 200*7
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1,
@@ -28,11 +27,8 @@ class GPUDrive(pufferlib.PufferEnv):
         
         total_agents, agent_offsets =CyGPUDrive.get_total_agent_count(
             num_envs, human_agent_idx, reward_vehicle_collision, reward_offroad_collision)
-        
         self.num_agents = total_agents
-        print("Num agents: ", self.num_agents)
         super().__init__(buf=buf)
-        print("offsets: ", agent_offsets)
         self.c_envs = CyGPUDrive(self.observations, self.actions, self.rewards,
             self.terminals, num_envs, human_agent_idx, reward_vehicle_collision, reward_offroad_collision, offsets = agent_offsets)
 

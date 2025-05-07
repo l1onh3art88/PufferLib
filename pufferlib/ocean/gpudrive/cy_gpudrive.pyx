@@ -203,13 +203,9 @@ cdef class CyGPUDrive:
             inc = self.agent_offsets[env_index]
             count = self.agent_offsets[env_index+1] - self.agent_offsets[env_index]
             clone_agent_offset = clone_index * total_agents + inc
-            print("Env Index: ", env_index)
-            print("Increment: ", inc)
-            print("clone_agent_offset: ", clone_agent_offset)
             map_file = f"resources/gpudrive/binaries/map_{env_index:03d}.bin".encode('utf-8')
             c_map_file = <char*>malloc(len(map_file) + 1)
             strcpy(c_map_file, map_file)
-            print("cython map_name", map_file)
             self.envs[i] = GPUDrive(
                 observations=&observations[clone_agent_offset, 0],
                 actions=&actions[clone_agent_offset,0],

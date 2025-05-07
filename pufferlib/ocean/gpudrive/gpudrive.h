@@ -239,7 +239,7 @@ struct GPUDrive {
 
 Entity* load_map_binary(const char* filename, GPUDrive* env) {
     FILE* file = fopen(filename, "rb");
-    printf("fileanme: %s\n", filename);
+    //printf("fileanme: %s\n", filename);
     if (!file) return NULL;
     fread(&env->num_objects, sizeof(int), 1, file);
     fread(&env->num_roads, sizeof(int), 1, file);
@@ -443,8 +443,6 @@ void init_grid_map(GPUDrive* env){
             }
         }
     }
-    printf("top left: %f, %f\n", top_left_x, top_left_y);
-    printf("bottom right: %f, %f\n", bottom_right_x, bottom_right_y);
 
     env->map_corners = (float*)calloc(4, sizeof(float));
     env->map_corners[0] = top_left_x;
@@ -622,7 +620,6 @@ void init(GPUDrive* env){
     // printf("num entities: %d\n", env->num_entities);
     env->dynamics_model = CLASSIC;
     set_means(env);
-    printf("world mean: %f, %f\n", env->world_mean_x, env->world_mean_y);
     set_active_agents(env);
     set_start_position(env);
     // printf("Active agents: %d\n", env->active_agent_count);
