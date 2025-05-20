@@ -29,9 +29,9 @@ typedef struct Log {
     float episode_return;
     float episode_length;
     float n;
-    int long_win_pct;
-    int short_win_pct;
-    int overall_win_pct;
+    float long_win_pct;
+    float short_win_pct;
+    float overall_win_pct;
 } Log;
 
 typedef struct Client {
@@ -43,7 +43,7 @@ typedef struct TradeSim {
     Client* client;
     Log log;
     double* observations;
-    float* actions;
+    int* actions;
     float* rewards;
     unsigned char* terminals;
     int tick;
@@ -143,15 +143,6 @@ void init(TradeSim* env) {
     env->entry_price = 0;
     env->entry_step = 0;
     read_data(env);
-    printf("initial_capital: %f\n", env->initial_capital);
-    printf("position_size_fixed_dollar: %f\n", env->position_size_fixed_dollar);
-    printf("pt_atr_mult: %f\n", env->pt_atr_mult);
-    printf("sl_atr_mult: %f\n", env->sl_atr_mult);
-    printf("warmup_steps: %d\n", env->warmup_steps);
-    printf("slippage_factor: %f\n", env->slippage_factor);
-    printf("transaction_fee_pct: %f\n", env->transaction_fee_pct);
-    printf("max_steps_per_episode: %d\n", env->max_steps_per_episode);
-    printf("reward_type: %d\n", env->reward_type);
     env->returns = (double*)calloc(env->max_steps_per_episode, sizeof(double));
     env->returns[0] = env->initial_capital;
     env->long_win_pct = 0;
@@ -162,7 +153,7 @@ void init(TradeSim* env) {
 void allocate(TradeSim* env) {
     init(env);
     env->observations = (double*)calloc(MAX_OBSERVATIONS, sizeof(double));
-    env->actions = (float*)calloc(1, sizeof(float));
+    env->actions = (int*)calloc(1, sizeof(int));
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
 }
@@ -187,9 +178,9 @@ void free_allocated(TradeSim* env) {
 
 void add_log(TradeSim* env) {
     env->log.episode_length += env->tick;
-    env->log.episode_return += env->step_return;
-    env->log.score += env->step_return;
-    env->log.perf += env->step_return;
+    env->log.episode_return += env->rewards[0];
+    env->log.score += env->realized_pnl;
+    env->log.perf += env->rewards[0];
     env->log.long_win_pct = env->long_win_pct;
     env->log.short_win_pct = env->short_win_pct;
     env->log.overall_win_pct = env->overall_win_pct;
@@ -197,7 +188,7 @@ void add_log(TradeSim* env) {
 }
 
 void compute_observations(TradeSim* env) {
-    memcpy(env->observations, env->features + (env->tick * (MAX_OBSERVATIONS-1)), (MAX_OBSERVATIONS-1) * sizeof(float));
+    memcpy(env->observations, env->features + (env->tick * (MAX_OBSERVATIONS-1)), (MAX_OBSERVATIONS-1) * sizeof(double));
     env->observations[MAX_OBSERVATIONS-1] = env->position;
 }
 
@@ -238,7 +229,7 @@ double step_trade(TradeSim* env, float action) {
     double current_price = env->prices[env->_step];
     double current_atr = env->atrs[env->_step - 1];
     if(!legal_action(env,action)){
-        return -0.1;
+        return -1.0;
     }
     int reset_internals = 0;
     if(env->entry_price == 0) {
@@ -343,17 +334,21 @@ void c_step(TradeSim* env) {
     env->terminals[0] = 0;
     env->rewards[0] = 0.0;
     if(env->_step >= env->max_steps_per_episode) {
+        add_log(env);
         c_reset(env);
     }
 
-    float action = env->actions[0];
+    int action = env->actions[0];
     env->tick += 1;
     double trade_pnl_pct = step_trade(env, action);
     env->_step += 1;
     if(env->reward_type == REWARD_TYPE_SIMPLE_PnL) {
-        env->rewards[0] = trade_pnl_pct;
-        env->log.episode_return += trade_pnl_pct;
-        add_log(env);
+        if(trade_pnl_pct != -1.0){
+            env->rewards[0] = trade_pnl_pct*100.0f;
+        } else {
+            env->rewards[0] = trade_pnl_pct;
+        }
+        env->log.episode_return += env->rewards[0];
     } 
     compute_observations(env);
 }
