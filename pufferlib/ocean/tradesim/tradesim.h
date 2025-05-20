@@ -19,6 +19,7 @@
 
 #define REWARD_TYPE_SIMPLE_PnL 0
 #define REWARD_TYPE_SORTINO_RATIO 1
+#define REWARD_TYPE_SHARPE_RATIO 2
 
 #define timestamp_char_len 19
 
@@ -28,6 +29,9 @@ typedef struct Log {
     float episode_return;
     float episode_length;
     float n;
+    int long_win_pct;
+    int short_win_pct;
+    int overall_win_pct;
 } Log;
 
 typedef struct Client {
@@ -79,7 +83,11 @@ typedef struct TradeSim {
     float height;
     double slippage_factor;
     double entry_price;
+    int entry_step;
     int reward_type;
+    float long_win_pct;
+    float short_win_pct;
+    float overall_win_pct;
 } TradeSim;
 
 void read_data(TradeSim* env) {
@@ -114,6 +122,16 @@ void read_data(TradeSim* env) {
     // read data
     env->features = (double*)calloc(env->max_steps_per_episode * env->num_features, sizeof(double));
     fread(env->features, sizeof(double), env->max_steps_per_episode * env->num_features, file);
+    // read config settings
+    fread(&env->initial_capital, sizeof(double), 1, file);
+    fread(&env->position_size_fixed_dollar, sizeof(double), 1, file);
+    fread(&env->pt_atr_mult, sizeof(double), 1, file);
+    fread(&env->sl_atr_mult, sizeof(double), 1, file);
+    fread(&env->warmup_steps, sizeof(int), 1, file);
+    fread(&env->slippage_factor, sizeof(double), 1, file);
+    fread(&env->transaction_fee_pct, sizeof(double), 1, file);
+    fread(&env->max_steps_per_episode, sizeof(int), 1, file);
+    fread(&env->reward_type, sizeof(int), 1, file);
     fclose(file);
 }
 
@@ -123,10 +141,22 @@ void init(TradeSim* env) {
     env->short_trade_wins = 0;
     env->long_trade_wins = 0;
     env->entry_price = 0;
+    env->entry_step = 0;
     read_data(env);
+    printf("initial_capital: %f\n", env->initial_capital);
+    printf("position_size_fixed_dollar: %f\n", env->position_size_fixed_dollar);
+    printf("pt_atr_mult: %f\n", env->pt_atr_mult);
+    printf("sl_atr_mult: %f\n", env->sl_atr_mult);
+    printf("warmup_steps: %d\n", env->warmup_steps);
+    printf("slippage_factor: %f\n", env->slippage_factor);
+    printf("transaction_fee_pct: %f\n", env->transaction_fee_pct);
+    printf("max_steps_per_episode: %d\n", env->max_steps_per_episode);
+    printf("reward_type: %d\n", env->reward_type);
     env->returns = (double*)calloc(env->max_steps_per_episode, sizeof(double));
     env->returns[0] = env->initial_capital;
-    env->reward_type = REWARD_TYPE_SIMPLE_PnL;
+    env->long_win_pct = 0;
+    env->short_win_pct = 0;
+    env->overall_win_pct = 0;
 }
 
 void allocate(TradeSim* env) {
@@ -160,6 +190,9 @@ void add_log(TradeSim* env) {
     env->log.episode_return += env->step_return;
     env->log.score += env->step_return;
     env->log.perf += env->step_return;
+    env->log.long_win_pct = env->long_win_pct;
+    env->log.short_win_pct = env->short_win_pct;
+    env->log.overall_win_pct = env->overall_win_pct;
     env->log.n += 1;
 }
 
@@ -180,6 +213,10 @@ void c_reset(TradeSim* env) {
     env->short_trade_wins = 0;
     env->long_trade_wins = 0;
     env->entry_price = 0;
+    env->entry_step = 0;
+    env->long_win_pct = 0;
+    env->short_win_pct = 0;
+    env->overall_win_pct = 0;
     compute_observations(env);
 }
 
@@ -196,26 +233,25 @@ int legal_action(TradeSim* env, float action) {
     return 1;
 }
 
-void step_trade(TradeSim* env, float action) {
+double step_trade(TradeSim* env, float action) {
     int current_regime = env->regimes[env->_step - 1];
     double current_price = env->prices[env->_step];
     double current_atr = env->atrs[env->_step - 1];
     if(!legal_action(env,action)){
-        env->log.episode_return -= 0.1;
-        env->rewards[0] = -0.1;
-        return;
+        return -0.1;
     }
     int reset_internals = 0;
     if(env->entry_price == 0) {
         env->entry_price = current_price;
+        env->entry_step = env->_step;
     }
     double base_commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct;
     double base_slippage = env->entry_price * fabs(env->position) * env->slippage_factor;
-
     double final_commision  = base_commision*2;
     double final_slippage = base_slippage*2;
     if(action == BUY) {
         env->entry_price = current_price;
+        env->entry_step = env->_step;
         env->long_trades += 1;
         env->position = fminf(env->initial_capital + env->unrealized_pnl + env->realized_pnl, env->position_size_fixed_dollar) / current_price;
         env->profit_target = current_price + env->pt_atr_mult * current_atr;
@@ -224,25 +260,36 @@ void step_trade(TradeSim* env, float action) {
     }
     if(action == SELL) {
         env->entry_price = current_price;
+        env->entry_step = env->_step;
         env->short_trades += 1;
         env->position = -fminf(env->initial_capital + env->unrealized_pnl + env->realized_pnl, env->position_size_fixed_dollar) / current_price;
         env->profit_target = current_price - env->pt_atr_mult * current_atr;
         env->stop_loss = current_price + env->sl_atr_mult * current_atr;
         env->unrealized_pnl = 0 - final_commision - final_slippage;
     }
-    
+    double trade_pnl = 0;
+    double trade_pnl_pct = 0;
     if(env->position > 0 ){
         if(current_price >= env->profit_target) {
+            reset_internals = 1;
             env->long_trade_wins += 1;
-            double trade_pnl = (env->profit_target - env->entry_price) * env->position;
+            trade_pnl = (env->profit_target - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(current_price <= env->stop_loss) {
-            double trade_pnl = (env->stop_loss - env->entry_price) * env->position;
+            reset_internals = 1;
+            trade_pnl = (env->stop_loss - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(action == CLOSE){
-            double trade_pnl = (current_price - env->entry_price) * env->position;
+            reset_internals = 1;
+            trade_pnl = (current_price - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+            if (trade_pnl > 0) {
+                env->long_trade_wins += 1;
+            }
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else {
@@ -250,31 +297,46 @@ void step_trade(TradeSim* env, float action) {
         }
     } else if (env->position < 0) {
         if(current_price <= env->profit_target) {
+            reset_internals = 1;
             env->short_trade_wins += 1;
-            double trade_pnl = (env->entry_price - env->profit_target) * env->position;
+            trade_pnl = (env->profit_target - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(current_price >= env->stop_loss) {
-            double trade_pnl = (env->entry_price - env->stop_loss) * env->position;
+            reset_internals = 1;
+            trade_pnl = (env->stop_loss - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(action == CLOSE){
-            double trade_pnl = (env->entry_price - current_price) * env->position;
+            reset_internals = 1;
+            trade_pnl = (current_price - env->entry_price) * env->position;
+            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+            if (trade_pnl > 0) {
+                env->short_trade_wins += 1;
+            }
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else {
-            env->unrealized_pnl = ((env->entry_price - current_price) * env->position) - base_commision - base_slippage;
+            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - base_commision - base_slippage;
         }
     }
     env->capital  = env->initial_capital + env->unrealized_pnl + env->realized_pnl;
     env->returns[env->_step] = env->capital;
-    env->step_return = env->returns[-1] - env->returns[-2];
+    env->step_return = env->returns[env->_step] - env->returns[env->_step - 1];
     if(reset_internals) {
         env->position = 0;
         env->profit_target = 0;
         env->stop_loss = 0;
         env->entry_price = 0;
+        env->entry_step = 0;
     }
+    env->overall_win_pct = (env->short_trade_wins + env->long_trade_wins) / (env->short_trades + env->long_trades + 1e-5);
+    env->short_win_pct = env->short_trade_wins / (env->short_trades + 1e-5);
+    env->long_win_pct = env->long_trade_wins / (env->long_trades + 1e-5);
+
+    return trade_pnl_pct;
 }
 
 void c_step(TradeSim* env) {
@@ -286,11 +348,12 @@ void c_step(TradeSim* env) {
 
     float action = env->actions[0];
     env->tick += 1;
-    step_trade(env, action);
+    double trade_pnl_pct = step_trade(env, action);
     env->_step += 1;
     if(env->reward_type == REWARD_TYPE_SIMPLE_PnL) {
-        env->rewards[0] = env->step_return;
-        env->log.episode_return += env->step_return;
+        env->rewards[0] = trade_pnl_pct;
+        env->log.episode_return += trade_pnl_pct;
+        add_log(env);
     } 
     compute_observations(env);
 }
@@ -299,7 +362,6 @@ Client* make_client(TradeSim* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->width = env->width;
     client->height = env->height;
-
     InitWindow(env->width, env->height, "PufferLib Tradesim");
     SetTargetFPS(60);
     return client;
@@ -326,6 +388,83 @@ void c_render(TradeSim* env) {
 
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
+    DrawText(TextFormat("Step: %d", env->_step), 10, 10, 20, WHITE);
+    DrawText(TextFormat("Capital: %f", env->capital), 10, 50, 20, WHITE);
+    DrawText(TextFormat("Unrealized PnL: %f", env->unrealized_pnl), 10, 70, 20, WHITE);
+    DrawText(TextFormat("Realized PnL: %f", env->realized_pnl), 10, 90, 20, WHITE);
+    DrawText(TextFormat("Profit Target: %f", env->profit_target), 10, 110, 20, WHITE);
+    DrawText(TextFormat("Stop Loss: %f", env->stop_loss), 10, 130, 20, WHITE);
+    DrawText(TextFormat("Long Win Pct: %.2f", env->long_win_pct), 10, 150, 20, WHITE);
+    DrawText(TextFormat("Short Win Pct: %.2f", env->short_win_pct), 10, 170, 20, WHITE);
+    DrawText(TextFormat("Overall Win Pct: %.2f", env->overall_win_pct), 10, 190, 20, WHITE);
+    // Draw a graph of the current price based on the current step and previous steps
+    int graph_width = client->width * 0.75;
+    int graph_height = client->height * 0.75;
+    float x_margin = 55;
+    float y_margin = 55;
+    int start_x = (client->width - graph_width) / 2;
+    int start_y = (client->height - graph_height) / 2;
+    DrawRectangle(start_x, start_y, graph_width, graph_height, WHITE);
+
+    // Find min and max prices for scaling
+    double min_price = env->prices[0];
+    double max_price = env->prices[0];
+    for(int i = 0; i < env->_step; i++) {
+        if(env->prices[i] < min_price) min_price = env->prices[i];
+        if(env->prices[i] > max_price) max_price = env->prices[i];
+    }
+    
+    // Add some padding to min/max
+    double price_range = max_price - min_price;
+    min_price -= price_range * 0.1;
+    max_price += price_range * 0.1;
+    price_range = max_price - min_price;
+
+    // Draw axes
+    // Y-axis
+    DrawLine(start_x + x_margin, start_y, start_x + x_margin, start_y + graph_height, BLACK);
+    // X-axis
+    DrawLine(start_x + x_margin, start_y + graph_height - y_margin, start_x + graph_width, start_y + graph_height - y_margin, BLACK);
+
+    // Draw y-axis ticks and labels
+    int num_y_ticks = 5;
+    for(int i = 0; i <= num_y_ticks; i++) {
+        float y_pos = start_y + graph_height - (i * graph_height / num_y_ticks);
+        float price = min_price + (i * price_range / num_y_ticks);
+        // Draw tick mark
+        DrawLine(start_x + x_margin - 5, y_pos, start_x + x_margin, y_pos, BLACK);
+        // Draw price label
+        DrawText(TextFormat("%.2f", price), start_x + x_margin - 45, y_pos - 10 - y_margin, 15, BLACK);
+    }
+
+    // Draw x-axis ticks and labels
+    int num_x_ticks = 5;
+    for(int i = 0; i <= num_x_ticks; i++) {
+        float x_pos = start_x + x_margin + 25 + (i * (graph_width - x_margin)) / num_x_ticks;
+        int step = (i * env->max_steps_per_episode) / num_x_ticks;
+        // Draw tick mark
+        DrawLine(x_pos, start_y + graph_height - y_margin, x_pos, start_y + graph_height - y_margin + 5, BLACK);
+        // Draw step label
+        DrawText(TextFormat("%d", step), x_pos - 10, start_y + graph_height - y_margin + 10, 15, BLACK);
+    }
+    
+    // Draw price points
+    for(int i = 0; i < env->_step; i++) {
+        // Scale x position to fit graph width
+        float x_pos = start_x + x_margin + 25 + (i * (graph_width - x_margin - 25)) / (env->max_steps_per_episode - 1);
+        // Scale y position to fit graph height
+        float y_pos = start_y + graph_height - y_margin - ((env->prices[i] - min_price) / price_range * graph_height);
+        if(i == env->entry_step && env->position != 0) {
+            // draw a rd or green arrow pointing at the cicle below
+            if(env->position > 0) {
+                DrawCircle(x_pos, y_pos, 3, GREEN);
+            } else {
+                DrawCircle(x_pos, y_pos, 3, RED);
+            }
+        } else {
+            DrawCircle(x_pos, y_pos, 3, BLACK);
+        }
+    }
     EndDrawing();
 
     //PlaySound(client->sound);

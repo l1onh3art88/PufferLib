@@ -139,6 +139,7 @@ MAKE_FUNCTIONS = {
     'cpr': 'PyCPR',
     'impulse_wars': 'ImpulseWars',
     'gpudrive': 'GPUDrive',
+    'tradesim': 'TradeSim',
     'spaces': make_spaces,
     'multiagent': make_multiagent,
 }

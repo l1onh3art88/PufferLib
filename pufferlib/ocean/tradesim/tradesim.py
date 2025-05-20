@@ -5,12 +5,12 @@ import pufferlib
 import os
 import yaml
 import struct
-# from pufferlib.ocean.tradesim import binding
+from pufferlib.ocean.tradesim import binding
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
             width=576, height=330,log_interval=128,
-            buf=None, seed=0):
+            data_path=None, buf=None, seed=0):
         self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf,
             shape=(414), dtype=np.float32)
         self.render_mode = render_mode
@@ -18,12 +18,12 @@ class TradeSim(pufferlib.PufferEnv):
         self.log_interval = log_interval
         self.tick = 0
         self.single_action_space = gymnasium.spaces.Discrete(4)
-            
+        self.data_path = data_path
         super().__init__(buf)
             
         self.c_envs = binding.vec_init(self.observations, self.actions, self.rewards,
             self.terminals, self.truncations, num_envs, seed, width=width, height=height,
-            log_interval=log_interval
+            log_interval=log_interval, data_path=data_path
         )
 
     def reset(self, seed=0):
@@ -158,6 +158,27 @@ def ingest_historical_data(path, config_path=None):
         for i in range(len(data)):
             for j in range(len(data[i])):
                 f.write(struct.pack("d", data[i][j]))
+        # Write Config Settings
+        sim_config = config['simulation']
+        f.write(struct.pack("d", sim_config['initial_capital']))
+        f.write(struct.pack("d", sim_config['position_size_fixed_dollar']))
+        f.write(struct.pack("d", sim_config['pt_atr_mult']))
+        f.write(struct.pack("d", sim_config['sl_atr_mult']))
+        f.write(struct.pack("i", sim_config['warmup_steps']))
+        f.write(struct.pack("d", sim_config['slippage_factor']))
+        f.write(struct.pack("d", sim_config['transaction_fee_pct']))
+        f.write(struct.pack("i", sim_config['max_steps_per_episode']))
+        reward_type = config['rl']['reward_type']
+        if(reward_type == 'simple_pnl'):
+            reward_type = 0
+        elif(reward_type == 'sortino'):
+            reward_type = 1
+        elif(reward_type == 'sharpe'):
+            reward_type = 2
+        f.write(struct.pack("i", reward_type))
+
+        
+        # f.write()
     return df
 
 if __name__ == '__main__':
