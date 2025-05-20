@@ -5,7 +5,7 @@ import pufferlib
 import os
 import yaml
 import struct
-from pufferlib.ocean.tradesim import binding
+# from pufferlib.ocean.tradesim import binding
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
@@ -119,7 +119,15 @@ def ingest_historical_data(path, config_path=None):
     rows, cols = data.shape
     # compute means and stds
     mean = data.mean(axis=0)
+    max = data.max(axis=0)
     std = data.std(axis=0)
+    denominator = np.where(
+        (max == 0) | (max == 1),
+        1.0,  # Use 1.0 for max=0 or max=1
+        max * 1.25  # Use max*1.25 for all other values
+    )
+    normalized_data = data.copy()
+    normalized_data = data / denominator[None, :]  # Broadcast denominator across rows
     
     # Check if resources/tradesim directory exists, create if not
     os.makedirs("resources/tradesim", exist_ok=True)
@@ -155,9 +163,9 @@ def ingest_historical_data(path, config_path=None):
         for regime in regimes:
             f.write(struct.pack("i", regime))
         # Write data
-        for i in range(len(data)):
-            for j in range(len(data[i])):
-                f.write(struct.pack("d", data[i][j]))
+        for i in range(len(normalized_data)):
+            for j in range(len(normalized_data[i])):
+                f.write(struct.pack("d", normalized_data[i][j]))
         # Write Config Settings
         sim_config = config['simulation']
         f.write(struct.pack("d", sim_config['initial_capital']))
