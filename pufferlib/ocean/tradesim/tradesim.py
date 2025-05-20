@@ -3,7 +3,9 @@ import gymnasium
 import pandas as pd
 import pufferlib
 import os
-from pufferlib.ocean.tradesim import binding
+import yaml
+import struct
+# from pufferlib.ocean.tradesim import binding
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
@@ -64,28 +66,60 @@ def test_performance(timeout=10, atn_cache=1024):
 
     print(f'SPS: %f', env.num_agents * tick / (time.time() - start))
 
-def ingest_historical_data(path):
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+def ingest_historical_data(path, config_path=None):
+    # Load config if provided
+    config = None
+    if config_path:
+        config = load_config(config_path)
+    
     df = pd.read_csv(path)
-    feature_columns = df.columns.tolist()
+    # Use config values if available, otherwise use defaults
+    if config and 'data' in config and 'historical' in config['data']:
+        historical_config = config['data']['historical']
+        feature_columns = historical_config.get('feature_columns', df.columns.tolist())
+        timestamp_column = historical_config.get('timestamp_column', 'timestamp')
+        price_column = historical_config.get('price_column', 'price')
+        atr_column = historical_config.get('atr_column', 'atr')
+        normalize_features = historical_config.get('normalize_features', False)
+    else:
+        feature_columns = df.columns.tolist()
+        timestamp_column = 'timestamp'
+        normalize_features = False
+
     # Ensure timestamp column exists
-    # if 'timestamp' not in df.columns:
-    #     print(f"Timestamp column '{timestamp_column}' not found in data. Using default index.")
-    # else:
-    # Convert timestamp to datetime and sort
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df = df.sort_values(by='timestamp')
+    if timestamp_column not in df.columns:
+        print(f"Timestamp column '{timestamp_column}' not found in data. Using default index.")
+    else:
+        # Convert timestamp to datetime and sort
+        df[timestamp_column] = pd.to_datetime(df[timestamp_column])
+        df = df.sort_values(by=timestamp_column)
     
     # Ensure all required feature columns exist
     missing_cols = [col for col in feature_columns if col not in df.columns]
-
     if missing_cols:
         raise ValueError(f"Missing required columns in data: {missing_cols}")
     
     print(f"Loaded {len(df)} rows of order book data")
-    data = df.to_numpy().astype(np.float32)
+    
+    # Select only the feature columns we want
+    feature_data = df[feature_columns].copy()
+    feature_data = feature_data.fillna(method='ffill').fillna(method='bfill')
+    #
+    prices = df[price_column].to_numpy()
+    atrs = df[atr_column].to_numpy()
+    timestamps = df[timestamp_column].dt.strftime('%Y-%m-%d %H:%M:%S').to_numpy()  # 'S' is for string/bytes
+    regimes = df['regime'].to_numpy()
+    # Convert to numpy array
+    breakpoint()
+    data = feature_data.to_numpy()
     rows, cols = data.shape
-    with open("data_metadata.txt", "w") as f:
-        f.write(f"{rows} {cols}")
+    # compute means and stds
+    mean = data.mean(axis=0)
+    std = data.std(axis=0)
     
     # Check if resources/tradesim directory exists, create if not
     os.makedirs("resources/tradesim", exist_ok=True)
@@ -97,10 +131,38 @@ def ingest_historical_data(path):
             pass
     except IOError as e:
         raise IOError(f"Unable to write to {data_path}: {e}")
-
-    # Save data as raw binary
-    data.tofile(data_path)
+    with open(data_path, "wb") as f:
+        # Write rows and cols as int32 (4 bytes each)
+        f.write(struct.pack("ii", rows, cols))
+        # Write means 
+        for i in range(len(mean)):
+            f.write(struct.pack("d", mean[i]))
+        # Write stds
+        for i in range(len(std)):
+            f.write(struct.pack("d", std[i]))
+        # Write prices
+        for i in range(len(prices)):
+            f.write(struct.pack("d", prices[i]))
+        # Write atrs
+        for i in range(len(atrs)):
+            f.write(struct.pack("d", atrs[i]))
+        # Write timestamps (as char*)
+        for timestamp in timestamps:
+            timestamp_bytes = timestamp.encode('utf-8')
+            # Write the fixed-length timestamp bytes (always 19 bytes)
+            f.write(timestamp_bytes)
+        # Write regimes
+        for regime in regimes:
+            f.write(struct.pack("i", regime))
+        # Write data
+        for i in range(len(data)):
+            for j in range(len(data[i])):
+                f.write(struct.pack("d", data[i][j]))
     return df
 
 if __name__ == '__main__':
-    test_performance()
+    # Example usage with config
+    ingest_historical_data(
+        "resources/tradesim/train_test_1.csv",
+        config_path="resources/tradesim/experiment_config_3.yaml"
+    )
