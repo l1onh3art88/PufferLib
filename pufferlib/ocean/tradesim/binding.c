@@ -4,9 +4,11 @@
 #include "../env_binding.h"
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    env->data_path = unpack(kwargs, "data_path");
     env->width = unpack(kwargs, "width");
     env->height = unpack(kwargs, "height");
+    char data_path[100];
+    sprintf(data_path, "resources/tradesim/data.bin");
+    env->data_path = data_path;
     init(env);
     return 0;
 }
