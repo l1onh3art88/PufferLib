@@ -9,10 +9,10 @@ import struct
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
-            width=576, height=330,log_interval=128,
+            width=576, height=330,log_interval=2000,
             data_path=None, buf=None, seed=0):
         self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf,
-            shape=(414), dtype=np.float32)
+            shape=(414,), dtype=np.float64)
         self.render_mode = render_mode
         self.num_agents = num_envs
         self.log_interval = log_interval
@@ -118,8 +118,12 @@ def ingest_historical_data(path, config_path=None):
     data = feature_data.to_numpy()
     rows, cols = data.shape
     # compute means and stds
+<<<<<<< HEAD
     mean = data.mean(axis=0)
     max = data.max(axis=0)
+=======
+    means = data.mean(axis=0)
+>>>>>>> ca394fd14c1ba26d3db5285f5e89a8ef6c9f7754
     std = data.std(axis=0)
     denominator = np.where(
         (max == 0) | (max == 1),
