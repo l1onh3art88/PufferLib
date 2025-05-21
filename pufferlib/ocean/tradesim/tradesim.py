@@ -5,12 +5,12 @@ import pufferlib
 import os
 import yaml
 import struct
-# from pufferlib.ocean.tradesim import binding
+from pufferlib.ocean.tradesim import binding
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
             width=576, height=330,log_interval=2000,
-            data_path=None, buf=None, seed=0):
+            data_path=None, reward_pnl_scale=100.0, reward_illegal_move = 0.0, buf=None, seed=0):
         self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf,
             shape=(414,), dtype=np.float64)
         self.render_mode = render_mode
@@ -23,7 +23,8 @@ class TradeSim(pufferlib.PufferEnv):
             
         self.c_envs = binding.vec_init(self.observations, self.actions, self.rewards,
             self.terminals, self.truncations, num_envs, seed, width=width, height=height,
-            log_interval=log_interval, data_path=data_path
+            log_interval=log_interval, data_path=data_path, reward_pnl_scale=reward_pnl_scale, 
+            reward_illegal_move=reward_illegal_move
         )
 
     def reset(self, seed=0):
@@ -118,12 +119,8 @@ def ingest_historical_data(path, config_path=None):
     data = feature_data.to_numpy()
     rows, cols = data.shape
     # compute means and stds
-<<<<<<< HEAD
     mean = data.mean(axis=0)
     max = data.max(axis=0)
-=======
-    means = data.mean(axis=0)
->>>>>>> ca394fd14c1ba26d3db5285f5e89a8ef6c9f7754
     std = data.std(axis=0)
     denominator = np.where(
         (max == 0) | (max == 1),

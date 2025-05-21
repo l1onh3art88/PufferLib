@@ -32,6 +32,9 @@ typedef struct Log {
     float long_win_pct;
     float short_win_pct;
     float overall_win_pct;
+    float realized_pnl;
+    float capital;
+    float illegal_move_pct;
 } Log;
 
 typedef struct Client {
@@ -88,6 +91,9 @@ typedef struct TradeSim {
     float long_win_pct;
     float short_win_pct;
     float overall_win_pct;
+    float reward_pnl_scale;
+    float reward_illegal_move;
+    float illegal_move_count;
 } TradeSim;
 
 void read_data(TradeSim* env) {
@@ -148,6 +154,7 @@ void init(TradeSim* env) {
     env->long_win_pct = 0;
     env->short_win_pct = 0;
     env->overall_win_pct = 0;
+    env->illegal_move_count = 0;
 }
 
 void allocate(TradeSim* env) {
@@ -185,6 +192,9 @@ void add_log(TradeSim* env) {
     env->log.short_win_pct = env->short_win_pct;
     env->log.overall_win_pct = env->overall_win_pct;
     env->log.n += 1;
+    env->log.capital = env->capital;
+    env->log.realized_pnl = env->realized_pnl;
+    env->log.illegal_move_pct = env->illegal_move_count / (env->max_steps_per_episode);
 }
 
 void compute_observations(TradeSim* env) {
@@ -208,6 +218,7 @@ void c_reset(TradeSim* env) {
     env->long_win_pct = 0;
     env->short_win_pct = 0;
     env->overall_win_pct = 0;
+    env->illegal_move_count = 0;
     compute_observations(env);
 }
 
@@ -229,7 +240,8 @@ double step_trade(TradeSim* env, float action) {
     double current_price = env->prices[env->_step];
     double current_atr = env->atrs[env->_step - 1];
     if(!legal_action(env,action)){
-        return -1.0;
+        env->illegal_move_count += 1;
+        return -2;
     }
     int reset_internals = 0;
     if(env->entry_price == 0) {
@@ -291,19 +303,19 @@ double step_trade(TradeSim* env, float action) {
             reset_internals = 1;
             env->short_trade_wins += 1;
             trade_pnl = (env->profit_target - env->entry_price) * env->position;
-            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+            trade_pnl_pct = trade_pnl / (-env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(current_price >= env->stop_loss) {
             reset_internals = 1;
             trade_pnl = (env->stop_loss - env->entry_price) * env->position;
-            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+            trade_pnl_pct = trade_pnl / (-env->position * env->entry_price);
             env->realized_pnl += trade_pnl - final_commision - final_slippage;
             env->unrealized_pnl = 0;
         } else if(action == CLOSE){
             reset_internals = 1;
             trade_pnl = (current_price - env->entry_price) * env->position;
-            trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+            trade_pnl_pct = trade_pnl / (-env->position * env->entry_price);
             if (trade_pnl > 0) {
                 env->short_trade_wins += 1;
             }
@@ -343,10 +355,15 @@ void c_step(TradeSim* env) {
     double trade_pnl_pct = step_trade(env, action);
     env->_step += 1;
     if(env->reward_type == REWARD_TYPE_SIMPLE_PnL) {
-        if(trade_pnl_pct != -1.0){
-            env->rewards[0] = trade_pnl_pct*100.0f;
+        /*if(trade_pnl_pct > 0.0){
+            env->rewards[0] = 1.0f;
+        } else if(trade_pnl_pct < 0.0){
+            env->rewards[0] = -1.0f;   
+        }*/
+        if(trade_pnl_pct == -2){
+            env->rewards[0] = env->reward_illegal_move;
         } else {
-            env->rewards[0] = trade_pnl_pct;
+            env->rewards[0] = trade_pnl_pct*env->reward_pnl_scale;
         }
         env->log.episode_return += env->rewards[0];
     } 
