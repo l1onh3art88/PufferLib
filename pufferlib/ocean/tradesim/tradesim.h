@@ -23,6 +23,12 @@
 
 #define timestamp_char_len 19
 
+#define MIN_CANDLE_WIDTH 4
+#define MAX_CANDLE_WIDTH 20
+#define DEFAULT_CANDLE_WIDTH 8
+#define DEFAULT_VISIBLE_CANDLES 150
+#define ZOOM_FACTOR 1.2f
+
 typedef struct Log {
     float perf;
     float score;
@@ -40,6 +46,18 @@ typedef struct Log {
 typedef struct Client {
     float width;
     float height;
+    
+    // Viewport control
+    float candle_width;
+    int visible_candles;
+    double view_start_time;  // Index of first visible candle
+    double view_end_time;    // Index of last visible candle
+    double view_min_price;   // Minimum visible price
+    double view_max_price;   // Maximum visible price
+    bool is_dragging;
+    Vector2 drag_start;
+    Vector2 last_mouse_pos;
+    Font font;
 } Client;
 
 typedef struct TradeSim {
@@ -394,11 +412,54 @@ void c_step(TradeSim* env) {
     compute_observations(env);
 }
 
+const Color STONE_GRAY = (Color){80, 80, 80, 255};
+const Color PUFF_RED = (Color){187, 0, 0, 255};
+const Color PUFF_CYAN = (Color){0, 187, 187, 255};
+const Color PUFF_WHITE = (Color){241, 241, 241, 241};
+const Color PUFF_GREY = (Color){128, 128, 128, 255};
+const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
+const Color PUFF_BACKGROUND2 = (Color){18, 72, 72, 255};
+
+
 Client* make_client(TradeSim* env) {
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->width = env->width;
     client->height = env->height;
+
+    
+    // Calculate Graph dimensions 
+    int graph_width = client->width * 0.75;
+    float x_margin = 55;
+    float graph_content_width = graph_width - x_margin - 25;
+    // Initialize viewport
+    client->candle_width = DEFAULT_CANDLE_WIDTH;
+    client->visible_candles = (int)(graph_content_width / client->candle_width);
+    client->view_start_time = 0;
+    client->view_end_time = client->visible_candles;
+    client->is_dragging = false;
+    
+    // Set initial price range
+    client->view_min_price = env->prices[0];
+    client->view_max_price = env->prices[0];
+    for(int i = 0; i < env->max_steps_per_episode; i++) {
+        client->view_min_price = fmin(client->view_min_price, env->prices[i]);
+        client->view_max_price = fmax(client->view_max_price, env->prices[i]);
+    }
+    // Add some padding
+    double price_range = client->view_max_price - client->view_min_price;
+    client->view_min_price -= price_range * 0.1;
+    client->view_max_price += price_range * 0.1;
+    printf("Initial viewport: start=%f, end=%f, min_price=%f, max_price=%f\n", 
+    client->view_start_time, client->view_end_time, 
+    client->view_min_price, client->view_max_price);
     InitWindow(env->width, env->height, "PufferLib Tradesim");
+    client->font = LoadFontEx("resources/tradesim/OpenSans-Regular.ttf", 32, 0, 94);
+    if (client->font.texture.id == 0) {  // Check if font failed to load
+        TraceLog(LOG_WARNING, "Failed to load custom font, falling back to default font");
+        client->font = GetFontDefault();
+    } else {
+        TraceLog(LOG_INFO, "Custom font loaded successfully");
+    }
     SetTargetFPS(60);
     return client;
 }
@@ -408,6 +469,18 @@ void close_client(Client* client) {
     free(client);
 }
 
+void update_viewport(Client* client, TradeSim* env) {
+    // If we're near the end of the visible range, update the viewport to follow the current step
+    if (env->_step > client->view_end_time - 20) {  // Start scrolling when we're within 20 candles of the end
+        client->view_start_time = fmax(0, env->_step - client->visible_candles);
+        client->view_end_time = fmin(client->view_start_time + client->visible_candles, env->_step);
+    }
+    if( env->_step >= env->max_steps_per_episode) {
+        client->view_start_time = 0;
+        client->view_end_time = client->visible_candles;
+    }
+}
+
 void c_render(TradeSim* env) {
     if (env->client == NULL) {
         env->client = make_client(env);
@@ -415,93 +488,124 @@ void c_render(TradeSim* env) {
 
     Client* client = env->client;
 
-    if (IsKeyDown(KEY_ESCAPE)) {
-        exit(0);
-    }
-    if (IsKeyPressed(KEY_TAB)) {
-        ToggleFullscreen();
-    }
+    if (IsKeyDown(KEY_ESCAPE)) exit(0);
+    if (IsKeyPressed(KEY_TAB)) ToggleFullscreen();
+
+    // Update viewport
+    update_viewport(client, env);
 
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
-    DrawText(TextFormat("Step: %d", env->_step), 10, 10, 20, WHITE);
-    DrawText(TextFormat("Capital: %f", env->capital), 10, 50, 20, WHITE);
-    DrawText(TextFormat("Unrealized PnL: %f", env->unrealized_pnl), 10, 70, 20, WHITE);
-    DrawText(TextFormat("Realized PnL: %f", env->realized_pnl), 10, 90, 20, WHITE);
-    DrawText(TextFormat("Profit Target: %f", env->profit_target), 10, 110, 20, WHITE);
-    DrawText(TextFormat("Stop Loss: %f", env->stop_loss), 10, 130, 20, WHITE);
-    DrawText(TextFormat("Long Win Pct: %.2f", env->long_win_pct), 10, 150, 20, WHITE);
-    DrawText(TextFormat("Short Win Pct: %.2f", env->short_win_pct), 10, 170, 20, WHITE);
-    DrawText(TextFormat("Overall Win Pct: %.2f", env->overall_win_pct), 10, 190, 20, WHITE);
-    // Draw a graph of the current price based on the current step and previous steps
-    int graph_width = client->width * 0.75;
-    int graph_height = client->height * 0.75;
-    float x_margin = 55;
-    float y_margin = 55;
-    int start_x = (client->width - graph_width) / 2;
-    int start_y = (client->height - graph_height) / 2;
-    DrawRectangle(start_x, start_y, graph_width, graph_height, WHITE);
-
-    // Find min and max prices for scaling
-    double min_price = env->prices[0];
-    double max_price = env->prices[0];
-    for(int i = 0; i < env->_step; i++) {
-        if(env->prices[i] < min_price) min_price = env->prices[i];
-        if(env->prices[i] > max_price) max_price = env->prices[i];
+    // Setup graph area
+    int graph_width = client->width;
+    int graph_height = client->height;
+    float x_margin = 100;
+    float y_margin =80;
+    int start_x = 0;
+    int start_y = 20;
+    float stat_margin = 120;
+    // Draw graph background
+    DrawRectangle(start_x, start_y, graph_width, graph_height, PUFF_BACKGROUND);
+    DrawTextEx(client->font, TextFormat("Step: %d", env->_step), (Vector2){stat_margin+10, 20}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Capital: %.2f", env->capital), (Vector2){stat_margin+10, 50}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Unrealized PnL: %.2f", env->unrealized_pnl), (Vector2){stat_margin+10, 70}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Realized PnL: %.2f", env->realized_pnl), (Vector2){stat_margin+10, 90}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Profit Target: %.4f", env->profit_target), (Vector2){stat_margin+10, 110}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Stop Loss: %.4f", env->stop_loss), (Vector2){stat_margin+10, 130}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Long Win Pct: %.2f", env->long_win_pct), (Vector2){stat_margin+10, 150}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Short Win Pct: %.2f", env->short_win_pct), (Vector2){stat_margin+10, 170}, 20, 1, PUFF_WHITE);
+    DrawTextEx(client->font, TextFormat("Overall Win Pct: %.2f", env->overall_win_pct), (Vector2){stat_margin+10, 190}, 20, 1, PUFF_WHITE);
+    if(env->position != 0){
+        DrawTextEx(client->font, TextFormat("Entry Price: %.2f", env->entry_price), (Vector2){stat_margin+10, 210}, 20, 1, PUFF_WHITE);
+    }
+    if( env->position > 0 ){
+        DrawTextEx(client->font, TextFormat("Long Position: %.2f", env->position), (Vector2){stat_margin+10, 230}, 20, 1, PUFF_WHITE);
+    } else if( env->position < 0 ){
+        DrawTextEx(client->font, TextFormat("Short Position: %.2f", env->position), (Vector2){stat_margin+10, 230}, 20, 1, PUFF_WHITE);
     }
     
-    // Add some padding to min/max
-    double price_range = max_price - min_price;
-    min_price -= price_range * 0.1;
-    max_price += price_range * 0.1;
-    price_range = max_price - min_price;
 
-    // Draw axes
-    // Y-axis
-    DrawLine(start_x + x_margin, start_y, start_x + x_margin, start_y + graph_height, BLACK);
-    // X-axis
-    DrawLine(start_x + x_margin, start_y + graph_height - y_margin, start_x + graph_width, start_y + graph_height - y_margin, BLACK);
-
+    // Calculate the actual width available for candles
+    float graph_content_width = graph_width - x_margin - 25;
+    float total_candles = client->view_end_time - client->view_start_time;
+    float candle_spacing = graph_content_width / total_candles;  // This will be our new spacing
+    // Draw main axes
+    DrawLine(start_x + x_margin, start_y, start_x + x_margin, start_y + graph_height - y_margin, PUFF_CYAN);
+    DrawLine(start_x + x_margin, start_y + graph_height - y_margin, start_x + x_margin + graph_content_width, start_y + graph_height - y_margin, PUFF_CYAN);
     // Draw y-axis ticks and labels
-    int num_y_ticks = 5;
+    int num_y_ticks = 10;
     for(int i = 0; i <= num_y_ticks; i++) {
-        float y_pos = start_y + graph_height - (i * graph_height / num_y_ticks);
-        float price = min_price + (i * price_range / num_y_ticks);
-        // Draw tick mark
-        DrawLine(start_x + x_margin - 5, y_pos, start_x + x_margin, y_pos, BLACK);
-        // Draw price label
-        DrawText(TextFormat("%.2f", price), start_x + x_margin - 45, y_pos - 10 - y_margin, 15, BLACK);
+        float y_pos = start_y + graph_height - y_margin - (i * (graph_height - y_margin) / num_y_ticks);
+        float price = client->view_min_price + (i * (client->view_max_price - client->view_min_price) / num_y_ticks);
+        DrawLine(start_x + x_margin, y_pos, start_x + x_margin + graph_content_width, y_pos, PUFF_CYAN);
+        DrawTextEx(client->font, TextFormat("%.2f", price), (Vector2){start_x + x_margin - 75, y_pos - 10}, 15, 1, WHITE);
     }
+
+    
 
     // Draw x-axis ticks and labels
     int num_x_ticks = 5;
     for(int i = 0; i <= num_x_ticks; i++) {
-        float x_pos = start_x + x_margin + 25 + (i * (graph_width - x_margin)) / num_x_ticks;
-        int step = (i * env->max_steps_per_episode) / num_x_ticks;
-        // Draw tick mark
-        DrawLine(x_pos, start_y + graph_height - y_margin, x_pos, start_y + graph_height - y_margin + 5, BLACK);
-        // Draw step label
-        DrawText(TextFormat("%d", step), x_pos - 10, start_y + graph_height - y_margin + 10, 15, BLACK);
-    }
-    
-    // Draw price points
-    for(int i = 0; i < env->_step; i++) {
-        // Scale x position to fit graph width
-        float x_pos = start_x + x_margin + 25 + (i * (graph_width - x_margin - 25)) / (env->max_steps_per_episode - 1);
-        // Scale y position to fit graph height
-        float y_pos = start_y + graph_height - y_margin - ((env->prices[i] - min_price) / price_range * graph_height);
-        if(i == env->entry_step && env->position != 0) {
-            // draw a rd or green arrow pointing at the cicle below
-            if(env->position > 0) {
-                DrawCircle(x_pos, y_pos, 3, GREEN);
-            } else {
-                DrawCircle(x_pos, y_pos, 3, RED);
+        float relative_pos = (float)i / num_x_ticks;  // 0 to 1
+        float x_pos = start_x + x_margin + (relative_pos * graph_content_width);
+        int step = client->view_start_time + (relative_pos * total_candles);
+        if (step >= 0 && step < env->max_steps_per_episode) {
+            DrawLine(x_pos, start_y + graph_height - y_margin, x_pos, start_y, PUFF_CYAN);
+            unsigned char timestamp[20];
+            for(int j = 0; j < timestamp_char_len; j++) {
+                timestamp[j] = env->timestamps[step*timestamp_char_len + j];
             }
-        } else {
-            DrawCircle(x_pos, y_pos, 3, BLACK);
+            timestamp[timestamp_char_len] = '\0';
+            char date[11] = {0};  // YYYY-MM-DD\0
+        char time[9] = {0};   // HH:MM:SS\0
+        strncpy(date, (char*)timestamp, 10);  // Copy first 10 chars (date)
+        strncpy(time, (char*)timestamp + 11, 8);  // Copy 8 chars starting from position 11 (time)
+        
+        // Draw date and time on separate lines
+        DrawTextEx(client->font, date, (Vector2){x_pos - 30, start_y + graph_height - y_margin + 10}, 15, 1, WHITE);
+        DrawTextEx(client->font, time, (Vector2){x_pos - 20, start_y + graph_height - y_margin + 30}, 15, 1, WHITE);
         }
     }
-    EndDrawing();
 
-    //PlaySound(client->sound);
+    // Draw candles using the same spacing calculation
+    for(int i = client->view_start_time; i < client->view_end_time && i < env->_step; i++) {
+        float relative_pos = (float)(i - client->view_start_time) / total_candles;  // 0 to 1
+        float x_pos = start_x + x_margin + (relative_pos * graph_content_width);
+        
+        // Get open and close prices
+        double open_price = env->prices[i];
+        double close_price = (i < env->_step - 1) ? env->prices[i + 1] : env->prices[i];
+        // Calculate y positions
+        float open_y = start_y + graph_height - y_margin - 
+            ((open_price - client->view_min_price) / (client->view_max_price - client->view_min_price) * (graph_height - y_margin));
+        float close_y = start_y + graph_height - y_margin - 
+            ((close_price - client->view_min_price) / (client->view_max_price - client->view_min_price) * (graph_height - y_margin));
+        
+        // Draw candle
+        Color candle_color = (close_price >= open_price) ? GREEN : RED;
+        float body_top = fmin(open_y, close_y);
+        float body_height = fabs(open_y - close_y);
+        if (body_height < 2.0f) body_height = 2.0f;
+        
+        DrawRectangle(x_pos, body_top, client->candle_width, body_height, candle_color);
+    }
+
+    // Draw entry price with purple horizontal line at price
+    if (env->position != 0){
+        Color position_color = (env->unrealized_pnl >= 0) ? GREEN : RED;
+        
+        float line_thickness = 4.0f;  // Adjust this value to make the line thicker or thinner
+    
+        DrawLineEx(
+            (Vector2){start_x + x_margin, start_y + graph_height - y_margin - 
+                ((env->entry_price - client->view_min_price) / (client->view_max_price - client->view_min_price) * (graph_height - y_margin))},
+            (Vector2){start_x + graph_width, start_y + graph_height - y_margin - 
+                ((env->entry_price - client->view_min_price) / (client->view_max_price - client->view_min_price) * (graph_height - y_margin))},
+            line_thickness,
+            position_color
+        );
+    }
+    
+
+    EndDrawing();
 }
