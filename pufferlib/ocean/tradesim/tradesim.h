@@ -94,6 +94,7 @@ typedef struct TradeSim {
     float reward_pnl_scale;
     float reward_illegal_move;
     float illegal_move_count;
+    float episode_return;
 } TradeSim;
 
 void read_data(TradeSim* env) {
@@ -155,6 +156,9 @@ void init(TradeSim* env) {
     env->short_win_pct = 0;
     env->overall_win_pct = 0;
     env->illegal_move_count = 0;
+    env->episode_return = 0;
+    env->realized_pnl = 0;
+    env->unrealized_pnl = 0;
 }
 
 void allocate(TradeSim* env) {
@@ -185,9 +189,9 @@ void free_allocated(TradeSim* env) {
 
 void add_log(TradeSim* env) {
     env->log.episode_length += env->tick;
-    env->log.episode_return += env->rewards[0];
+    env->log.episode_return += env->episode_return;
     env->log.score += env->realized_pnl;
-    env->log.perf += env->rewards[0];
+    env->log.perf += env->episode_return;
     env->log.long_win_pct = env->long_win_pct;
     env->log.short_win_pct = env->short_win_pct;
     env->log.overall_win_pct = env->overall_win_pct;
@@ -206,6 +210,7 @@ void c_reset(TradeSim* env) {
     env->tick = 0;
     env->_step = 1;
     env->position = 0;
+    env->episode_return = 0;
     env->capital = env->initial_capital;
     env->unrealized_pnl = 0;
     env->realized_pnl = 0;
@@ -248,10 +253,8 @@ double step_trade(TradeSim* env, float action) {
         env->entry_price = current_price;
         env->entry_step = env->_step;
     }
-    double base_commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct;
-    double base_slippage = env->entry_price * fabs(env->position) * env->slippage_factor;
-    double final_commision  = base_commision*2;
-    double final_slippage = base_slippage*2;
+    double commision; 
+    double slippage; 
     if(action == BUY) {
         env->entry_price = current_price;
         env->entry_step = env->_step;
@@ -259,7 +262,9 @@ double step_trade(TradeSim* env, float action) {
         env->position = fminf(env->initial_capital + env->unrealized_pnl + env->realized_pnl, env->position_size_fixed_dollar) / current_price;
         env->profit_target = current_price + env->pt_atr_mult * current_atr;
         env->stop_loss = current_price - env->sl_atr_mult * current_atr;
-        env->unrealized_pnl = 0 + final_commision + final_slippage;
+        commision = current_price * fabs(env->position) * env->transaction_fee_pct;
+        slippage = current_price * fabs(env->position) * env->slippage_factor;
+        env->unrealized_pnl = 0 - commision - slippage;
     }
     if(action == SELL) {
         env->entry_price = current_price;
@@ -268,7 +273,10 @@ double step_trade(TradeSim* env, float action) {
         env->position = -fminf(env->initial_capital + env->unrealized_pnl + env->realized_pnl, env->position_size_fixed_dollar) / current_price;
         env->profit_target = current_price - env->pt_atr_mult * current_atr;
         env->stop_loss = current_price + env->sl_atr_mult * current_atr;
-        env->unrealized_pnl = 0 - final_commision - final_slippage;
+        commision = current_price * fabs(env->position) * env->transaction_fee_pct;
+        slippage = current_price * fabs(env->position) * env->slippage_factor;
+        env->unrealized_pnl = 0 - commision - slippage;
+ 
     }
     double trade_pnl = 0;
     double trade_pnl_pct = 0;
@@ -278,13 +286,17 @@ double step_trade(TradeSim* env, float action) {
             env->long_trade_wins += 1;
             trade_pnl = (env->profit_target - env->entry_price) * env->position;
             trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else if(current_price <= env->stop_loss) {
             reset_internals = 1;
             trade_pnl = (env->stop_loss - env->entry_price) * env->position;
             trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else if(action == CLOSE){
             reset_internals = 1;
@@ -293,10 +305,14 @@ double step_trade(TradeSim* env, float action) {
             if (trade_pnl > 0) {
                 env->long_trade_wins += 1;
             }
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else {
-            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - base_commision - base_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor;
+            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - commision - slippage;
         }
     } else if (env->position < 0) {
         if(current_price <= env->profit_target) {
@@ -304,13 +320,17 @@ double step_trade(TradeSim* env, float action) {
             env->short_trade_wins += 1;
             trade_pnl = (env->profit_target - env->entry_price) * env->position;
             trade_pnl_pct = trade_pnl / (-env->position * env->entry_price);
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else if(current_price >= env->stop_loss) {
             reset_internals = 1;
             trade_pnl = (env->stop_loss - env->entry_price) * env->position;
             trade_pnl_pct = trade_pnl / (-env->position * env->entry_price);
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else if(action == CLOSE){
             reset_internals = 1;
@@ -319,10 +339,14 @@ double step_trade(TradeSim* env, float action) {
             if (trade_pnl > 0) {
                 env->short_trade_wins += 1;
             }
-            env->realized_pnl += trade_pnl - final_commision - final_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct *2.0;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor *2.0;
+            env->realized_pnl += trade_pnl - commision - slippage;
             env->unrealized_pnl = 0;
         } else {
-            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - base_commision - base_slippage;
+            commision = env->entry_price * fabs(env->position) * env->transaction_fee_pct;
+            slippage = env->entry_price * fabs(env->position) * env->slippage_factor;
+            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - commision - slippage;
         }
     }
     env->capital  = env->initial_capital + env->unrealized_pnl + env->realized_pnl;
@@ -365,7 +389,7 @@ void c_step(TradeSim* env) {
         } else {
             env->rewards[0] = trade_pnl_pct*env->reward_pnl_scale;
         }
-        env->log.episode_return += env->rewards[0];
+        env->episode_return += env->rewards[0];
     } 
     compute_observations(env);
 }

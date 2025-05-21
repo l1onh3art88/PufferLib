@@ -55,6 +55,7 @@ void test_performance(int timeout) {
     float sps = num_steps / (end - start);
     printf("Test Environment SPS: %f\n", sps);
     free_allocated(&env);
+    return;
 }
 
 int main() {
