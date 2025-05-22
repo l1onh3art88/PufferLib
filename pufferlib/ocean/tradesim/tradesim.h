@@ -592,9 +592,9 @@ void c_render(TradeSim* env) {
 
     // Draw entry price with purple horizontal line at price
     if (env->position != 0){
-        Color position_color = (env->unrealized_pnl >= 0) ? GREEN : RED;
+        Color position_color = PUFF_CYAN;
         
-        float line_thickness = 4.0f;  // Adjust this value to make the line thicker or thinner
+        float line_thickness = 2.0f;  // Adjust this value to make the line thicker or thinner
     
         DrawLineEx(
             (Vector2){start_x + x_margin, start_y + graph_height - y_margin - 
