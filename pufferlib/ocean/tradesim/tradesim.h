@@ -460,7 +460,7 @@ Client* make_client(TradeSim* env) {
     } else {
         TraceLog(LOG_INFO, "Custom font loaded successfully");
     }
-    SetTargetFPS(60);
+    SetTargetFPS(20);
     return client;
 }
 

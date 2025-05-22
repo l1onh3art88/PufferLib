@@ -9,7 +9,7 @@ from pufferlib.ocean.tradesim import binding
 
 class TradeSim(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None,
-            width=576, height=330,log_interval=200,
+            width=1200, height=800,log_interval=200,
             data_path=None, reward_pnl_scale=100.0, reward_illegal_move = 0.0, buf=None, seed=0):
         self.single_observation_space = gymnasium.spaces.Box(low=-np.inf, high=np.inf,
             shape=(414,), dtype=np.float64)
