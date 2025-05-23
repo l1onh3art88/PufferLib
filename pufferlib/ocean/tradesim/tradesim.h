@@ -264,6 +264,11 @@ double step_trade(TradeSim* env, float action) {
     double current_atr = env->atrs[env->_step - 1];
     if(!legal_action(env,action)){
         env->illegal_move_count += 1;
+        if(env->position != 0){
+            double commision = current_price * fabs(env->position) * env->transaction_fee_pct;
+            double slippage = current_price * fabs(env->position) * env->slippage_factor;
+            env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - commision - slippage;
+        }
         return -2;
     }
     int reset_internals = 0;
