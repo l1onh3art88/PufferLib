@@ -268,6 +268,9 @@ double step_trade(TradeSim* env, float action) {
             double commision = current_price * fabs(env->position) * env->transaction_fee_pct;
             double slippage = current_price * fabs(env->position) * env->slippage_factor;
             env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - commision - slippage;
+            env->capital  = env->initial_capital + env->unrealized_pnl + env->realized_pnl;
+            env->returns[env->_step] = env->capital;
+            env->step_return = env->returns[env->_step] - env->returns[env->_step - 1];
         }
         return -2;
     }
