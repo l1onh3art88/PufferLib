@@ -175,7 +175,7 @@ void performance_test() {
         .human_agent_idx = 0,
 	    .map_name = "resources/robotaxi/binaries/map_003.bin",
         .spawn_immunity_timer = 30,
-        .active_agent_count = 10
+        .active_agent_count = 100
     };
     clock_t start_time, end_time;
     double cpu_time_used;

@@ -48,19 +48,8 @@
 #define MAX_ROAD_SEGMENT_OBSERVATIONS 200
 #define MAX_CARS 64
 // Observation Space Constants
-#define MAX_SPEED 100.0f
-#define MAX_VEH_LEN 30.0f
-#define MAX_VEH_WIDTH 15.0f
-#define MAX_VEH_HEIGHT 10.0f
-#define MIN_REL_GOAL_COORD -1000.0f
-#define MAX_REL_GOAL_COORD 1000.0f
-#define MIN_REL_AGENT_POS -1000.0f
-#define MAX_REL_AGENT_POS 1000.0f
-#define MAX_ORIENTATION_RAD 2 * PI
-#define MIN_RG_COORD -1000.0f
-#define MAX_RG_COORD 1000.0f
-#define MAX_ROAD_SCALE 100.0f
-#define MAX_ROAD_SEGMENT_LENGTH 100.0f
+#define VISION_CNN_SIZE 21*21*2
+#define SELF_OBSERVATIONS 6
 
 // Acceleration Values
 static const float ACCELERATION_VALUES[7] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f,  1.3330f,  2.6670f,  4.0000f};
@@ -128,6 +117,8 @@ struct Entity {
     float vy;
     float vz;
     float heading;
+    float heading_x;
+    float heading_y;
     int valid;
     int reached_goal;
     int respawn_timestep;
@@ -520,6 +511,8 @@ void spawn_agent(Robotaxi* env, int agent_idx){
             env->entities[agent_idx].y = env->entities[random_idx].traj_y[rand_traj_idx];
             env->entities[agent_idx].z = 1.0f;
             env->entities[agent_idx].heading = 1.57f;
+            env->entities[agent_idx].heading_x = cosf(env->entities[agent_idx].heading);
+            env->entities[agent_idx].heading_y = sinf(env->entities[agent_idx].heading);
             env->entities[agent_idx].vx = 0.0f;
             env->entities[agent_idx].vy = 0.0f;
             env->entities[agent_idx].vz = 0.0f;
@@ -581,7 +574,7 @@ void free_initialized(Robotaxi* env){
 
 void allocate(Robotaxi* env){
     init(env);
-    int max_obs = 6 + 7*(MAX_CARS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = SELF_OBSERVATIONS + VISION_CNN_SIZE;
     // printf("max obs: %d\n", max_obs*env->active_agent_count);
     // printf("num cars: %d\n", env->num_cars);
     // printf("num static cars: %d\n", env->static_car_count);
@@ -607,7 +600,7 @@ void c_close(Robotaxi* env){
 }
 
 float clipSpeed(float speed) {
-    const float maxSpeed = MAX_SPEED;
+    const float maxSpeed = 100.0f;
     if (speed > maxSpeed) return maxSpeed;
     if (speed < -maxSpeed) return -maxSpeed;
     return speed;
@@ -662,6 +655,8 @@ void move_dynamics(Robotaxi* env, int action_idx, int agent_idx){
         agent->x = x;
         agent->y = y;
         agent->heading = heading;
+        agent->heading_x = cosf(heading);
+        agent->heading_y = sinf(heading);
         agent->vx = new_vx;
         agent->vy = new_vy;
     }
@@ -674,6 +669,8 @@ void move_expert(Robotaxi* env, int* actions, int agent_idx){
     agent->y = agent->traj_y[env->timestep];
     agent->z = agent->traj_z[env->timestep];
     agent->heading = agent->traj_heading[env->timestep];
+    agent->heading_x = cosf(agent->heading);
+    agent->heading_y = sinf(agent->heading);
 }
 
 bool check_line_intersection(float p1[2], float p2[2], float q1[2], float q2[2]) {
@@ -754,13 +751,79 @@ int checkNeighbors(Robotaxi* env, float x, float y, int* entity_list, int max_si
     return entity_list_count;
 }
 
+int check_aabb_collision(Entity* car1, Entity* car2) {
+    // Get car corners in world space
+    float cos1 = car1->heading_x;
+    float sin1 = car1->heading_y;
+    float cos2 = car2->heading_x;
+    float sin2 = car2->heading_y;
+    
+    // Calculate half dimensions
+    float half_len1 = car1->length * 0.5f;
+    float half_width1 = car1->width * 0.5f;
+    float half_len2 = car2->length * 0.5f;
+    float half_width2 = car2->width * 0.5f;
+    
+    // Calculate car1's corners in world space
+    float car1_corners[4][2] = {
+        {car1->x + (half_len1 * cos1 - half_width1 * sin1), car1->y + (half_len1 * sin1 + half_width1 * cos1)},
+        {car1->x + (half_len1 * cos1 + half_width1 * sin1), car1->y + (half_len1 * sin1 - half_width1 * cos1)},
+        {car1->x + (-half_len1 * cos1 - half_width1 * sin1), car1->y + (-half_len1 * sin1 + half_width1 * cos1)},
+        {car1->x + (-half_len1 * cos1 + half_width1 * sin1), car1->y + (-half_len1 * sin1 - half_width1 * cos1)}
+    };
+    
+    // Calculate car2's corners in world space
+    float car2_corners[4][2] = {
+        {car2->x + (half_len2 * cos2 - half_width2 * sin2), car2->y + (half_len2 * sin2 + half_width2 * cos2)},
+        {car2->x + (half_len2 * cos2 + half_width2 * sin2), car2->y + (half_len2 * sin2 - half_width2 * cos2)},
+        {car2->x + (-half_len2 * cos2 - half_width2 * sin2), car2->y + (-half_len2 * sin2 + half_width2 * cos2)},
+        {car2->x + (-half_len2 * cos2 + half_width2 * sin2), car2->y + (-half_len2 * sin2 - half_width2 * cos2)}
+    };
+
+    // Get the axes to check (normalized vectors perpendicular to each edge)
+    float axes[4][2] = {
+        {cos1, sin1},           // Car1's length axis
+        {-sin1, cos1},          // Car1's width axis
+        {cos2, sin2},           // Car2's length axis
+        {-sin2, cos2}           // Car2's width axis
+    };
+
+    // Check each axis
+    for(int i = 0; i < 4; i++) {
+        float min1 = INFINITY, max1 = -INFINITY;
+        float min2 = INFINITY, max2 = -INFINITY;
+        
+        // Project car1's corners onto the axis
+        for(int j = 0; j < 4; j++) {
+            float proj = car1_corners[j][0] * axes[i][0] + car1_corners[j][1] * axes[i][1];
+            min1 = fminf(min1, proj);
+            max1 = fmaxf(max1, proj);
+        }
+        
+        // Project car2's corners onto the axis
+        for(int j = 0; j < 4; j++) {
+            float proj = car2_corners[j][0] * axes[i][0] + car2_corners[j][1] * axes[i][1];
+            min2 = fminf(min2, proj);
+            max2 = fmaxf(max2, proj);
+        }
+        
+        // If there's a gap on this axis, the boxes don't intersect
+        if(max1 < min2 || min1 > max2) {
+            return 0;  // No collision
+        }
+    }
+    
+    // If we get here, there's no separating axis, so the boxes intersect
+    return 1;  // Collision
+}
+
 void collision_check(Robotaxi* env, int agent_idx) {
     Entity* agent = &env->entities[agent_idx];
     if(agent->x == -10000.0f ) return;
     float half_length = agent->length/2.0f;
     float half_width = agent->width/2.0f;
-    float cos_heading = cosf(agent->heading);
-    float sin_heading = sinf(agent->heading);
+    float cos_heading = agent->heading_x;
+    float sin_heading = agent->heading_y;
     float corners[4][2];
     for (int i = 0; i < 4; i++) {
         corners[i][0] = agent->x + (offsets[i][0]*half_length*cos_heading - offsets[i][1]*half_width*sin_heading);
@@ -788,36 +851,25 @@ void collision_check(Robotaxi* env, int agent_idx) {
         }
         if (collided == OFFROAD) break;
     }
-    for(int i = 0; i < env->active_agent_count; i++){
-        int index = env->active_agent_indices[i];
+    for(int i = 0; i < MAX_CARS; i++){
+        int index = -1;
+        if(i < env->active_agent_count){
+            index = env->active_agent_indices[i];
+        } else if (i < env->num_cars){
+            index = env->static_car_indices[i - env->active_agent_count];
+        }
+        if(index == -1) continue;
         if(index == agent_idx) continue;
         Entity* entity = &env->entities[index];
         float x1 = entity->x;
         float y1 = entity->y;
-        float dist = sqrtf((x1 - agent->x)*(x1 - agent->x) + (y1 - agent->y)*(y1 - agent->y));
-        if(dist > 15.0f) continue;
-        float other_corners[4][2];
-        for (int z = 0; z < 4; z++) {
-            float other_cos_heading = cosf(entity->heading);
-            float other_sin_heading = sinf(entity->heading);
-            float other_half_length = entity->length / 2.0f;
-            float other_half_width = entity->width / 2.0f;
-            other_corners[z][0] = entity->x + (offsets[z][0]*other_half_length*other_cos_heading - offsets[z][1]*other_half_width*other_sin_heading);
-            other_corners[z][1] = entity->y + (offsets[z][0]*other_half_length*other_sin_heading + offsets[z][1]*other_half_width*other_cos_heading);
+        float dist = ((x1 - agent->x)*(x1 - agent->x) + (y1 - agent->y)*(y1 - agent->y));
+        if(dist > 225.0f) continue;
+        if(check_aabb_collision(agent, entity)) {
+            collided = VEHICLE_COLLISION;
+            car_collided_with_index = index;
+            break;
         }
-        for (int k = 0; k < 4; k++) { // Check each edge of the bounding box
-            int next = (k + 1) % 4;
-            for (int l = 0; l < 4; l++) { // Check each edge of the bounding box
-                int next_l = (l + 1) % 4;
-                if (check_line_intersection(corners[k], corners[next], other_corners[l], other_corners[next_l])) {
-                    collided = VEHICLE_COLLISION;
-                    car_collided_with_index = index;
-                    break;
-                }
-            }
-            if (collided == VEHICLE_COLLISION) break;
-        }
-        if (collided == VEHICLE_COLLISION) break;
     }
     agent->collision_state = collided;
     // spawn immunity for collisions with other agent cars as agent_idx respawns
@@ -829,7 +881,7 @@ void collision_check(Robotaxi* env, int agent_idx) {
     }
 
     // spawn immunity for collisions with other cars who just respawned
-    if(car_collided_with_index == -1) return;
+    if(car_collided_with_index ==-1) return;
     int respawned_collided_with_car = env->entities[car_collided_with_index].respawn_timestep != -1;
     int exceeded_spawn_immunity_collided_with_car = env->timestep - env->entities[car_collided_with_index].respawn_timestep >= env->spawn_immunity_timer;
     int within_spawn_immunity_collided_with_car = env->timestep - env->entities[car_collided_with_index].respawn_timestep < env->spawn_immunity_timer;
@@ -841,16 +893,17 @@ void collision_check(Robotaxi* env, int agent_idx) {
     } 
 }
 
+
 float normalize_value(float value, float min, float max){
     return (value - min) / (max - min);
 }
 
-float reverse_normalize_value(float value, float min, float max){
+float reverse_normalize_value(float value){
     return value*100.0f;
 }
 
 void compute_observations(Robotaxi* env) {
-    int max_obs = 6 + 7*(MAX_CARS - 1) + 7*MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = VISION_CNN_SIZE + SELF_OBSERVATIONS;
     memset(env->observations, 0, max_obs*env->active_agent_count*sizeof(float));
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations; 
     for(int i = 0; i < env->active_agent_count; i++) {
@@ -858,8 +911,8 @@ void compute_observations(Robotaxi* env) {
         Entity* ego_entity = &env->entities[env->active_agent_indices[i]];
         if(ego_entity->type > 3) break;
         float ego_heading = ego_entity->heading;
-        float cos_heading = cosf(ego_heading);
-        float sin_heading = sinf(ego_heading);
+        float cos_heading = ego_entity->heading_x;
+        float sin_heading = ego_entity->heading_y;
         float ego_speed = sqrtf(ego_entity->vx*ego_entity->vx + ego_entity->vy*ego_entity->vy);
         // Set goal distances
         float goal_x = ego_entity->goal_position_x - ego_entity->x;
@@ -867,96 +920,106 @@ void compute_observations(Robotaxi* env) {
         // Rotate to ego vehicle's frame
         float rel_goal_x = goal_x*cos_heading + goal_y*sin_heading;
         float rel_goal_y = -goal_x*sin_heading + goal_y*cos_heading;
-        //obs[0] = normalize_value(rel_goal_x, MIN_REL_GOAL_COORD, MAX_REL_GOAL_COORD);
-        //obs[1] = normalize_value(rel_goal_y, MIN_REL_GOAL_COORD, MAX_REL_GOAL_COORD);
         obs[0] = rel_goal_x/100.0f;
         obs[1] = rel_goal_y/100.0f;
-        //obs[2] = ego_speed / MAX_SPEED;
         obs[2] = ego_speed / 100.0f;
-        obs[3] = ego_entity->width / MAX_VEH_WIDTH;
-        obs[4] = ego_entity->length / MAX_VEH_LEN;
+        obs[3] = ego_entity->width / 15.0f;
+        obs[4] = ego_entity->length / 30.0f;
         obs[5] = (ego_entity->collision_state > 0) ? 1 : 0;
-        
-        // Relative Pos of other cars
-        int obs_idx = 6;  // Start after goal distances
-        int cars_seen = 0;
-        for(int j = 0; j < env->active_agent_count; j++) {
-            int index = env->active_agent_indices[j];
-            if(index == -1) continue;
-            if(env->entities[index].type > 3) break;
-            if(index == env->active_agent_indices[i]) continue;  // Skip self, but don't increment obs_idx
-            Entity* other_entity = &env->entities[index];
-            // Store original relative positions
-            float dx = other_entity->x - ego_entity->x;
-            float dy = other_entity->y - ego_entity->y;
-            float dist = sqrtf(dx*dx + dy*dy);
-            if(dist > 50.0f) continue;
-            // Rotate to ego vehicle's frame
-            float rel_x = dx*cos_heading + dy*sin_heading;
-            float rel_y = -dx*sin_heading + dy*cos_heading;
-            // Store observations with correct indexing
-            obs[obs_idx] = rel_x / 100.0f;
-            obs[obs_idx + 1] = rel_y / 100.0f;
-            obs[obs_idx + 2] = other_entity->width / MAX_VEH_WIDTH;
-            obs[obs_idx + 3] = other_entity->length / MAX_VEH_LEN;
-            // relative heading
-            float rel_heading = normalize_heading(other_entity->heading - ego_heading);
-            obs[obs_idx + 4] = cosf(rel_heading) / MAX_ORIENTATION_RAD;
-            obs[obs_idx + 5] = sinf(rel_heading) / MAX_ORIENTATION_RAD;
-            // relative speed
-            float other_speed = sqrtf(other_entity->vx*other_entity->vx + other_entity->vy*other_entity->vy);
-            obs[obs_idx + 6] = other_speed / MAX_SPEED;
-            cars_seen++;
-            obs_idx += 7;  // Move to next observation slot
-        }
-        int remaining_partner_obs = (MAX_CARS - 1 - cars_seen) * 7;
-        memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
-        obs_idx += remaining_partner_obs;
-        // map observations
+        // Vision CNN
+        int map_size = VISION_CNN_SIZE / 2;
+        int vision_cnn_offset = SELF_OBSERVATIONS;
         int entity_list[MAX_ROAD_SEGMENT_OBSERVATIONS*2];  // Array big enough for all neighboring cells
         int grid_idx = getGridIndex(env, ego_entity->x, ego_entity->y);
         int list_size = get_neighbor_cache_entities(env, grid_idx, entity_list, MAX_ROAD_SEGMENT_OBSERVATIONS);
-        for(int k = 0; k < list_size; k++){
-            int entity_idx = entity_list[k*2];
-            int geometry_idx = entity_list[k*2+1];
+        // split map based on vision window of 11x11 around ego vehicle
+        int vision_cnn_size  = map_size;
+        /* based on the locations of entities found from neighbor cache, place observation of 1 if in that cell location or 0 otherwise*/
+        obs[vision_cnn_offset + 10 * 21 + 10] = 2.0f;
+        for(int j = 0; j < list_size; j++){
+            int entity_idx = entity_list[j*2];
+            int geometry_idx = entity_list[j*2+1];
             Entity* entity = &env->entities[entity_idx];
+            if(entity->type != ROAD_EDGE) continue;
             float start_x = entity->traj_x[geometry_idx];
             float start_y = entity->traj_y[geometry_idx];
             float end_x = entity->traj_x[geometry_idx+1];
             float end_y = entity->traj_y[geometry_idx+1];
-            float mid_x = (start_x + end_x) / 2.0f;
-            float mid_y = (start_y + end_y) / 2.0f;
-            float rel_x = mid_x - ego_entity->x;
-            float rel_y = mid_y - ego_entity->y;
-            float x_obs = rel_x*cos_heading + rel_y*sin_heading;
-            float y_obs = -rel_x*sin_heading + rel_y*cos_heading;
-            float length = relative_distance_2d(mid_x, mid_y, end_x, end_y);
-            float width = 0.1;
-            // Calculate angle from ego to midpoint (vector from ego to midpoint)
-            float dx = end_x - mid_x;
-            float dy = end_y - mid_y;
-            float dx_norm = dx;
-            float dy_norm = dy;
-            float hypot = sqrtf(dx*dx + dy*dy);
-            if(hypot > 0) {
-                dx_norm /= hypot;
-                dy_norm /= hypot;
+            // Convert to relative coordinates from ego vehicle
+            float rel_start_x = start_x - ego_entity->x;
+            float rel_start_y = start_y - ego_entity->y;
+            float rel_end_x = end_x - ego_entity->x;
+            float rel_end_y = end_y - ego_entity->y;
+            // Rotate coordinates to ego vehicle's frame using negative heading
+            float rot_start_x = rel_start_x * cos_heading + rel_start_y * sin_heading;
+            float rot_start_y = (-rel_start_x * sin_heading + rel_start_y * cos_heading) * -1.0f;
+            float rot_end_x = rel_end_x * cos_heading + rel_end_y * sin_heading;
+            float rot_end_y = (-rel_end_x * sin_heading + rel_end_y * cos_heading) * -1.0f;
+            // Convert to grid cell coordinates (21x21 grid, centered on ego)
+            // Each cell is 5m x 5m, so divide by 5 and add 10 to center
+            int grid_start_x = (int)(rot_start_x / 1.0f) + 10;
+            int grid_start_y = (int)(rot_start_y / 1.0f) + 10;
+            int grid_end_x = (int)(rot_end_x / 1.0f) + 10;
+            int grid_end_y = (int)(rot_end_y / 1.0f) + 10;
+            // Use Bresenham's line algorithm to mark all cells the line passes through
+            int dx = abs(grid_end_x - grid_start_x);
+            int dy = abs(grid_end_y - grid_start_y);
+            int sx = (grid_start_x < grid_end_x) ? 1 : -1;
+            int sy = (grid_start_y < grid_end_y) ? 1 : -1;
+            int err = dx - dy;
+
+            int x = grid_start_x;
+            int y = grid_start_y;
+
+            while(1) {
+                // Only mark cells within the 21x21 grid
+                if(x >= 0 && x < 21 && y >= 0 && y < 21) {
+                    int cell_idx = y * 21 + x;
+                    if(obs[vision_cnn_offset + cell_idx] != 2.0f){
+                        obs[vision_cnn_offset + cell_idx] = 1.0f;
+                    }
+                }
+
+                if(x == grid_end_x && y == grid_end_y) break;
+                int e2 = 2 * err;
+                if(e2 > -dy) {
+                    err -= dy;
+                    x += sx;
+                }
+                if(e2 < dx) {
+                    err += dx;
+                    y += sy;
+                }
             }
-            // Compute sin and cos of relative angle directly without atan2f
-            float cos_angle = dx_norm*cos_heading + dy_norm*sin_heading;
-            float sin_angle = -dx_norm*sin_heading + dy_norm*cos_heading;
-            obs[obs_idx] = x_obs / 100.0f;
-            obs[obs_idx + 1] = y_obs / 100.0f;
-            obs[obs_idx + 2] = length / MAX_ROAD_SEGMENT_LENGTH;
-            obs[obs_idx + 3] = width / MAX_ROAD_SCALE;
-            obs[obs_idx + 4] = cos_angle / MAX_ORIENTATION_RAD;
-            obs[obs_idx + 5] = sin_angle / MAX_ORIENTATION_RAD;
-            obs[obs_idx + 6] = entity->type - 4.0f;
-            obs_idx += 7;
         }
-        int remaining_obs = (MAX_ROAD_SEGMENT_OBSERVATIONS - list_size) * 7;
-        // Set the entire block to 0 at once
-        memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
+        if(i != env->human_agent_idx){
+            continue;
+        }
+        // visualize the vision cnn print
+        // printf("\nVision CNN Grid (21x21):\n");
+        // printf("  "); // Add some padding for alignment
+        // // Print column numbers
+        // for(int x = 0; x < 21; x++) {
+        //     printf("%2d ", x);
+        // }
+        // printf("\n");
+
+        // for(int y = 0; y < 21; y++) {
+        //     printf("%2d ", y); // Print row numbers
+        //     for(int x = 0; x < 21; x++) {
+        //         int cell_idx = y * 21 + x;
+        //         float value = obs[vision_cnn_offset + cell_idx];
+        //         if(value == 2.0f) {
+        //             printf(" E "); // E for Ego vehicle
+        //         } else if(value == 1.0f) {
+        //             printf(" R "); // R for Road
+        //         } else {
+        //             printf(" . "); // . for empty
+        //         }
+        //     }
+        //     printf("\n");
+        // }
+        // printf("\n");
     }
 }
 
@@ -1124,8 +1187,8 @@ void draw_agent_obs(Robotaxi* env, int agent_index){
     float (*observations)[max_obs] = (float(*)[max_obs])env->observations;
     float* agent_obs = &observations[agent_index][0];
     // draw goal
-    float goal_x = reverse_normalize_value(agent_obs[0], MIN_REL_GOAL_COORD, MAX_REL_GOAL_COORD);
-    float goal_y = reverse_normalize_value(agent_obs[1], MIN_REL_GOAL_COORD, MAX_REL_GOAL_COORD);
+    float goal_x = reverse_normalize_value(agent_obs[0]);
+    float goal_y = reverse_normalize_value(agent_obs[1]);
     DrawSphere((Vector3){goal_x, goal_y, 1}, 0.5f, GREEN);
     // First draw other agent observations
     int obs_idx = 6;  // Start after goal distances
@@ -1135,8 +1198,8 @@ void draw_agent_obs(Robotaxi* env, int agent_index){
             continue;
         }
         // Draw position of other agents
-        float x = reverse_normalize_value(agent_obs[obs_idx], MIN_RG_COORD, MAX_RG_COORD);
-        float y = reverse_normalize_value(agent_obs[obs_idx + 1], MIN_RG_COORD, MAX_RG_COORD);
+        float x = reverse_normalize_value(agent_obs[obs_idx]);
+        float y = reverse_normalize_value(agent_obs[obs_idx + 1]);
         DrawLine3D(
             (Vector3){0, 0, 0}, 
             (Vector3){x, y, 1}, 
@@ -1193,12 +1256,12 @@ void draw_agent_obs(Robotaxi* env, int agent_index){
         } 
         lineColor = PUFF_CYAN;
         // For road segments, draw line between start and end points
-        float x_middle = reverse_normalize_value(agent_obs[entity_idx], MIN_RG_COORD, MAX_RG_COORD);
-        float y_middle = reverse_normalize_value(agent_obs[entity_idx + 1], MIN_RG_COORD, MAX_RG_COORD);
+        float x_middle = reverse_normalize_value(agent_obs[entity_idx]);
+        float y_middle = reverse_normalize_value(agent_obs[entity_idx + 1]);
         float rel_angle_x = (agent_obs[entity_idx + 4]);
         float rel_angle_y = (agent_obs[entity_idx + 5]);
         float rel_angle = atan2f(rel_angle_y, rel_angle_x);
-        float segment_length = agent_obs[entity_idx + 2] * MAX_ROAD_SEGMENT_LENGTH;
+        float segment_length = agent_obs[entity_idx + 2] * 100.0f;
         // Calculate endpoint using the relative angle directly
         // Calculate endpoint directly
         float x_start = x_middle - segment_length*cosf(rel_angle);
