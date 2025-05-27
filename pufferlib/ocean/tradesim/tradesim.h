@@ -41,6 +41,8 @@ typedef struct Log {
     float realized_pnl;
     float capital;
     float illegal_move_pct;
+    float sharpe_ratio;
+    float sortino_ratio;
 } Log;
 
 typedef struct Client {
@@ -113,6 +115,8 @@ typedef struct TradeSim {
     float reward_illegal_move;
     float illegal_move_count;
     float episode_return;
+    float sharpe_ratio;
+    float sortino_ratio;
 } TradeSim;
 
 void read_data(TradeSim* env) {
@@ -169,7 +173,7 @@ void init(TradeSim* env) {
     env->entry_step = 0;
     read_data(env);
     env->returns = (double*)calloc(env->max_steps_per_episode, sizeof(double));
-    env->returns[0] = env->initial_capital;
+    env->returns[0] = 0;
     env->long_win_pct = 0;
     env->short_win_pct = 0;
     env->overall_win_pct = 0;
@@ -217,6 +221,8 @@ void add_log(TradeSim* env) {
     env->log.capital = env->capital;
     env->log.realized_pnl = env->realized_pnl;
     env->log.illegal_move_pct = env->illegal_move_count / (env->max_steps_per_episode);
+    env->log.sharpe_ratio = env->sharpe_ratio;
+    env->log.sortino_ratio = env->sortino_ratio;
 }
 
 void compute_observations(TradeSim* env) {
@@ -269,8 +275,8 @@ double step_trade(TradeSim* env, float action) {
             double slippage = current_price * fabs(env->position) * env->slippage_factor;
             env->unrealized_pnl = ((current_price - env->entry_price) * env->position) - commision - slippage;
             env->capital  = env->initial_capital + env->unrealized_pnl + env->realized_pnl;
-            env->returns[env->_step] = env->capital;
-            env->step_return = env->returns[env->_step] - env->returns[env->_step - 1];
+            // env->returns[env->_step] = env->capital;
+            // env->step_return = env->returns[env->_step] - env->returns[env->_step - 1];
         }
         return -2;
     }
@@ -376,7 +382,7 @@ double step_trade(TradeSim* env, float action) {
         }
     }
     env->capital  = env->initial_capital + env->unrealized_pnl + env->realized_pnl;
-    env->returns[env->_step] = env->capital;
+    env->returns[env->_step] = trade_pnl_pct;
     env->step_return = env->returns[env->_step] - env->returns[env->_step - 1];
     if(reset_internals) {
         env->position = 0;
@@ -388,14 +394,102 @@ double step_trade(TradeSim* env, float action) {
     env->overall_win_pct = (env->short_trade_wins + env->long_trade_wins) / (env->short_trades + env->long_trades + 1e-5);
     env->short_win_pct = env->short_trade_wins / (env->short_trades + 1e-5);
     env->long_win_pct = env->long_trade_wins / (env->long_trades + 1e-5);
-
     return trade_pnl_pct;
 }
 
+void close_all_positions(TradeSim* env) {
+    if (env->position == 0){
+        return;
+    }
+    double current_price = env->prices[env->_step];
+    double trade_pnl = (current_price - env->entry_price) * env->position;
+    double commision = current_price * fabs(env->position) * env->transaction_fee_pct*2.0;
+    double slippage = current_price * fabs(env->position) * env->slippage_factor*2.0;
+    double trade_pnl_pct = trade_pnl / (env->position * env->entry_price);
+    env->realized_pnl += trade_pnl - commision - slippage;
+    env->unrealized_pnl = 0;
+    if (trade_pnl > 0) {
+        env->long_trade_wins += 1;
+    } else {
+        env->short_trade_wins += 1;
+    }
+    env->overall_win_pct = (env->short_trade_wins + env->long_trade_wins) / (env->short_trades + env->long_trades + 1e-5);
+    env->short_win_pct = env->short_trade_wins / (env->short_trades + 1e-5);
+    env->long_win_pct = env->long_trade_wins / (env->long_trades + 1e-5);
+    env->position = 0;
+}
+
+float calculate_sharpe_ratio(TradeSim* env, int window, float risk_free_rate) {
+    if (env->_step < window) {
+        return env->returns[env->_step];
+    }
+    double mean = 0;
+    double std = 0;
+    for(int i = 0; i < window; i++) {
+        mean += env->returns[env->_step - i];
+    }
+    mean /= window;
+    mean -= risk_free_rate;
+    for(int i = 1; i < window; i++) {
+        std += pow(env->returns[env->_step - i] - mean, 2);
+    }
+    std /= (window - 1);
+    std = sqrt(std);
+    if (std == 0) {
+        return env->returns[env->_step];
+    }
+    
+    float sharpe_ratio = mean / std;
+    return sharpe_ratio * sqrt(252);
+}
+
+float calculate_sortino_ratio(TradeSim* env, int window, float risk_free_rate) {
+    if (env->_step < window) {
+        return env->returns[env->_step];
+    }
+    double mean = 0;
+    double downside_std = 0;
+    int downside_count = 0;
+    
+    // Calculate mean return
+    for(int i = 0; i < window; i++) {
+        mean += env->returns[env->_step - i];
+        
+    }
+    mean /= window;
+    mean -= risk_free_rate;  // This is for the numerator (excess return)
+    // Calculate downside deviation using target return (0 or risk_free_rate)
+    float target_return = 0;  // or risk_free_rate if you prefer
+    for(int i = 0; i < window; i++) {
+        float return_diff = env->returns[env->_step - i];  
+        if (return_diff < target_return) {  // Only consider returns below target
+            downside_std += return_diff*return_diff;
+            downside_count++;
+        }
+    }
+    
+    // Calculate downside deviation
+    if (downside_count > 0) {
+        downside_std /= downside_count;
+        downside_std = sqrt(downside_std);
+    } else {
+        return mean;  // If no downside returns, return the excess return
+    }
+    
+    if (downside_std == 0) {
+        return env->returns[env->_step];
+    }
+    
+    float sortino_ratio = mean / downside_std;
+    return sortino_ratio * sqrt(252);    
+}
 void c_step(TradeSim* env) {
     env->terminals[0] = 0;
     env->rewards[0] = 0.0;
-    if(env->_step >= env->max_steps_per_episode) {
+    if(env->_step >= env->max_steps_per_episode || env->capital <= 0) {
+        close_all_positions(env);
+        env->sharpe_ratio = calculate_sharpe_ratio(env, 100, 0);
+        env->sortino_ratio = calculate_sortino_ratio(env, 100, 0);
         add_log(env);
         c_reset(env);
     }
@@ -405,11 +499,6 @@ void c_step(TradeSim* env) {
     double trade_pnl_pct = step_trade(env, action);
     env->_step += 1;
     if(env->reward_type == REWARD_TYPE_SIMPLE_PnL) {
-        /*if(trade_pnl_pct > 0.0){
-            env->rewards[0] = 1.0f;
-        } else if(trade_pnl_pct < 0.0){
-            env->rewards[0] = -1.0f;   
-        }*/
         if(trade_pnl_pct == -2){
             env->rewards[0] = env->reward_illegal_move;
         } else {

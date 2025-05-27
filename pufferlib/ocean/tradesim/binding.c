@@ -27,5 +27,7 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "realized_pnl", log->realized_pnl);
     assign_to_dict(dict, "capital", log->capital);
     assign_to_dict(dict, "illegal_move_pct", log->illegal_move_pct);
+    assign_to_dict(dict, "sharpe_ratio", log->sharpe_ratio);
+    assign_to_dict(dict, "sortino_ratio", log->sortino_ratio);
     return 0;
 }
