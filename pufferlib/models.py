@@ -8,6 +8,202 @@ import pufferlib.emulation
 import pufferlib.pytorch
 import pufferlib.spaces
 
+class SimpleWM(nn.Module):
+    def __init__(self, input_size, atn_dim, hidden_size=128):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.atn_dim = atn_dim
+
+        x = input_size
+        h = hidden_size
+
+        self.encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(x, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, h)),
+        )
+
+        self.lstm = nn.LSTM(h, h)
+        self.cell = torch.nn.LSTMCell(h, h)
+        self.cell.weight_ih = self.lstm.weight_ih_l0
+        self.cell.weight_hh = self.lstm.weight_hh_l0
+        self.cell.bias_ih = self.lstm.bias_ih_l0
+        self.cell.bias_hh = self.lstm.bias_hh_l0
+
+        self.dynamics = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(h + atn_dim, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, x)),
+        )
+        self.reward = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(h + atn_dim, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 1)),
+        )
+        self.terminal = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(h + atn_dim, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 2*h)),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 1)),
+        )
+
+    def sequence(self, x, atns):
+        z = self.encoder(x)
+        z, _ = self.lstm(z)
+        atns = torch.nn.functional.one_hot(atns, self.atn_dim)
+        ha = torch.cat([z, atns], dim=-1)
+        x_pred = self.dynamics(ha)
+        reward = self.reward(ha).squeeze(-1)
+        terminal = self.terminal(ha).squeeze(-1)
+        return z, x_pred, reward, terminal
+
+    def imagine_from_real(self, x, atn, state):
+        z = self.encoder(x)
+        z, c = self.cell(z, state)
+        state = (z, c)
+        atn = torch.nn.functional.one_hot(atn, self.atn_dim)
+        ha = torch.cat([z, atn], dim=-1)
+        x_pred = self.dynamics(ha)
+        reward = self.reward(ha)
+        terminal = self.terminal(ha)
+        return x_pred, reward, terminal, state
+
+    def imagine_from_sample(self, z, atn):
+        atn = torch.nn.functional.one_hot(atn, self.atn_dim)
+        ha = torch.cat([z, atn], dim=-1)
+        x_pred = self.dynamics(ha)
+        reward = self.reward(ha)
+        terminal = self.terminal(ha)
+        return x_pred, reward, terminal
+
+class RSSM(nn.Module):
+    def __init__(self, input_size, atn_dim, hidden_size=128, z_dim=32, z_samples=32):
+        super().__init__()
+        z_flat = z_dim * z_samples
+        self.z_flat = z_flat
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.cell_size = 4 * hidden_size
+
+        x = input_size
+        h = hidden_size
+        c = self.cell_size
+
+        self.cell = torch.nn.LSTMCell(z_flat + atn_dim, c)
+
+        self.encoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(x + c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 3*h)),
+            nn.RMSNorm(3*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(3*h, 4*h)),
+            nn.RMSNorm(4*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(4*h, z_dim))
+        )
+
+        self.dynamics = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 3*h)),
+            nn.RMSNorm(3*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(3*h, 4*h)),
+            nn.RMSNorm(4*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(4*h, z_dim))
+        )
+
+        self.wm_hidden = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.z_flat + c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, h))
+        )
+        
+        self.reward = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.z_flat + c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 1))
+        )
+
+        self.terminal = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.z_flat + c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 2))
+        )
+
+        self.decoder = torch.nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.z_flat + c, 2*h)),
+            nn.RMSNorm(2*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(2*h, 3*h)),
+            nn.RMSNorm(3*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(3*h, 4*h)),
+            nn.RMSNorm(4*h),
+            nn.GELU(),
+            pufferlib.pytorch.layer_init(nn.Linear(4*h, x))
+        )
+
+    def sample(self, logits, n=32, mix=0.01):
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        probs = (1.0 - mix)*probs + mix*torch.ones_like(probs)/probs.shape[-1]
+        categorical = torch.multinomial(probs, n, replacement=True)
+        one_hot = torch.nn.functional.one_hot(categorical, num_classes=probs.shape[-1])
+
+        probs = probs.unsqueeze(-2)
+        return one_hot + probs - probs.detach()
+
+    def forward(self, x, h_prev, z_prev, a_prev):
+        cell_input = torch.cat([z_prev, a_prev], dim=-1)
+        h, c = self.cell(cell_input, h_prev)
+        state = (h, c)
+
+        z = self.encoder(torch.cat([x, h], dim=-1))
+        z_hat = self.dynamics(h)
+
+        samp = self.sample(z)
+        samp = samp.view(samp.shape[0], -1)
+
+        hz = torch.cat([h, samp], dim=-1)
+        reward = self.reward(hz)
+        terminal = self.terminal(hz)
+        x_hat = self.decoder(hz)
+        hidden = self.wm_hidden(hz)
+
+        return z, z_hat, samp, reward, terminal, x_hat, state, hidden
+
+    def imagine(self, h_prev, z_prev, a_prev):
+        cell_input = torch.cat([z_prev, a_prev], dim=-1)
+        h, c = self.cell(cell_input, h_prev)
+        state = (h, c)
+
+        z_hat = self.dynamics(h)
+
+        samp = self.sample(z_hat)
+        samp = samp.view(samp.shape[0], -1)
+
+        hz = torch.cat([h, samp], dim=-1)
+        reward = self.reward(hz)
+        terminal = self.terminal(hz)
+        x_hat = self.decoder(hz)
+        hidden = self.wm_hidden(hz)
+
+        return z_hat, samp, reward, terminal, x_hat, state, hidden
 
 class Default(nn.Module):
     '''Default PyTorch policy. Flattens obs and applies a linear layer.
@@ -39,6 +235,7 @@ class Default(nn.Module):
             self.encoder = nn.Linear(input_size, self.hidden_size)
         else:
             num_obs = np.prod(env.single_observation_space.shape)
+            self.num_obs = num_obs
             self.encoder = torch.nn.Sequential(
                 pufferlib.pytorch.layer_init(nn.Linear(num_obs, hidden_size)),
                 nn.GELU(),
@@ -51,6 +248,7 @@ class Default(nn.Module):
                     nn.Linear(hidden_size, num_atns), std=0.01)
         elif not self.is_continuous:
             num_atns = env.single_action_space.n
+            self.num_atns = num_atns
             self.decoder = pufferlib.pytorch.layer_init(
                 nn.Linear(hidden_size, num_atns), std=0.01)
         else:
@@ -130,9 +328,13 @@ class LSTMWrapper(nn.Module):
         #self.pre_layernorm = nn.LayerNorm(hidden_size)
         #self.post_layernorm = nn.LayerNorm(hidden_size)
 
-    def forward_eval(self, observations, state):
+    def forward_eval(self, observations, state, encode=True):
         '''Forward function for inference. 3x faster than using LSTM directly'''
-        hidden = self.policy.encode_observations(observations, state=state)
+        if encode:
+            hidden = self.policy.encode_observations(observations, state=state)
+        else:
+            hidden = observations
+
         h = state['lstm_h']
         c = state['lstm_c']
 

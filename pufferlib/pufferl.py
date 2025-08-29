@@ -1,4 +1,4 @@
-## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
+## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full details
 # This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
 # Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
 
@@ -29,6 +29,7 @@ import torch.utils.cpp_extension
 
 import pufferlib
 import pufferlib.sweep
+import pufferlib.models
 import pufferlib.vector
 import pufferlib.pytorch
 try:
@@ -104,6 +105,15 @@ class PuffeRL:
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
 
+        self.wm_observations = torch.zeros(0, horizon, *obs_space.shape,
+            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
+            pin_memory=device == 'cuda' and config['cpu_offload'],
+            device='cpu' if config['cpu_offload'] else device)
+        self.wm_actions = torch.zeros(0, horizon, *atn_space.shape, device=device,
+            dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype])
+        self.wm_rewards = torch.zeros(0, horizon, device=device)
+        self.wm_terminals = torch.zeros(0, horizon, device=device)
+ 
         # LSTM
         if config['use_rnn']:
             n = vecenv.agents_per_batch
@@ -140,29 +150,34 @@ class PuffeRL:
             self.policy.forward_eval = torch.compile(policy, mode=config['compile_mode'])
             pufferlib.pytorch.sample_logits = torch.compile(pufferlib.pytorch.sample_logits, mode=config['compile_mode'])
 
-        # Optimizer
-        if config['optimizer'] == 'adam':
-            optimizer = torch.optim.Adam(
-                self.policy.parameters(),
-                lr=config['learning_rate'],
-                betas=(config['adam_beta1'], config['adam_beta2']),
-                eps=config['adam_eps'],
-            )
-        elif config['optimizer'] == 'muon':
-            from heavyball import ForeachMuon
-            warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
-            import heavyball.utils
-            heavyball.utils.compile_mode = config['compile_mode'] if config['compile'] else None
-            optimizer = ForeachMuon(
-                self.policy.parameters(),
-                lr=config['learning_rate'],
-                betas=(config['adam_beta1'], config['adam_beta2']),
-                eps=config['adam_eps'],
-            )
-        else:
-            raise ValueError(f'Unknown optimizer: {config["optimizer"]}')
+        #self.world_model = pufferlib.models.RSSM(
+        #    policy.policy.num_obs, policy.policy.num_atns,
+        #    policy.hidden_size).to(config['device'])
 
+        self.world_model = pufferlib.models.SimpleWM(
+            policy.policy.num_obs, policy.policy.num_atns,
+            policy.hidden_size).to(config['device'])
+
+        # Optimizer
+        from heavyball import ForeachMuon
+        warnings.filterwarnings(action='ignore', category=UserWarning, module=r'heavyball.*')
+        import heavyball.utils
+        heavyball.utils.compile_mode = config['compile_mode'] if config['compile'] else None
+        optimizer = ForeachMuon(
+            self.policy.parameters(),
+            lr=config['learning_rate'],
+            betas=(config['adam_beta1'], config['adam_beta2']),
+            eps=config['adam_eps'],
+        )
         self.optimizer = optimizer
+
+        world_optimizer = ForeachMuon(
+            self.world_model.parameters(),
+            lr=config['world_model_learning_rate'],
+            betas=(config['adam_beta1'], config['adam_beta2']),
+            eps=config['adam_eps'],
+        )
+        self.world_optimizer = world_optimizer
 
         # Logging
         self.logger = logger
@@ -329,22 +344,13 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
+        '''
         for mb in range(self.total_minibatches):
             profile('train_misc', epoch, nest=True)
             self.amp_context.__enter__()
 
-            shape = self.values.shape
-            advantages = torch.zeros(shape, device=device)
-            advantages = compute_puff_advantage(self.values, self.rewards,
-                self.terminals, self.ratio, advantages, config['gamma'],
-                config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
-
             profile('train_copy', epoch)
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
-            prio_probs = (prio_weights + 1e-6)/(prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs, self.minibatch_segments)
-            mb_prio = (self.segments*prio_probs[idx, None])**-anneal_beta
+            idx = slice(None)
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
@@ -353,8 +359,6 @@ class PuffeRL:
             mb_truncations = self.truncations[idx]
             mb_ratio = self.ratio[idx]
             mb_values = self.values[idx]
-            mb_returns = advantages[idx] + mb_values
-            mb_advantages = advantages[idx]
 
             profile('train_forward', epoch)
             if not config['use_rnn']:
@@ -380,12 +384,13 @@ class PuffeRL:
                 approx_kl = ((ratio - 1) - logratio).mean()
                 clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
 
-            adv = advantages[idx]
+            adv = torch.zeros_like(mb_values)
             adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
                 ratio, adv, config['gamma'], config['gae_lambda'],
                 config['vtrace_rho_clip'], config['vtrace_c_clip'])
-            adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            mb_advantages = adv
+            mb_returns = adv + mb_values
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
             # Losses
             pg_loss1 = -adv * ratio
@@ -423,17 +428,21 @@ class PuffeRL:
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+        '''
+
+        self.train_world_model(losses)
+        self.rl_world_model(losses)
 
         # Reprioritize experience
         profile('train_misc', epoch)
         if config['anneal_lr']:
             self.scheduler.step()
 
-        y_pred = self.values.flatten()
-        y_true = advantages.flatten() + self.values.flatten()
-        var_y = y_true.var()
-        explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
-        losses['explained_variance'] = explained_var.item()
+        #y_pred = self.values.flatten()
+        #y_true = advantages.flatten() + self.values.flatten()
+        #var_y = y_true.var()
+        #explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
+        #losses['explained_variance'] = explained_var.item()
 
         profile.end()
         logs = None
@@ -453,6 +462,424 @@ class PuffeRL:
             self.msg = f'Checkpoint saved at update {self.epoch}'
 
         return logs
+
+    def train_world_model(self, losses):
+        sz = self.config['buffer_size']
+        self.wm_observations = torch.cat([
+            self.observations, self.wm_observations], dim=0)[:sz]
+        self.wm_actions = torch.cat([
+            self.actions, self.wm_actions], dim=0)[:sz]
+        self.wm_rewards = torch.cat([
+            self.rewards, self.wm_rewards], dim=0)[:sz]
+        self.wm_terminals = torch.cat([
+            self.terminals, self.wm_terminals], dim=0)[:sz]
+
+
+        epoch = self.epoch
+        config = self.config
+        device = config['device']
+
+        for mb in range(32*self.total_minibatches):
+            idx = torch.randint(0, self.wm_observations.shape[0],
+                size=(self.minibatch_segments,), device=device)
+            mb_obs = self.wm_observations[idx]
+            mb_actions = self.wm_actions[idx]
+            mb_rewards = self.wm_rewards[idx]
+            mb_terminals = self.wm_terminals[idx]
+
+            reward_loss = 0
+            terminal_loss = 0
+            recon_loss = 0
+            dyn_loss = 0
+            rep_loss = 0
+            hidden_loss = 0
+
+            n = self.minibatch_segments
+            lstm_state = dict(
+                lstm_h=torch.zeros(n, self.policy.hidden_size, device=device),
+                lstm_c=torch.zeros(n, self.policy.hidden_size, device=device),
+            )
+
+            z, x_pred, reward, terminal = self.world_model.sequence(mb_obs, mb_actions)
+
+            '''
+            all_obs = []
+            all_reward = []
+            all_terminal = []
+
+            for t in range(config['bptt_horizon']):
+                if t % 4 == 0:
+                    x = mb_obs[:, t]
+
+                x, reward, terminal = self.world_model.imagine_from_real(
+                    x, mb_actions[:, t])
+
+                all_obs.append(x)
+                all_reward.append(reward)
+                all_terminal.append(terminal)
+
+            x_pred = torch.stack(all_obs, dim=1)
+            reward = torch.stack(all_reward, dim=1).squeeze(-1)
+            terminal = torch.stack(all_terminal, dim=1).squeeze(-1)
+            '''
+
+
+            #state = dict(
+            #    lstm_h=None,
+            #    lstm_c=None,
+            #)
+            #with torch.no_grad():
+            #    self.policy(mb_obs, state)
+
+            #hidden = state['hidden']
+            reconstruction_loss = torch.nn.functional.mse_loss(
+                x_pred[:, :-1], mb_obs[:, 1:])
+
+            reward_loss = torch.nn.functional.mse_loss(
+                reward[:, :-1], mb_rewards[:, 1:])
+
+            terminal_loss = torch.nn.functional.mse_loss(
+                terminal[:, :-1], mb_terminals[:, 1:])
+
+            #z_log_probs = torch.nn.functional.log_softmax(z_pred[:, :-1], dim=-1).detach()
+            #z_pred_log_probs = torch.nn.functional.log_softmax(z[:, 1:], dim=-1)
+            #z_loss = torch.nn.functional.kl_div(z_pred_log_probs, z_log_probs, reduction='batchmean', log_target=True)
+
+            #z_loss = torch.nn.functional.mse_loss(
+            #    z_pred[:, :-1], z[:, 1:])
+
+            #z_loss = torch.nn.functional.mse_loss(z_pred, z.detach())
+
+            #losses['world_rep'] += world_rep_loss.item() / self.total_minibatches
+            losses['reconstruction'] += reconstruction_loss.item() / self.total_minibatches
+            losses['reward_loss'] += reward_loss.item() / self.total_minibatches
+            losses['terminal_loss'] += terminal_loss.item() / self.total_minibatches
+            #losses['z_loss'] += z_loss.item() / self.total_minibatches
+
+            # Value
+            loss = (
+                reward_loss
+                + terminal_loss
+                #+ z_loss
+                #+ world_rep_loss
+                + reconstruction_loss
+            )
+
+            # Learn on accumulated minibatches
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.world_model.parameters(), config['max_grad_norm'])
+            self.world_optimizer.step()
+            self.world_optimizer.zero_grad()
+
+    def rl_world_model(self, losses):
+        profile = self.profile
+        epoch = self.epoch
+        profile('train', epoch)
+        config = self.config
+        device = config['device']
+
+        clip_coef = config['clip_coef']
+        vf_clip = config['vf_clip_coef']
+        self.ratio[:] = 1
+
+        for mb in range(4*self.total_minibatches):
+            idx = torch.randint(0, self.wm_observations.shape[0],
+                size=(self.minibatch_segments,), device=device)
+            mb_obs = self.wm_observations[idx]
+            mb_actions = self.wm_actions[idx]
+            mb_rewards = self.wm_rewards[idx]
+            mb_terminals = self.wm_terminals[idx]
+
+            profile('train_forward', epoch)
+            if not config['use_rnn']:
+                mb_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+
+            state = dict(
+                action=mb_actions,
+                lstm_h=None,
+                lstm_c=None,
+            )
+
+            #logits, newvalue = self.policy(mb_obs, state)
+            #actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
+
+            # Hallucinate trajectories
+            all_logits = []
+            all_newvalue = []
+            all_newlogprob = []
+            all_entropy = []
+            all_reward = []
+            all_terminal = []
+            all_actions = []
+            all_logprobs = []
+            all_obs = []
+
+            n = self.minibatch_segments
+            h = self.policy.hidden_size
+            state = dict(
+                action=mb_actions,
+                lstm_h=None,
+                lstm_c=None,
+            )
+            wm_state = (
+                torch.zeros(n, h, device=device),
+                torch.zeros(n, h, device=device),
+            )
+
+
+            x = mb_obs[:, 0]
+            for t in range(config['bptt_horizon']):
+                '''
+                # Old real data
+                logits, value = self.policy.forward_eval(mb_obs[:, t], state)
+                action = mb_actions[:, t]
+                _, logprob, entropy = pufferlib.pytorch.sample_logits(logits, action=action)
+
+                reward = mb_rewards[:, t]
+                terminal = mb_terminals[:, t]
+
+                # New real data
+                x, reward, terminal, _, _, _, _ = self.vecenv.recv()
+                x = torch.from_numpy(x).to(self.config['device'])
+                logits, value = self.policy.forward_eval(x, state)
+                action, logprob, entropy = pufferlib.pytorch.sample_logits(logits)
+                cpu_action = action.cpu().numpy().reshape(self.vecenv.action_space.shape)
+                self.vecenv.send(cpu_action)
+
+                reward = torch.from_numpy(reward).to(self.config['device'])
+                terminal = torch.from_numpy(terminal).to(self.config['device'])
+                '''
+
+                logits, value = self.policy.forward_eval(x, state)
+                action, logprob, entropy = pufferlib.pytorch.sample_logits(logits)
+                with torch.no_grad():
+                    x, reward, terminal, wm_state = self.world_model.imagine_from_real(
+                        x, action.long(), wm_state)
+
+
+                x = torch.clamp(x, -1, 1)
+                reward = torch.clamp(reward, -1, 1)
+                terminal = torch.clamp(terminal, 0, 1)
+
+                #reward = mb_rewards[:, t]
+                #terminal = mb_terminals[:, t]
+ 
+                all_reward.append(reward)
+                all_terminal.append(terminal)
+                all_actions.append(action)
+                all_logprobs.append(logprob)
+                all_logits.append(logits)
+                all_newvalue.append(value)
+                all_entropy.append(entropy)
+
+
+            logits = torch.stack(all_logits, dim=1)
+            newvalue = torch.stack(all_newvalue, dim=1).squeeze(-1)
+            newlogprob = torch.stack(all_logprobs, dim=1)
+            entropy = torch.stack(all_entropy, dim=1)
+            mb_rewards = torch.stack(all_reward, dim=1).squeeze(-1).detach()
+            mb_terminals = torch.stack(all_terminal, dim=1).squeeze(-1).float()
+            #mb_terminals = (mb_terminals > 0.8).float().detach()
+            mb_actions = torch.stack(all_actions, dim=1)
+            mb_logprobs = newlogprob.detach()
+            mb_values = newvalue.detach()
+
+            profile('train_misc', epoch)
+            newlogprob = newlogprob.reshape(mb_logprobs.shape)
+            logratio = newlogprob - newlogprob.detach()
+            ratio = logratio.exp()
+
+            adv = torch.zeros_like(mb_values)
+            adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
+                ratio, adv, config['gamma'], config['gae_lambda'],
+                config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            mb_advantages = adv
+            mb_returns = adv + mb_values
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            # Losses
+            pg_loss = (-adv * ratio).mean()
+
+            newvalue = newvalue.view(mb_returns.shape)
+            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+            v_loss_unclipped = (newvalue - mb_returns) ** 2
+            v_loss = 0.5*v_loss_unclipped.mean()
+
+            entropy_loss = entropy.mean()
+
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+
+            losses['policy_loss'] += pg_loss.item() / self.total_minibatches
+            losses['value_loss'] += v_loss.item() / self.total_minibatches
+            losses['entropy'] += entropy_loss.item() / self.total_minibatches
+
+            # Learn on accumulated minibatches
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        # Reprioritize experience
+        if config['anneal_lr']:
+            self.scheduler.step()
+
+
+    def old_rl_world_model(self, losses):
+        epoch = self.epoch
+        config = self.config
+        device = config['device']
+        clip_coef = config['clip_coef']
+        vf_clip = config['vf_clip_coef']
+ 
+        for mb in range(self.total_minibatches):
+            #idx = torch.randint(0, self.segments,
+            #    size=(self.minibatch_segments,), device=device)
+            idx = slice(None)
+            mb_obs = self.observations[idx]
+            mb_actions = self.actions[idx]
+            mb_rewards = self.rewards[idx]
+            mb_terminals = self.terminals[idx]
+            mb_truncations = self.truncations[idx]
+
+            # Hallucinate trajectories
+            all_logits = []
+            all_newvalue = []
+            all_newlogprob = []
+            all_entropy = []
+            all_reward = []
+            all_terminal = []
+            all_actions = []
+            all_logprobs = []
+            all_obs = []
+
+            n = self.minibatch_segments
+            h = self.policy.hidden_size
+            state = dict(
+                action=mb_actions,
+                lstm_h=None,
+                lstm_c=None,
+            )
+
+            for t in range(config['bptt_horizon']):
+                '''
+                if t == 0:
+                    logits, value = self.policy.forward_eval(mb_obs[:, t], state)
+                    action, logprob, entropy = pufferlib.pytorch.sample_logits(logits)
+                    with torch.no_grad():
+                        x, reward, terminal = self.world_model.imagine_from_real(
+                            mb_obs[:, t], mb_actions[:, t])
+                else:
+                    logits, value = self.policy.forward_eval(x, state)
+                    action, logprob, entropy = pufferlib.pytorch.sample_logits(logits)
+                    with torch.no_grad():
+                        x, reward, terminal = self.world_model.imagine_from_real(
+                            x, action.long())
+                '''
+                x, reward, terminal, _, _, _, _ = self.vecenv.recv()
+                x = torch.from_numpy(x).to(self.config['device'])
+                logits, value = self.policy.forward_eval(x, state)
+                action, logprob, entropy = pufferlib.pytorch.sample_logits(logits)
+                cpu_action = action.cpu().numpy().reshape(self.vecenv.action_space.shape)
+                self.vecenv.send(cpu_action)
+
+                reward = torch.from_numpy(reward).to(self.config['device'])
+                terminal = torch.from_numpy(terminal).to(self.config['device'])
+
+
+                # Must clamp to avoid accumulating errors
+                # TODO: Base on observation space etc
+                #x = torch.clamp(x, -1, 1)
+                #reward = torch.clamp(reward, -1, 1)
+                #terminal = torch.clamp(terminal, 0, 1)
+
+                all_reward.append(reward)
+                all_terminal.append(terminal)
+                all_actions.append(action)
+                all_logprobs.append(logprob)
+                all_logits.append(logits)
+                all_newvalue.append(value)
+                all_entropy.append(entropy)
+
+            logits = torch.stack(all_logits, dim=1)
+            newvalue = torch.stack(all_newvalue, dim=1).squeeze(-1)
+            newlogprob = torch.stack(all_logprobs, dim=1)
+            entropy = torch.stack(all_entropy, dim=1)
+            mb_rewards = torch.stack(all_reward, dim=1).squeeze(-1).detach()
+            mb_terminals = torch.stack(all_terminal, dim=1).squeeze(-1).float()
+            #mb_terminals = (mb_terminals > 0.8).float().detach()
+            mb_actions = torch.stack(all_actions, dim=1)
+            mb_logprobs = newlogprob.detach()
+
+            # Clamp values
+            #mb_rewards = torch.nan_to_num(mb_rewards)
+            #mb_rewards = torch.clamp(mb_rewards, -1, 1)
+
+            #mb_terminals = torch.nan_to_num(mb_terminals)
+            #mb_terminals = torch.clamp(mb_terminals, 0, 1)
+
+            mb_values = newvalue.detach()
+            newlogprob = newlogprob.reshape(mb_rewards.shape)
+
+            newlogprob = newlogprob.reshape(mb_logprobs.shape)
+            logratio = newlogprob - mb_logprobs
+            ratio = logratio.exp()
+
+            with torch.no_grad():
+                old_approx_kl = (-logratio).mean()
+                approx_kl = ((ratio - 1) - logratio).mean()
+                clipfrac = ((ratio - 1.0).abs() > config['clip_coef']).float().mean()
+
+            #adv = advantages[idx]
+            adv = torch.zeros_like(mb_values)
+            ratio = torch.ones_like(mb_values)
+            adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
+                ratio, adv, config['gamma'], config['gae_lambda'],
+                config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            #adv = mb_advantages
+            #adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            mb_returns = adv + mb_values
+
+            # Losses
+            pg_loss1 = -adv * ratio
+            pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+            newvalue = newvalue.view(mb_returns.shape)
+            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+            v_loss_unclipped = (newvalue - mb_returns) ** 2
+            v_loss_clipped = (v_clipped - mb_returns) ** 2
+            v_loss = 0.5*torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+            entropy_loss = entropy.mean()
+
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+ 
+            '''
+            adv = torch.zeros_like(mb_values)
+            ratio = torch.ones_like(mb_values)
+            adv = compute_puff_advantage(mb_values, mb_rewards, mb_terminals,
+                ratio, adv, config['gamma'], config['gae_lambda'],
+                config['vtrace_rho_clip'], config['vtrace_c_clip'])
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+            adv = adv.detach()
+
+            mb_returns = adv + mb_values
+
+            # Losses
+            pg_loss = (-adv * newlogprob).mean()
+            v_loss = 0.5*((newvalue - mb_returns) ** 2).mean()
+            entropy_loss = entropy.mean()
+
+            loss = pg_loss + config['vf_coef']*v_loss - config['ent_coef']*entropy_loss
+            '''
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(),
+                config['max_grad_norm'])
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
     def mean_and_log(self):
         config = self.config
