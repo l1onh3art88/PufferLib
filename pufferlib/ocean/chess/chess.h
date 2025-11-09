@@ -240,6 +240,7 @@ typedef struct {
     float reward_draw;
     int render_fps;
     int human_play;
+    int human_side;
     
     char starting_fen[128];
     char** fen_curriculum;
@@ -260,9 +261,12 @@ typedef struct {
     float reward_invalid_move;
     float reward_valid_piece;
     float reward_valid_move;
+    float reward_material_gain;
     
     int enable_50_move_rule;
     int enable_threefold_repetition;
+    
+    int16_t prev_material_score;
     
     float ai_score;
     float opponent_score;
@@ -1481,8 +1485,12 @@ void populate_observations(Chess* env) {
     uint8_t* obs = env->observations;
     Position* pos = &env->pos;
     
-    for (int player = 0; player < 2; player++) {
-        uint8_t* player_obs = obs + (player * OBS_SIZE);
+    int num_players = env->human_play ? 1 : 2;
+    int start_player = env->human_play ? (1 - env->human_side) : 0;
+    
+    for (int player = start_player; player < start_player + num_players; player++) {
+        int obs_idx = env->human_play ? 0 : player;
+        uint8_t* player_obs = obs + (obs_idx * OBS_SIZE);
         uint8_t* board_planes = player_obs + O_BOARD;
         memset(board_planes, 0, 12 * 64);
         
@@ -1706,6 +1714,7 @@ void c_reset(Chess* env) {
         pos_set(&env->pos, env->starting_fen);
     }
     
+    env->prev_material_score = env->pos.materialScore;
     generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
     env->legal_moves_side = env->pos.sideToMove;
     env->legal_moves_key = env->pos.key;
@@ -1803,7 +1812,18 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
     env->selected_square[pidx] = SQ_NONE;
     env->valid_destinations[pidx].count = 0;
     
+    int16_t prev_material = env->prev_material_score;
     do_move(&env->pos, chosen_move, env->undo_stack, &env->undo_stack_ptr);
+    int16_t new_material = env->pos.materialScore;
+    
+    if (env->reward_material_gain != 0.0f) {
+        int material_delta = new_material - prev_material;
+        if (player == CHESS_BLACK) {
+            material_delta = -material_delta;
+        }
+        env->rewards[0] += env->reward_material_gain * (material_delta / 100.0f);
+    }
+    env->prev_material_score = new_material;
     
     if (env->undo_stack_ptr > 0 && env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull > 99) {
         env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull = 99;
@@ -1821,6 +1841,31 @@ void c_step(Chess* env) {
             env->legal_moves_side = env->pos.sideToMove;
             env->legal_moves_key = env->pos.key;
         }
+        
+        ChessColor ai_side = (ChessColor)(1 - env->human_side);
+        if (env->pos.sideToMove == ai_side) {
+            int ai_action = env->actions[0];
+            bool ai_moved = process_player_action(env, ai_action, ai_side);
+            
+            if (ai_moved) {
+                if (env->legal_moves_side != env->pos.sideToMove || env->legal_moves_key != env->pos.key) {
+                    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+                    env->legal_moves_side = env->pos.sideToMove;
+                    env->legal_moves_key = env->pos.key;
+                }
+                
+                env->game_result = game_result_with_legal_count(&env->pos, env->legal_moves.count, env->undo_stack, env->undo_stack_ptr,
+                                                                 env->enable_50_move_rule, env->enable_threefold_repetition);
+                
+                if (env->game_result != 0) {
+                    c_reset(env);
+                    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+                    env->legal_moves_side = env->pos.sideToMove;
+                    env->legal_moves_key = env->pos.key;
+                }
+            }
+        }
+        
         populate_observations(env);
         return;
     }
@@ -1902,21 +1947,18 @@ void c_step(Chess* env) {
     
     if (env->game_result != 0) {
         env->terminals[0] = 1;
-        if (env->game_result == 3) {
-            bool is_checkmate = (env->legal_moves.count == 0) && is_check(&env->pos, env->pos.sideToMove);
-            if (is_checkmate) {
-                env->rewards[0] = 1.0f;
-                env->log.perf += 1.0f;
-                env->log.draw_rate += 0.0f;
-            } else {
-                env->rewards[0] = env->reward_draw;
-                env->log.perf += 0.0f;
-                env->log.draw_rate += 1.0f;
-            }
-        } else {
+        if (env->game_result == 2) {
             env->rewards[0] = 1.0f;
             env->log.perf += 1.0f;
             env->log.draw_rate += 0.0f;
+        } else if (env->game_result == 1) {
+            env->rewards[0] = -1.0f;
+            env->log.perf += 0.0f;
+            env->log.draw_rate += 0.0f;
+        } else {
+            env->rewards[0] = env->reward_draw;
+            env->log.perf += 0.0f;
+            env->log.draw_rate += 1.0f;
         }
         env->log.timeout_rate += 0.0f;
         env->log.chess_moves += env->chess_moves;
@@ -1954,36 +1996,60 @@ void c_render(Chess* env) {
     }
     
     static int selected_sq = -1;
-    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-        Vector2 mp = GetMousePosition();
-        int file = (int)(mp.x) / cell_size;
-        int rank = 7 - ((int)(mp.y) / cell_size);
-        if (file >= 0 && file < 8 && rank >= 0 && rank < 8) {
-            int clicked_sq = (int)make_square(file, rank);
-            if (selected_sq == -1) {
-                if (env->pos.sideToMove == CHESS_WHITE) {
+    if (env->human_play && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        ChessColor human_side = (ChessColor)env->human_side;
+        if (env->pos.sideToMove == human_side) {
+            Vector2 mp = GetMousePosition();
+            int screen_file = (int)(mp.x) / cell_size;
+            int screen_rank = (int)(mp.y) / cell_size;
+            
+            if (screen_file >= 0 && screen_file < 8 && screen_rank >= 0 && screen_rank < 8) {
+                int file, rank;
+                if (env->human_side == CHESS_BLACK) {
+                    file = 7 - screen_file;
+                    rank = screen_rank;
+                } else {
+                    file = screen_file;
+                    rank = 7 - screen_rank;
+                }
+                int clicked_sq = (int)make_square(file, rank);
+                
+                if (selected_sq == -1) {
                     Piece pc = piece_on(&env->pos, (Square)clicked_sq);
-                    if (pc != NO_PIECE && color_of(pc) == CHESS_WHITE) {
+                    if (pc != NO_PIECE && color_of(pc) == human_side) {
                         bool has_from = false;
                         for (int i = 0; i < env->legal_moves.count; i++) {
                             if ((int)from_sq(env->legal_moves.moves[i].move) == clicked_sq) { has_from = true; break; }
                         }
                         if (has_from) selected_sq = clicked_sq;
                     }
+                } else {
+                    Move chosen = MOVE_NONE;
+                    for (int i = 0; i < env->legal_moves.count; i++) {
+                        Move m = env->legal_moves.moves[i].move;
+                        if ((int)from_sq(m) == selected_sq && (int)to_sq(m) == clicked_sq) { chosen = m; break; }
+                    }
+                    if (chosen != MOVE_NONE) {
+                        do_move(&env->pos, chosen, env->undo_stack, &env->undo_stack_ptr);
+                        env->tick++;
+                        generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+                        env->legal_moves_side = env->pos.sideToMove;
+                        
+                        env->game_result = game_result_with_legal_count(&env->pos, env->legal_moves.count, 
+                                                                         env->undo_stack, env->undo_stack_ptr,
+                                                                         env->enable_50_move_rule, env->enable_threefold_repetition);
+                        if (env->game_result != 0) {
+                            c_reset(env);
+                            selected_sq = -1;
+                            generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+                            env->legal_moves_side = env->pos.sideToMove;
+                            env->legal_moves_key = env->pos.key;
+                        }
+                        
+                        populate_observations(env);
+                    }
+                    selected_sq = -1;
                 }
-            } else {
-                Move chosen = MOVE_NONE;
-                for (int i = 0; i < env->legal_moves.count; i++) {
-                    Move m = env->legal_moves.moves[i].move;
-                    if ((int)from_sq(m) == selected_sq && (int)to_sq(m) == clicked_sq) { chosen = m; break; }
-                }
-                if (chosen != MOVE_NONE) {
-                    do_move(&env->pos, chosen, env->undo_stack, &env->undo_stack_ptr);
-                    env->tick++;
-                    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
-                    env->legal_moves_side = env->pos.sideToMove;
-                }
-                selected_sq = -1;
             }
         }
     }
@@ -1991,20 +2057,28 @@ void c_render(Chess* env) {
     BeginDrawing();
     ClearBackground((Color){40, 40, 40, 255});
     
+    int board_flip = env->human_play && env->human_side == CHESS_BLACK;
+    
     for (int rank = 0; rank < 8; rank++) {
         for (int file = 0; file < 8; file++) {
             Color square_color = ((rank + file) % 2 == 0) 
                 ? (Color){240, 217, 181, 255}
                 : (Color){181, 136, 99, 255};
             
-            int draw_x = file * cell_size;
-            int draw_y = (7 - rank) * cell_size;
+            int draw_file = board_flip ? (7 - file) : file;
+            int draw_rank = board_flip ? (7 - rank) : rank;
+            int draw_x = draw_file * cell_size;
+            int draw_y = (7 - draw_rank) * cell_size;
             DrawRectangle(draw_x, draw_y, cell_size, cell_size, square_color);
 
             if (selected_sq != -1) {
                 int sel_f = file_of((Square)selected_sq);
                 int sel_r = rank_of((Square)selected_sq);
-                if (sel_f == file && sel_r == rank) {
+                if (board_flip) {
+                    sel_f = 7 - sel_f;
+                    sel_r = 7 - sel_r;
+                }
+                if (sel_f == draw_file && sel_r == draw_rank) {
                     DrawRectangleLines(draw_x, draw_y, cell_size, cell_size, (Color){255, 215, 0, 255});
                 }
                 for (int i = 0; i < env->legal_moves.count; i++) {
@@ -2013,7 +2087,11 @@ void c_render(Chess* env) {
                         Square to = to_sq(m);
                         int tf = file_of(to);
                         int tr = rank_of(to);
-                        if (tf == file && tr == rank) {
+                        if (board_flip) {
+                            tf = 7 - tf;
+                            tr = 7 - tr;
+                        }
+                        if (tf == draw_file && tr == draw_rank) {
                             DrawRectangleLines(draw_x+2, draw_y+2, cell_size-4, cell_size-4, (Color){0, 200, 0, 255});
                         }
                     }
@@ -2034,6 +2112,10 @@ void c_render(Chess* env) {
         if (pc != NO_PIECE) {
             int file = file_of(sq);
             int rank = rank_of(sq);
+            if (board_flip) {
+                file = 7 - file;
+                rank = 7 - rank;
+            }
             int x = file * cell_size + cell_size / 4;
             int y = (7 - rank) * cell_size + cell_size / 8;
             

@@ -9,19 +9,21 @@ class Chess(pufferlib.PufferEnv):
                  max_moves=500, reward_draw=0.0,
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01, 
                  reward_valid_piece=0.0, reward_valid_move=0.0,
-                 render_fps=30, human_play=0,
+                 reward_material_gain=0.0,
+                 render_fps=30, human_play=0, human_side=0,
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                  multi_fen=False,
                  enable_50_move_rule=1, enable_threefold_repetition=1):
         
+        self.selfplay = 0 if human_play else 1
+        obs_size = 1045 if human_play else 1045*2
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(1045*2,), dtype=np.uint8)
+            low=0, high=255, shape=(obs_size,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(64)
         self.render_mode = render_mode
         self.num_agents = num_envs
         self.log_interval = log_interval
         self.tick = 0
-        self.selfplay = 1
         
         fen_curriculum = None
         if str(multi_fen).lower() in ('true', '1', 'yes'):
@@ -54,8 +56,10 @@ class Chess(pufferlib.PufferEnv):
                 reward_invalid_move=reward_invalid_move,
                 reward_valid_piece=reward_valid_piece,
                 reward_valid_move=reward_valid_move,
+                reward_material_gain=reward_material_gain,
                 render_fps=render_fps,
                 human_play=human_play,
+                human_side=human_side,
                 starting_fen=starting_fen,
                 fen_curriculum=fen_curriculum,
                 enable_50_move_rule=enable_50_move_rule,

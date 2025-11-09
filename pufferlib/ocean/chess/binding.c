@@ -22,9 +22,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->reward_invalid_move = -0.1f;
     env->reward_valid_piece = 0.0f;
     env->reward_valid_move = 0.0f;
+    env->reward_material_gain = 0.0f;
     env->client = NULL;
     env->render_fps = 30;
     env->human_play = 0;
+    env->human_side = 0;
     env->fen_curriculum = NULL;
     env->num_fens = 0;
     strcpy(env->starting_fen, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
@@ -70,6 +72,13 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             env->reward_valid_move = (float)PyLong_AsDouble(reward_valid_move_obj);
         }
 
+        PyObject* reward_material_gain_obj = PyDict_GetItemString(kwargs, "reward_material_gain");
+        if (reward_material_gain_obj != NULL && PyFloat_Check(reward_material_gain_obj)) {
+            env->reward_material_gain = (float)PyFloat_AsDouble(reward_material_gain_obj);
+        } else if (reward_material_gain_obj != NULL && PyLong_Check(reward_material_gain_obj)) {
+            env->reward_material_gain = (float)PyLong_AsDouble(reward_material_gain_obj);
+        }
+
         PyObject* fps_obj = PyDict_GetItemString(kwargs, "render_fps");
         if (fps_obj != NULL && PyLong_Check(fps_obj)) {
             env->render_fps = (int)PyLong_AsLong(fps_obj);
@@ -78,6 +87,13 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyObject* human_obj = PyDict_GetItemString(kwargs, "human_play");
         if (human_obj != NULL && PyLong_Check(human_obj)) {
             env->human_play = (int)PyLong_AsLong(human_obj);
+        }
+
+        PyObject* human_side_obj = PyDict_GetItemString(kwargs, "human_side");
+        if (human_side_obj != NULL && PyLong_Check(human_side_obj)) {
+            env->human_side = (int)PyLong_AsLong(human_side_obj);
+        } else {
+            env->human_side = 0;
         }
 
         env->enable_50_move_rule = 1;

@@ -79,7 +79,6 @@ class ChessCNN(nn.Module):
         ep_idx = ep_onehot.argmax(dim=1)
         ep_plane = (ep_idx < 64).float().view(B, 1, 1, 1).expand(-1, -1, 8, 8)
         
-        # Phase plane (1 channel)
         phase_onehot = obs[:, 851:853]
         phase_plane = phase_onehot[:, 1:2].view(B, 1, 1, 1).expand(-1, -1, 8, 8)
         
