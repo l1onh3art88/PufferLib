@@ -177,15 +177,18 @@ typedef struct {
 } MoveList;
 
 enum {
-    O_BOARD = 0,
-    O_SIDE = 768,
-    O_CASTLE = 770,
-    O_EP = 786,
-    O_PICK_PHASE = 851,
-    O_SELECTED_PIECE = 853,
-    O_VALID_PIECES = 917,
-    O_VALID_DESTS = 981,
-    OBS_SIZE = 1045
+    O_CNN_PLANES = 0,
+    O_PICK_PHASE = 1280,
+    O_VALID_PIECES = 1282,
+    O_VALID_DESTS = 1346, 
+    OBS_SIZE = 1410,
+    
+    CNN_BOARD_START = 0,
+    CNN_SIDE = 12,
+    CNN_CASTLE_START = 13,
+    CNN_EP = 17,
+    CNN_PHASE = 18,
+    CNN_SELECTED = 19
 };
 
 // todo: remove old fields
@@ -1401,16 +1404,19 @@ bool is_draw_with_history(Position* pos, UndoInfo* undo_stack, int undo_stack_pt
     if (is_insufficient_material(pos))
         return true;
 
-    // Backward scan for repetitions
-    int e = (undo_stack_ptr > 0) ? undo_stack[undo_stack_ptr - 1].pliesFromNull - 4 : -1;
-    if (e >= 0) {
-        int repetitions = 0;
-        for (int i = 4; i <= e + 4; i += 2) {
-            int idx = undo_stack_ptr - 1 - i;
-            if (idx >= 0 && undo_stack[idx].key == pos->key) {
-                repetitions++;
-                if (repetitions >= 2) {
-                    return true;
+    if (undo_stack_ptr > 0) {
+        int plies_from_null = undo_stack[undo_stack_ptr - 1].pliesFromNull;
+        int scan_limit = (pos->rule50 < plies_from_null) ? pos->rule50 : plies_from_null;
+        
+        if (scan_limit >= 4) {
+            int repetitions = 0;
+            for (int i = 4; i <= scan_limit; i += 2) {
+                int idx = undo_stack_ptr - 1 - i;
+                if (idx >= 0 && undo_stack[idx].key == pos->key) {
+                    repetitions++;
+                    if (repetitions >= 2) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1438,13 +1444,12 @@ int game_result_with_legal_count(Position* pos, int legal_count, UndoInfo* undo_
     }
     
     if (enable_threefold_repetition && undo_stack_ptr > 0) {
-        uint8_t plies = undo_stack[undo_stack_ptr - 1].pliesFromNull;
+        uint8_t plies_from_null = undo_stack[undo_stack_ptr - 1].pliesFromNull;
+        int scan_limit = (pos->rule50 < plies_from_null) ? pos->rule50 : plies_from_null;
         
-        // Only search if there are enough reversible plies (need at least 4 plies = 2 moves)
-        if (plies >= 4) {
+        if (scan_limit >= 4) {
             int repetitions = 0;
-            // Search backward: only check positions with same side to move (step by 2 plies)
-            for (int i = 4; i <= plies; i += 2) {
+            for (int i = 4; i <= scan_limit; i += 2) {
                 int idx = undo_stack_ptr - 1 - i;
                 if (idx >= 0 && undo_stack[idx].key == pos->key) {
                     repetitions++;
@@ -1491,18 +1496,19 @@ void populate_observations(Chess* env) {
     for (int player = start_player; player < start_player + num_players; player++) {
         int obs_idx = env->human_play ? 0 : player;
         uint8_t* player_obs = obs + (obs_idx * OBS_SIZE);
-        uint8_t* board_planes = player_obs + O_BOARD;
-        memset(board_planes, 0, 12 * 64);
         
-        ChessColor us = (ChessColor)player;  // 0=White, 1=Black
+        uint8_t* cnn_planes = player_obs + O_CNN_PLANES;
+        memset(cnn_planes, 0, 1280);
+        
+        ChessColor us = (ChessColor)player;
         ChessColor them = (ChessColor)!us;
         
         Bitboard occupied = pos->byTypeBB[0];
         while (occupied) {
             Square sq = pop_lsb(&occupied);
-        Piece p = pos->board[sq];
-        
-        int plane;
+            Piece p = pos->board[sq];
+            
+            int plane;
             int obs_sq;
             
             if (player == 1) {
@@ -1510,27 +1516,24 @@ void populate_observations(Chess* env) {
                 int piece_color = color_of(p);
                 int piece_type = type_of_p(p);
                 if (piece_color == CHESS_BLACK) {
-                    plane = piece_type - 1;  // Our pieces in planes 0-5
+                    plane = CNN_BOARD_START + (piece_type - 1);  // Our pieces 0-5
                 } else {
-                    plane = 6 + (piece_type - 1);  // Their pieces in planes 6-11
+                    plane = CNN_BOARD_START + 6 + (piece_type - 1);  // Their pieces 6-11
                 }
             } else {
                 obs_sq = sq;
-        if (p >= B_PAWN) {
-            plane = 6 + (p - B_PAWN);
-        } else {
-            plane = p - 1;
-        }
+                if (p >= B_PAWN) {
+                    plane = CNN_BOARD_START + 6 + (p - B_PAWN);
+                } else {
+                    plane = CNN_BOARD_START + (p - 1);
+                }
             }
-            board_planes[plane * 64 + obs_sq] = 1;
+            cnn_planes[plane * 64 + obs_sq] = 1;
         }
         
-        uint8_t* side_onehot = player_obs + O_SIDE;
-        side_onehot[0] = 0; side_onehot[1] = 0;
-        side_onehot[(pos->sideToMove == us) ? 0 : 1] = 1;
+        uint8_t side_value = (pos->sideToMove == us) ? 1 : 0;
+        memset(cnn_planes + CNN_SIDE * 64, side_value, 64);
         
-        uint8_t* castle_onehot = player_obs + O_CASTLE;
-        memset(castle_onehot, 0, 16);
         uint8_t castle_rights = pos->castlingRights;
         if (player == 1) {
             uint8_t flipped = 0;
@@ -1540,23 +1543,35 @@ void populate_observations(Chess* env) {
             if (castle_rights & WHITE_OOO) flipped |= BLACK_OOO;
             castle_rights = flipped;
         }
-        castle_onehot[castle_rights] = 1;
-
-        uint8_t* ep_onehot = player_obs + O_EP;
-        memset(ep_onehot, 0, 65);
-    if (pos->epSquare < 64) {
-            int ep_sq = (player == 1) ? (pos->epSquare ^ 56) : pos->epSquare;
-            ep_onehot[ep_sq] = 1;
-    } else {
-        ep_onehot[64] = 1;
-    }
-    
+        
+        for (int i = 0; i < 4; i++) {
+            uint8_t has_right = (castle_rights & (1 << i)) ? 1 : 0;
+            memset(cnn_planes + (CNN_CASTLE_START + i) * 64, has_right, 64);
+        }
+        
+        int ep_sq = -1;
+        if (pos->epSquare < 64) {
+            ep_sq = (player == 1) ? (pos->epSquare ^ 56) : pos->epSquare;
+            cnn_planes[CNN_EP * 64 + ep_sq] = 1;
+        }
+        
+        int player_idx = (int)us;
+        uint8_t phase_value = env->pick_phase[player_idx];
+        memset(cnn_planes + CNN_PHASE * 64, phase_value, 64);
+        
+        if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE) {
+            int view_selected = (player == 1) ? (env->selected_square[player_idx] ^ 56) : env->selected_square[player_idx];
+            cnn_planes[CNN_SELECTED * 64 + view_selected] = 1;
+        }
+        
+        uint8_t* phase_onehot = player_obs + O_PICK_PHASE;
+        phase_onehot[0] = 0; phase_onehot[1] = 0;
+        phase_onehot[env->pick_phase[player_idx]] = 1;
+        
         uint8_t* valid_pieces = player_obs + O_VALID_PIECES;
         uint8_t* valid_dests = player_obs + O_VALID_DESTS;
         memset(valid_pieces, 0, 64);
         memset(valid_dests, 0, 64);
-        
-        int player_idx = (int)us;
         
         if (pos->sideToMove != us) {
             env->pick_phase[player_idx] = 0;
@@ -1572,7 +1587,6 @@ void populate_observations(Chess* env) {
             generate_legal(&temp_pos, &next_player_legal, local_undo, &local_undo_ptr);
             
             if (next_player_legal.count > 0) {
-                memset(valid_pieces, 0, 64);
                 for (int i = 0; i < next_player_legal.count; i++) {
                     Square from = from_sq(next_player_legal.moves[i].move);
                     Square obs_sq = (us == CHESS_BLACK) ? (from ^ 56) : from;
@@ -1581,8 +1595,7 @@ void populate_observations(Chess* env) {
             } else {
                 memset(valid_pieces, 1, 64);
             }
-            memset(valid_dests, 0, 64);
-    } else {
+        } else {
             if (env->pick_phase[player_idx] == 0) {
                 if (env->legal_moves.count > 0) {
                     for (int i = 0; i < env->legal_moves.count; i++) {
@@ -1602,17 +1615,6 @@ void populate_observations(Chess* env) {
                     }
                 }
             }
-        }
-        
-        uint8_t* phase_onehot = player_obs + O_PICK_PHASE;
-        phase_onehot[0] = 0; phase_onehot[1] = 0;
-        phase_onehot[env->pick_phase[player_idx]] = 1;
-        
-        uint8_t* selected_piece_plane = player_obs + O_SELECTED_PIECE;
-        memset(selected_piece_plane, 0, 64);
-        if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE) {
-            int view_selected = (player == 1) ? (env->selected_square[player_idx] ^ 56) : env->selected_square[player_idx];
-            selected_piece_plane[view_selected] = 1;
         }
     }
 }

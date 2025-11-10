@@ -16,7 +16,7 @@ class Chess(pufferlib.PufferEnv):
                  enable_50_move_rule=1, enable_threefold_repetition=1):
         
         self.selfplay = 0 if human_play else 1
-        obs_size = 1045 if human_play else 1045*2
+        obs_size = 1410 if human_play else 1410*2
         self.single_observation_space = gymnasium.spaces.Box(
             low=0, high=255, shape=(obs_size,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(64)
