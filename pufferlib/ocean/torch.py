@@ -20,10 +20,11 @@ import numpy as np
 
 
 class ChessCNN(nn.Module):
-    def __init__(self, env, cnn_channels=32, hidden_size=256, **kwargs):
+    def __init__(self, env, cnn_channels=32, hidden_size=256, use_action_masking=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
+        self.use_action_masking = bool(use_action_masking)
         
         self.network = nn.Sequential(
             layer_init(nn.Conv2d(20, cnn_channels, 5, stride=3)),
@@ -37,7 +38,8 @@ class ChessCNN(nn.Module):
             nn.ReLU(),
         )
         
-        self.actor = layer_init(nn.Linear(hidden_size, 64), std=0.01)
+        # Output: 64 squares + 32 promotion options (4 types * 8 files) = 96 actions
+        self.actor = layer_init(nn.Linear(hidden_size, 96), std=0.01)
         self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
         
         self.last_observations = None
@@ -95,27 +97,26 @@ class ChessCNN(nn.Module):
     def decode_actions(self, hidden, state=None):
         logits = self.actor(hidden)
         
-        if self.last_observations is None:
-            pass
-        
-        if self.last_observations is not None:
+        if self.use_action_masking and self.last_observations is not None:
             obs = self.last_observations.float()
             phase_onehot = obs[:, 851:853]
             pick_phase = phase_onehot[:, 1]
             valid_pieces = obs[:, 917:981]
             valid_dests = obs[:, 981:1045]
+            valid_promos = obs[:, 1045:1077]
             
             valid_pieces_binary = (valid_pieces > 0.5).float()
             valid_dests_binary = (valid_dests > 0.5).float()
-            
-            mask = torch.where(pick_phase.unsqueeze(1) > 0.5, valid_dests_binary, valid_pieces_binary)
+            valid_promos_binary = (valid_promos > 0.5).float()
+            mask_squares = torch.where(pick_phase.unsqueeze(1) > 0.5, valid_dests_binary, valid_pieces_binary)
+            mask = torch.cat([mask_squares, valid_promos_binary], dim=1)
             
             all_masked = (mask == 0).all(dim=1)
             if all_masked.any():
                 for idx in torch.where(all_masked)[0]:
                     mask[idx] = 1
             
-            logits = logits.masked_fill(mask == 0, -1e10)
+            logits = logits.masked_fill(mask == 0, -1e8)
         
         value = self.value_head(hidden)
         return logits, value
@@ -433,7 +434,6 @@ class Go(nn.Module):
         self.grid_size = int(np.sqrt((obs_size-1)/2))
         output_size = self.grid_size - 4
         cnn_flat_size = cnn_channels * output_size * output_size
-        self.current_obs = None
         
         self.flat = pufferlib.pytorch.layer_init(nn.Linear(1,32))
         
@@ -458,7 +458,6 @@ class Go(nn.Module):
         full_board = grid_size * grid_size 
         black_board = observations[:, :full_board].view(-1,1, grid_size,grid_size).float()
         white_board = observations[:, full_board:-1].view(-1,1, grid_size, grid_size).float()
-        self.current_obs = black_board + white_board
         board_features = torch.cat([black_board, white_board],dim=1)
         flat_feature1 = observations[:, -1].unsqueeze(1).float()
         # Pass board through cnn
@@ -472,11 +471,8 @@ class Go(nn.Module):
         return features
 
     def decode_actions(self, flat_hidden, state=None):
-        full_board = self.grid_size*self.grid_size;
         value = self.value_fn(flat_hidden)
         action = self.actor(flat_hidden)
-        illegal = (self.current_obs[:, 0] == 1).reshape(action.shape[0], -1)
-        action[:, 1:].masked_fill_(illegal, -1e9)
         return action, value
     
 class MOBA(nn.Module):

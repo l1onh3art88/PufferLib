@@ -5,10 +5,8 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <math.h>
-
-#ifdef ENABLE_RENDERING
+#include <unistd.h> 
 #include "raylib.h"
-#endif
 
 typedef uint64_t Bitboard;
 typedef uint64_t Key;
@@ -109,6 +107,7 @@ enum {
 #define is_empty(pos, s) (piece_on(pos, s) == NO_PIECE)
 
 #define MAX_SERVED_MOVES 64
+#define MAX_GAME_PLIES 2048
 
 #define FileABB 0x0101010101010101ULL
 #define FileBBB (FileABB << 1)
@@ -185,30 +184,27 @@ enum {
     O_SELECTED_PIECE = 853,
     O_VALID_PIECES = 917,
     O_VALID_DESTS = 981,
-    OBS_SIZE = 1045
+    O_VALID_PROMOS = 1045,
+    OBS_SIZE = 1077
 };
 
-// todo: remove old fields
+
 typedef struct {
     float perf;
     float score;
     float draw_rate;
-    float timeout_rate;         // Percentage of games hitting max_moves limit
+    float timeout_rate;
     float chess_moves;          // Average chess moves per game
-    float episode_length;       // Average episode length in ticks (includes 2-phase actions)
+    float episode_length;       // Average episode length in ticks (2-phase system)
     float episode_return;
     float invalid_action_rate;
     float n;
 } Log;
 
-#ifdef ENABLE_RENDERING
 typedef struct {
     Texture2D pieces;
     int cell_size;
 } Client;
-#else
-typedef void Client;
-#endif
 
 typedef struct {
     Piece captured;
@@ -245,13 +241,10 @@ typedef struct {
     char** fen_curriculum;
     int num_fens;
     
-    UndoInfo undo_stack[1024];
+    UndoInfo undo_stack[MAX_GAME_PLIES];
     int undo_stack_ptr;
     
-    int legal_moves_sum;
-    int steps_in_episode;
     int invalid_actions_this_episode;
-    int valid_piece_picks;
     
     int pick_phase[2];
     Square selected_square[2];
@@ -260,12 +253,17 @@ typedef struct {
     float reward_invalid_move;
     float reward_valid_piece;
     float reward_valid_move;
+    float reward_material;
+    float reward_castling;
+    float reward_repetition;
     
     int enable_50_move_rule;
     int enable_threefold_repetition;
     
-    float ai_score;
-    float opponent_score;
+    int learner_color; // 0 for White, 1 for Black
+    
+    float white_score;
+    float black_score;
     char last_result[32];
 } Chess;
 
@@ -1419,7 +1417,7 @@ int game_result_with_legal_count(Position* pos, int legal_count, UndoInfo* undo_
                                   int enable_50_move_rule, int enable_threefold_repetition) {
     if (legal_count == 0) {
         if (is_check(pos, pos->sideToMove)) {
-            return pos->sideToMove == CHESS_WHITE ? 2 : 1;  // 2=White win, 1=Black win
+            return pos->sideToMove == CHESS_WHITE ? 1 : 2;
         } else {
             return 3;
         }
@@ -1436,7 +1434,6 @@ int game_result_with_legal_count(Position* pos, int legal_count, UndoInfo* undo_
     if (enable_threefold_repetition && undo_stack_ptr > 0) {
         uint8_t plies = undo_stack[undo_stack_ptr - 1].pliesFromNull;
         
-        // Only search if there are enough reversible plies (need at least 4 plies = 2 moves)
         if (plies >= 4) {
             int repetitions = 0;
             // Search backward: only check positions with same side to move (step by 2 plies)
@@ -1482,12 +1479,18 @@ void populate_observations(Chess* env) {
     Position* pos = &env->pos;
     
     for (int player = 0; player < 2; player++) {
-        uint8_t* player_obs = obs + (player * OBS_SIZE);
+        int buffer_idx;
+        if (env->learner_color == CHESS_WHITE) {
+            buffer_idx = player;
+        } else {
+            buffer_idx = 1 - player;
+        }
+        
+        uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
         uint8_t* board_planes = player_obs + O_BOARD;
         memset(board_planes, 0, 12 * 64);
         
         ChessColor us = (ChessColor)player;  // 0=White, 1=Black
-        ChessColor them = (ChessColor)!us;
         
         Bitboard occupied = pos->byTypeBB[0];
         while (occupied) {
@@ -1502,9 +1505,9 @@ void populate_observations(Chess* env) {
                 int piece_color = color_of(p);
                 int piece_type = type_of_p(p);
                 if (piece_color == CHESS_BLACK) {
-                    plane = piece_type - 1;  // Our pieces in planes 0-5
+                    plane = piece_type - 1;
                 } else {
-                    plane = 6 + (piece_type - 1);  // Their pieces in planes 6-11
+                    plane = 6 + (piece_type - 1);
                 }
             } else {
                 obs_sq = sq;
@@ -1574,7 +1577,7 @@ void populate_observations(Chess* env) {
                 memset(valid_pieces, 1, 64);
             }
             memset(valid_dests, 0, 64);
-    } else {
+        } else {
             if (env->pick_phase[player_idx] == 0) {
                 if (env->legal_moves.count > 0) {
                     for (int i = 0; i < env->legal_moves.count; i++) {
@@ -1605,6 +1608,21 @@ void populate_observations(Chess* env) {
         if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE) {
             int view_selected = (player == 1) ? (env->selected_square[player_idx] ^ 56) : env->selected_square[player_idx];
             selected_piece_plane[view_selected] = 1;
+        }
+        
+        // Mask for valid promotion pieces (actions 64-95: 4 rows x 8 files)
+        uint8_t* valid_promos = player_obs + O_VALID_PROMOS;
+        memset(valid_promos, 0, 32);
+        
+        if (env->pick_phase[player_idx] == 1 && env->valid_destinations[player_idx].count > 0) {
+            for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
+                Move m = env->valid_destinations[player_idx].moves[i].move;
+                if (type_of_m(m) == PROMOTION) {
+                    int type_idx = QUEEN - promotion_type(m);
+                    int file_idx = file_of(to_sq(m));
+                    valid_promos[type_idx * 8 + file_idx] = 1;
+                }
+            }
         }
     }
 }
@@ -1679,13 +1697,8 @@ void c_reset(Chess* env) {
     env->tick = 0;
     env->chess_moves = 0;
     env->game_result = 0;
-    env->terminals[0] = 0;
-    env->rewards[0] = 0.0f;
     env->undo_stack_ptr = 0;
-    env->legal_moves_sum = 0;
-    env->steps_in_episode = 0;
     env->invalid_actions_this_episode = 0;
-    env->valid_piece_picks = 0;
     
     env->pick_phase[0] = 0;
     env->pick_phase[1] = 0;
@@ -1693,6 +1706,7 @@ void c_reset(Chess* env) {
     env->selected_square[1] = SQ_NONE;
     env->valid_destinations[0].count = 0;
     env->valid_destinations[1].count = 0;
+    env->learner_color = rand() % 2;
     
     // Select starting position or curriculum
     if (env->num_fens > 0) {
@@ -1719,11 +1733,17 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
     }
     
     if (action < 0) action = 0;
-    if (action >= 64) action = 63;
+    if (action >= 96) action = 95;
     
-    Square picked_sq = (Square)action;
-    if (player == CHESS_BLACK) {
-        picked_sq = action ^ 56;
+    // Actions 64-95 are promotion selections (4 rows by 8 files)
+    bool is_promotion_selection = (action >= 64 && action <= 95);
+    Square picked_sq = SQ_NONE;
+    
+    if (!is_promotion_selection) {
+        picked_sq = (Square)action;
+        if (player == CHESS_BLACK) {
+            picked_sq = action ^ 56;
+        }
     }
     
     int pidx = (int)player;
@@ -1741,6 +1761,14 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
     }
     
     if (env->pick_phase[pidx] == 0) {
+        if (picked_sq >= 64) {
+            if (player == CHESS_WHITE) {
+                env->rewards[0] += env->reward_invalid_piece;
+                env->invalid_actions_this_episode++;
+            }
+            return false;
+        }
+
         Piece pc = piece_on(&env->pos, picked_sq);
         
         if (pc != NO_PIECE && color_of(pc) == player) {
@@ -1755,11 +1783,18 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
             if (env->valid_destinations[pidx].count > 0) {
                 env->selected_square[pidx] = picked_sq;
                 env->pick_phase[pidx] = 1;
+                if (player == env->learner_color) env->rewards[0] += env->reward_valid_piece;
             } else {
-                env->rewards[0] += env->reward_invalid_piece;
+                if (player == env->learner_color) {
+                    env->rewards[0] += env->reward_invalid_piece;
+                    env->invalid_actions_this_episode++;
+                }
             }
         } else {
-            env->rewards[0] += env->reward_invalid_piece;
+            if (player == env->learner_color) {
+                env->rewards[0] += env->reward_invalid_piece;
+                env->invalid_actions_this_episode++;
+            }
         }
         return false;
     }
@@ -1767,10 +1802,29 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
     Move chosen_move = MOVE_NONE;
     Square selected_sq = env->selected_square[pidx];
     
-    for (int i = 0; i < env->valid_destinations[pidx].count; i++) {
-        if (to_sq(env->valid_destinations[pidx].moves[i].move) == picked_sq) {
-            chosen_move = env->valid_destinations[pidx].moves[i].move;
-            break;
+    // Handle promotion piece selection (actions 64-95)
+    if (is_promotion_selection) {
+        int promo_idx = action - 64;
+        int promo_row = promo_idx / 8; // 0-3
+        int promo_file = promo_idx % 8; // 0-7
+        int desired_promo = QUEEN - promo_row;
+        
+        for (int i = 0; i < env->valid_destinations[pidx].count; i++) {
+            Move m = env->valid_destinations[pidx].moves[i].move;
+            if ((int)type_of_m(m) == PROMOTION && 
+                promotion_type(m) == desired_promo &&
+                file_of(to_sq(m)) == promo_file) {
+                
+                chosen_move = m;
+                break;
+            }
+        }
+    } else {
+        for (int i = 0; i < env->valid_destinations[pidx].count; i++) {
+            if (to_sq(env->valid_destinations[pidx].moves[i].move) == picked_sq) {
+                chosen_move = env->valid_destinations[pidx].moves[i].move;
+                break;
+            }
         }
     }
     
@@ -1791,17 +1845,25 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
     }
     
     if (chosen_move == MOVE_NONE) {
-        env->rewards[0] += env->reward_invalid_move;
+        if (player == env->learner_color) {
+            env->rewards[0] += env->reward_invalid_move;
+            env->invalid_actions_this_episode++;
+        }
         env->pick_phase[pidx] = 0;
         env->selected_square[pidx] = SQ_NONE;
         env->valid_destinations[pidx].count = 0;
         return false;
     }
     
+    if (player == env->learner_color) env->rewards[0] += env->reward_valid_move;
     env->chess_moves++;
     env->pick_phase[pidx] = 0;
     env->selected_square[pidx] = SQ_NONE;
     env->valid_destinations[pidx].count = 0;
+
+    if (player == env->learner_color && (int)type_of_m(chosen_move) == CASTLING) {
+        env->rewards[0] += env->reward_castling;
+    }
     
     do_move(&env->pos, chosen_move, env->undo_stack, &env->undo_stack_ptr);
     
@@ -1809,7 +1871,31 @@ bool process_player_action(Chess* env, int action, ChessColor player) {
         env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull = 99;
     }
     
+    // Repetition penalty
+    if (player == env->learner_color && env->undo_stack_ptr > 0) {
+        uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
+        if (plies >= 4) {
+            Key current_key = env->pos.key;
+            for (int i = 4; i <= plies; i += 2) {
+                int idx = env->undo_stack_ptr - 1 - i;
+                if (idx >= 0 && env->undo_stack[idx].key == current_key) {
+                    env->rewards[0] += env->reward_repetition;
+                    break;
+                }
+            }
+        }
+    }
+    
     return true;
+}
+
+void clip_rewards(Chess* env) {
+    if (env->rewards[0] > 1.0f) {
+        env->rewards[0] = 1.0f;
+    }
+    if (env->rewards[0] < -1.0f) {
+        env->rewards[0] = -1.0f;
+    }
 }
 
 void c_step(Chess* env) {
@@ -1825,70 +1911,64 @@ void c_step(Chess* env) {
         return;
     }
     
-    if (env->terminals[0]) {
-        c_reset(env);
-        return;
-    }
-    
     env->rewards[0] = 0.0f;
     env->terminals[0] = 0;
     env->tick++;
     
-    int white_action = env->actions[0];
-    int black_action = env->actions[1];
+    int white_action, black_action;
+    if (env->learner_color == CHESS_WHITE) {
+        white_action = env->actions[0];
+        black_action = env->actions[1];
+    } else {
+        white_action = env->actions[1];
+        black_action = env->actions[0];
+    }
     
-    bool white_moved = process_player_action(env, white_action, CHESS_WHITE);
+    int16_t score_before = env->pos.materialScore;
+    ChessColor mover = env->pos.sideToMove;
     
-    if (white_moved) {
+    bool move_completed = false;
+    if (mover == CHESS_WHITE) {
+        move_completed = process_player_action(env, white_action, CHESS_WHITE);
+    } else {
+        move_completed = process_player_action(env, black_action, CHESS_BLACK);
+    }
+
+    if (move_completed) {
+        int16_t score_after = env->pos.materialScore;
+        // materialScore is from White's perspective.
+        int delta = score_after - score_before;
+        
+        float mat_reward = (float)delta * env->reward_material;
+        if (env->learner_color == CHESS_BLACK) {
+            mat_reward = -mat_reward;
+        }
+        env->rewards[0] += mat_reward;
+    }
+    
+    clip_rewards(env);
+    
+    if (move_completed) {
         if (env->legal_moves_side != env->pos.sideToMove || env->legal_moves_key != env->pos.key) {
             generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
             env->legal_moves_side = env->pos.sideToMove;
             env->legal_moves_key = env->pos.key;
         }
         populate_observations(env);
-        
-        if (env->pick_phase[1] == 1 && env->selected_square[1] != SQ_NONE) {
-            Square black_selected = env->selected_square[1];
-            Piece pc = piece_on(&env->pos, black_selected);
-            bool piece_still_valid = (pc != NO_PIECE && color_of(pc) == CHESS_BLACK);
-            
-            if (!piece_still_valid) {
-                env->pick_phase[1] = 0;
-                env->selected_square[1] = SQ_NONE;
-                env->valid_destinations[1].count = 0;
-            } else {
-                env->valid_destinations[1].count = 0;
-                for (int i = 0; i < env->legal_moves.count; i++) {
-                    Move m = env->legal_moves.moves[i].move;
-                    if (from_sq(m) == black_selected) {
-                        env->valid_destinations[1].moves[env->valid_destinations[1].count++] = env->legal_moves.moves[i];
-                    }
-                }
-                if (env->valid_destinations[1].count == 0) {
-                    env->pick_phase[1] = 0;
-                    env->selected_square[1] = SQ_NONE;
-                }
-            }
-        }
     }
     
-    bool black_moved = process_player_action(env, black_action, CHESS_BLACK);
-    
-    if (env->chess_moves >= env->max_moves) {
+    if (env->chess_moves >= env->max_moves || env->undo_stack_ptr >= MAX_GAME_PLIES - 2) {
         env->terminals[0] = 1;
         env->rewards[0] = env->reward_draw;
-        env->log.perf += 0.0f;
+        env->log.perf = (env->log.perf * env->log.n + 0.5f) / (env->log.n + 1.0f);
         env->log.draw_rate += 1.0f;
         env->log.timeout_rate += 1.0f;
         env->log.chess_moves += env->chess_moves;
         env->log.episode_length += env->tick;
+        float invalid_rate = (env->tick > 0) ? ((float)env->invalid_actions_this_episode / (float)env->tick) : 0.0f;
+        env->log.invalid_action_rate += invalid_rate;
         env->log.n += 1.0f;
-        if (env->legal_moves_side != env->pos.sideToMove || env->legal_moves_key != env->pos.key) {
-            generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
-            env->legal_moves_side = env->pos.sideToMove;
-            env->legal_moves_key = env->pos.key;
-        }
-        populate_observations(env);
+        c_reset(env);
         return;
     }
     
@@ -1902,37 +1982,55 @@ void c_step(Chess* env) {
     
     if (env->game_result != 0) {
         env->terminals[0] = 1;
+        float win_value = 0.0f;
         if (env->game_result == 3) {
-            bool is_checkmate = (env->legal_moves.count == 0) && is_check(&env->pos, env->pos.sideToMove);
-            if (is_checkmate) {
-                env->rewards[0] = 1.0f;
-                env->log.perf += 1.0f;
-                env->log.draw_rate += 0.0f;
+            env->rewards[0] = env->reward_draw;
+            win_value = 0.5f;
+            env->log.draw_rate += 1.0f;
+            
+            env->white_score += 0.5f;
+            env->black_score += 0.5f;
+            strcpy(env->last_result, "Draw");
+        } else if (env->game_result == 1) {
+            if (env->learner_color == CHESS_WHITE) {
+                env->rewards[0] = -1.0f;
+                win_value = 0.0f;
             } else {
-                env->rewards[0] = env->reward_draw;
-                env->log.perf += 0.0f;
-                env->log.draw_rate += 1.0f;
+                env->rewards[0] = 1.0f;
+                win_value = 1.0f;
             }
-        } else {
-            env->rewards[0] = 1.0f;
-            env->log.perf += 1.0f;
+            env->black_score += 1.0f;
+            strcpy(env->last_result, "Black Wins");
+            env->log.draw_rate += 0.0f;
+        } else if (env->game_result == 2) {
+            if (env->learner_color == CHESS_WHITE) {
+                env->rewards[0] = 1.0f;
+                win_value = 1.0f;
+            } else {
+                env->rewards[0] = -1.0f;
+                win_value = 0.0f;
+            }
+            env->white_score += 1.0f;
+            strcpy(env->last_result, "White Wins");
             env->log.draw_rate += 0.0f;
         }
+        
+        env->log.perf = (env->log.perf * env->log.n + win_value) / (env->log.n + 1.0f);
         env->log.timeout_rate += 0.0f;
         env->log.chess_moves += env->chess_moves;
         env->log.episode_length += env->tick;
-        float invalid_rate = (env->tick > 0) ? ((float)env->invalid_actions_this_episode / (float)(env->tick * 2)) : 0.0f;
+        float invalid_rate = (env->tick > 0) ? ((float)env->invalid_actions_this_episode / (float)env->tick) : 0.0f;
         env->log.invalid_action_rate += invalid_rate;
         env->log.n += 1.0f;
-        populate_observations(env);
+        c_reset(env);
         return;
     }
     
     populate_observations(env);
 }
 
+// GUI is a tad scuffed, but it works.
 void c_render(Chess* env) {
-#ifdef ENABLE_RENDERING
     const int cell_size = 64;
     const int board_size = 8 * cell_size;
     
@@ -1943,15 +2041,19 @@ void c_render(Chess* env) {
         env->client = (Client*)calloc(1, sizeof(Client));
         env->client->cell_size = cell_size;
         
-        env->ai_score = 0.0f;
-        env->opponent_score = 0.0f;
+        env->white_score = 0.0f;
+        env->black_score = 0.0f;
         strcpy(env->last_result, "Game starting...");
     }
     
-    if (IsKeyDown(KEY_ESCAPE)) {
+    if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) {
         CloseWindow();
         exit(0);
     }
+    
+    // Speed controls
+    static int paused = 0;
+    static int frame_delay = 12;
     
     static int selected_sq = -1;
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
@@ -2047,14 +2149,14 @@ void c_render(Chess* env) {
     
     const int scoreboard_y = board_size + 10;
     char score_text[128];
-    snprintf(score_text, sizeof(score_text), "AI: %.1f  Opponent: %.1f", 
-             env->ai_score, env->opponent_score);
+    snprintf(score_text, sizeof(score_text), "White: %.1f  Black: %.1f", 
+             env->white_score, env->black_score);
     DrawText(score_text, 10, scoreboard_y, 20, WHITE);
     
     if (env->last_result[0] != '\0') {
-        Color result_color = GREEN;
-        if (strstr(env->last_result, "Opponent")) result_color = RED;
-        else if (strstr(env->last_result, "Draw")) result_color = YELLOW;
+        Color result_color = YELLOW;
+        if (strstr(env->last_result, "White")) result_color = (Color){240, 217, 181, 255};
+        else if (strstr(env->last_result, "Black")) result_color = (Color){100, 100, 100, 255};
         
         DrawText(env->last_result, 10, scoreboard_y + 25, 18, result_color);
     }
@@ -2063,14 +2165,134 @@ void c_render(Chess* env) {
     snprintf(move_text, sizeof(move_text), "Move: %d", env->chess_moves);
     DrawText(move_text, board_size - 100, scoreboard_y, 18, LIGHTGRAY);
     
+    const char* learner_str = (env->learner_color == CHESS_WHITE) ? "Learner: White" : "Learner: Black";
+    DrawText(learner_str, board_size - 120, scoreboard_y + 25, 16, LIGHTGRAY);
+    
+    const int btn_width = 36;
+    const int btn_height = 24;
+    const int btn_y = scoreboard_y + 45;
+    const int btn_start_x = board_size / 2 - 70;
+    
+    Rectangle minus_btn = {btn_start_x, btn_y, btn_width, btn_height};
+    DrawRectangleRec(minus_btn, DARKGRAY);
+    DrawRectangleLinesEx(minus_btn, 2, LIGHTGRAY);
+    DrawText("-", btn_start_x + 14, btn_y + 4, 20, WHITE);
+    
+    Rectangle pause_btn = {btn_start_x + btn_width + 5, btn_y, btn_width + 10, btn_height};
+    DrawRectangleRec(pause_btn, paused ? MAROON : DARKGREEN);
+    DrawRectangleLinesEx(pause_btn, 2, LIGHTGRAY);
+    DrawText(paused ? ">" : "||", btn_start_x + btn_width + 14, btn_y + 4, 18, WHITE);
+    
+    Rectangle plus_btn = {btn_start_x + 2*btn_width + 20, btn_y, btn_width, btn_height};
+    DrawRectangleRec(plus_btn, DARKGRAY);
+    DrawRectangleLinesEx(plus_btn, 2, LIGHTGRAY);
+    DrawText("+", btn_start_x + 2*btn_width + 32, btn_y + 4, 20, WHITE);
+    
+    // Speed indicator
+    char speed_text[32];
+    int speed_val = frame_delay > 0 ? 60 / frame_delay : 60;
+    snprintf(speed_text, sizeof(speed_text), "%dx", speed_val > 0 ? speed_val : 1);
+    DrawText(speed_text, btn_start_x + 3*btn_width + 30, btn_y + 4, 18, paused ? RED : LIGHTGRAY);
+    
     EndDrawing();
-#else
-    (void)env;  // Unused when rendering disabled
-#endif
+    
+    if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        Vector2 mouse = GetMousePosition();
+        if (CheckCollisionPointRec(mouse, minus_btn)) {
+            frame_delay = frame_delay < 60 ? frame_delay + 4 : 60;
+        }
+        if (CheckCollisionPointRec(mouse, pause_btn)) {
+            paused = !paused;
+        }
+        if (CheckCollisionPointRec(mouse, plus_btn)) {
+            frame_delay = frame_delay > 4 ? frame_delay - 4 : 1;
+        }
+    }
+    
+    if (IsKeyPressed(KEY_SPACE)) paused = !paused;
+    if (IsKeyPressed(KEY_EQUAL) || IsKeyPressed(KEY_KP_ADD)) frame_delay = frame_delay > 4 ? frame_delay - 4 : 1;
+    if (IsKeyPressed(KEY_MINUS) || IsKeyPressed(KEY_KP_SUBTRACT)) frame_delay = frame_delay < 60 ? frame_delay + 4 : 60;
+    
+    const char* pause_piece_chars[] = {
+        "",
+        "P", "N", "B", "R", "Q", "K",
+        "", "",
+        "p", "n", "b", "r", "q", "k"
+    };
+    
+    while (paused) {
+        BeginDrawing();
+        ClearBackground(DARKGRAY);
+        
+        for (int r = 0; r < 8; r++) {
+            for (int f = 0; f < 8; f++) {
+                Color sq_color = ((r + f) % 2 == 0) ? (Color){181, 136, 99, 255} : (Color){240, 217, 181, 255};
+                DrawRectangle(f * cell_size, (7 - r) * cell_size, cell_size, cell_size, sq_color);
+                Piece pc = piece_on(&env->pos, (Square)make_square(f, r));
+                if (pc != NO_PIECE) {
+                    int x = f * cell_size + cell_size / 4;
+                    int y = (7 - r) * cell_size + cell_size / 8;
+                    Color pc_color = color_of(pc) == CHESS_WHITE 
+                        ? (Color){255, 255, 255, 255}
+                        : (Color){0, 0, 0, 255};
+                    DrawText(pause_piece_chars[pc], x, y, cell_size / 2, pc_color);
+                }
+            }
+        }
+        
+        DrawRectangle(0, board_size, board_size, 80, (Color){40, 40, 40, 255});
+        DrawText("PAUSED", board_size / 2 - 50, scoreboard_y + 10, 24, RED);
+        
+        DrawRectangleRec(minus_btn, DARKGRAY);
+        DrawRectangleLinesEx(minus_btn, 2, LIGHTGRAY);
+        DrawText("-", btn_start_x + 14, btn_y + 4, 20, WHITE);
+        
+        DrawRectangleRec(pause_btn, MAROON);
+        DrawRectangleLinesEx(pause_btn, 2, LIGHTGRAY);
+        DrawText(">", btn_start_x + btn_width + 18, btn_y + 4, 18, WHITE);
+        
+        DrawRectangleRec(plus_btn, DARKGRAY);
+        DrawRectangleLinesEx(plus_btn, 2, LIGHTGRAY);
+        DrawText("+", btn_start_x + 2*btn_width + 32, btn_y + 4, 20, WHITE);
+        
+        snprintf(speed_text, sizeof(speed_text), "%dx", speed_val > 0 ? speed_val : 1);
+        DrawText(speed_text, btn_start_x + 3*btn_width + 30, btn_y + 4, 18, RED);
+        
+        EndDrawing();
+        
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            Vector2 mouse = GetMousePosition();
+            if (CheckCollisionPointRec(mouse, pause_btn)) {
+                paused = 0;
+                break;
+            }
+            if (CheckCollisionPointRec(mouse, minus_btn)) {
+                frame_delay = frame_delay < 60 ? frame_delay + 4 : 60;
+                speed_val = 60 / frame_delay;
+            }
+            if (CheckCollisionPointRec(mouse, plus_btn)) {
+                frame_delay = frame_delay > 4 ? frame_delay - 4 : 1;
+                speed_val = 60 / frame_delay;
+            }
+        }
+        if (IsKeyPressed(KEY_SPACE)) {
+            paused = 0;
+            break;
+        }
+        if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) {
+            CloseWindow();
+            exit(0);
+        }
+        usleep(16000); 
+    }
+    
+
+    if (frame_delay > 1) {
+        usleep(frame_delay * 16000);
+    }
 }
 
 void c_close(Chess* env) {
-#ifdef ENABLE_RENDERING
     if (env->client != NULL) {
         if (IsWindowReady()) {
             CloseWindow();
@@ -2078,7 +2300,12 @@ void c_close(Chess* env) {
         free(env->client);
         env->client = NULL;
     }
-#else
-    (void)env;
-#endif
+    if (env->fen_curriculum != NULL) {
+        for (int i = 0; i < env->num_fens; i++) {
+            free(env->fen_curriculum[i]);
+        }
+        free(env->fen_curriculum);
+        env->fen_curriculum = NULL;
+        env->num_fens = 0;
+    }
 }
