@@ -9,14 +9,15 @@ class Chess(pufferlib.PufferEnv):
                  max_moves=500, reward_draw=0.0,
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01, 
                  reward_valid_piece=0.0, reward_valid_move=0.0,
+                 reward_material=0.0, reward_castling=0.0, reward_repetition=0.0,
                  render_fps=30, human_play=0,
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                  multi_fen=False,
                  enable_50_move_rule=1, enable_threefold_repetition=1):
         
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(1045*2,), dtype=np.uint8)
-        self.single_action_space = gymnasium.spaces.Discrete(64)
+            low=0, high=255, shape=(1077*2,), dtype=np.uint8)
+        self.single_action_space = gymnasium.spaces.Discrete(96)
         self.render_mode = render_mode
         self.num_agents = num_envs
         self.log_interval = log_interval
@@ -38,6 +39,9 @@ class Chess(pufferlib.PufferEnv):
         
         super().__init__(buf)
         
+        if self.selfplay:
+            self.actions = np.zeros(num_envs * 2, dtype=np.int32)
+
         factor = 2 if self.selfplay else 1
         c_envs = []
         for i in range(num_envs):
@@ -54,6 +58,9 @@ class Chess(pufferlib.PufferEnv):
                 reward_invalid_move=reward_invalid_move,
                 reward_valid_piece=reward_valid_piece,
                 reward_valid_move=reward_valid_move,
+                reward_material=reward_material,
+                reward_castling=reward_castling,
+                reward_repetition=reward_repetition,
                 render_fps=render_fps,
                 human_play=human_play,
                 starting_fen=starting_fen,
@@ -89,7 +96,7 @@ if __name__ == '__main__':
     steps = 0
 
     CACHE = 1024
-    actions = np.random.randint(0, 64, (CACHE, N))
+    actions = np.random.randint(0, 64, (CACHE, 2*N))
 
     import time
     start = time.time()
