@@ -1288,21 +1288,42 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
     pufferl.logger.close(model_path, early_stop=False)
     return all_logs
 
-def run_match(env_name, args=None, vecenv=None, model_A_path="", model_B_path="", num_games: int = 1024):
-    try:
-        args['load_model_path'] = model_A_path
-        policy_A = load_policy(args, vecenv, env_name)
-        args['load_model_path'] = model_B_path
-        policy_B = load_policy(args, vecenv, env_name)
-    except Exception as e:
-        print(f"Error loading policies: {e}")
-        return
+class TournamentPool:
+    def __init__(self, make_policy, device, n_slots=4):
+        self.device = device
+        self.n_slots = n_slots
+        self.policies = [make_policy().to(device) for _ in range(n_slots)]
+        for p in self.policies:
+            p.eval()
+            for param in p.parameters():
+                param.requires_grad = False
+        self.current_A = 0
+        self.current_B = 1
+        self.next_A = 2
+        self.next_B = 3
     
+    def get_current(self):
+        return self.policies[self.current_A], self.policies[self.current_B]
+    
+    def load_next(self, weights_A, weights_B):
+        if weights_A is not None:
+            self.policies[self.next_A].load_state_dict(weights_A, strict=True)
+        if weights_B is not None:
+            self.policies[self.next_B].load_state_dict(weights_B, strict=True)
+    
+    def swap_to_next(self):
+        self.current_A, self.next_A = self.next_A, self.current_A
+        self.current_B, self.next_B = self.next_B, self.current_B
+
+
+def run_match(env_name, args, pool, num_games: int = 1024):
+    vecenv = load_env(env_name, args)
     ob, info = vecenv.reset()
     driver = vecenv.driver_env
-    selfplay = driver.selfplay
     num_agents = vecenv.observation_space.shape[0]
     device = args['train']['device']
+    
+    policy_A, policy_B = pool.get_current()
 
     state_A = {}
     state_B = {}
@@ -1315,111 +1336,223 @@ def run_match(env_name, args=None, vecenv=None, model_A_path="", model_B_path=""
             lstm_h=torch.zeros(num_agents, policy_B.hidden_size, device=device),
             lstm_c=torch.zeros(num_agents, policy_B.hidden_size, device=device),
         )
+    
     games_played = 0
     wins_A = 0
     draws = 0
+    
     while games_played < num_games:
         with torch.no_grad():
             ob_tensor = torch.as_tensor(ob).to(device)
             
-            # Policy A (The Policy - uses first half of obs)
-            ob_A = ob_tensor[:, :int(ob_tensor.shape[1]/2)]
+            ob_A = ob_tensor[:, :ob_tensor.shape[1]//2]
             logits_A, _ = policy_A.forward_eval(ob_A, state_A)
             action_A, _, _ = pufferlib.pytorch.sample_logits(logits_A)
             action_A = action_A.cpu().numpy()
             
-            # Policy B (The Enemy - uses second half of obs)
-            ob_B = ob_tensor[:, int(ob_tensor.shape[1]/2):]
+            ob_B = ob_tensor[:, ob_tensor.shape[1]//2:]
             logits_B, _ = policy_B.forward_eval(ob_B, state_B)
             action_B, _, _ = pufferlib.pytorch.sample_logits(logits_B)
             action_B = action_B.cpu().numpy()
-            # Interleave actions for the self-play vector environment
-            if(isinstance(driver.single_action_space, pufferlib.spaces.MultiDiscrete)):
-                 interleaved = np.empty((num_agents*2, len(driver.single_action_space.nvec)), dtype = vecenv.single_action_space.dtype)
+            
+            if isinstance(driver.single_action_space, pufferlib.spaces.MultiDiscrete):
+                interleaved = np.empty((num_agents*2, len(driver.single_action_space.nvec)), dtype=vecenv.single_action_space.dtype)
             else:
-                 interleaved = np.empty(action_A.size * 2, dtype = action_A.dtype)
+                interleaved = np.empty(action_A.size * 2, dtype=action_A.dtype)
                  
             interleaved[0::2] = action_A
             interleaved[1::2] = action_B
             action = interleaved.reshape(vecenv.action_space.shape)
+        
         result = vecenv.step(action)
         ob, r, d = result[0:3]
-        done_idx = np.flatnonzero(d==1)
+        done_idx = np.flatnonzero(d == 1)
+        
         if done_idx.size > 0:
             rewards = r[done_idx]
             wins_A += np.sum(rewards > 0)
             draws += np.sum(rewards == 0)
             games_played += done_idx.size
+            
+            if args['train']['use_rnn']:
+                for idx in done_idx:
+                    if idx < num_agents:
+                        state_A['lstm_h'][idx].zero_()
+                        state_A['lstm_c'][idx].zero_()
+                        state_B['lstm_h'][idx].zero_()
+                        state_B['lstm_c'][idx].zero_()
+    
+    vecenv.close()
+    
     losses_A = games_played - wins_A - draws
     win_rate = (wins_A + 0.5*draws) / games_played if games_played > 0 else 0.0
-    print(f"Match Complete: A vs B | Win Rate A: {win_rate:.4f} ({wins_A}/{draws}/{losses_A} of {games_played})")
     return win_rate, wins_A, draws, games_played
 
-            
-def round_robin_tournament(env_name, args=None, num_games: int = 1024):
+
+def round_robin_tournament(env_name, args=None):
+    import math
+    
     args = load_config(env_name)
     directory = args['tournament_directory']
-    backend = args['vec']['backend']
-    args['vec'] = dict(backend=backend, num_envs=1)
-    vecenv = load_env(env_name, args)
-    model_paths = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.pt')]
+    num_games = args.get('tournament_games', 1024)
+    device = args['train']['device']
+    
+    total_parallel = args['env'].get('num_envs', 1) * args['vec'].get('num_envs', 1)
+    print(f"Tournament parallelism: {total_parallel} parallel games (from config)")
+    
+    model_paths = sorted([
+        os.path.join(directory, f) for f in os.listdir(directory) 
+        if f.endswith('.pt') and 'trainer_state' not in f and 'state' not in f.lower()
+    ])
+    
+    RANDOM_BASELINE = "__random_baseline__"
+    model_paths.insert(0, RANDOM_BASELINE)
+    
     num_models = len(model_paths)
-    if num_models < 2:
-        print(f"Need at least 2 models for a tournament. Got {num_models}")
-        vecenv.close()
-        return []
-    results = {path: {
-        'wins': 0,
-        'draws': 0,
-        'losses': 0,
-        'games_played': 0,
-        'model_name': Path(path).stem
-    } for path in model_paths}
+    print(f"Found {num_models - 1} models + 1 random baseline in {directory}")
+    
+    temp_vecenv = load_env(env_name, args)
+    
+    def make_policy():
+        return load_policy(args, temp_vecenv, env_name)
+    
+    pool = TournamentPool(make_policy, device)
+    temp_vecenv.close()
+    
+    print("Loading model weights...")
+    weights = {}
+    weights[RANDOM_BASELINE] = None
+    
+    for path in model_paths:
+        if path == RANDOM_BASELINE:
+            print(f"Random baseline (randomly initialized)")
+            continue
+        try:
+            state_dict = torch.load(path, map_location=device, weights_only=False)
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            weights[path] = state_dict
+            print(f"  Loaded {Path(path).stem}")
+        except Exception as e:
+            print(f"  Failed to load {Path(path).stem}: {e}")
+            weights[path] = None
+    
+    results = {}
+    for path in model_paths:
+        name = "random_baseline" if path == RANDOM_BASELINE else Path(path).stem
+        results[path] = {
+            'wins': 0,
+            'draws': 0,
+            'losses': 0,
+            'games_played': 0,
+            'model_name': name,
+        }
+    
     schedule = list(itertools.combinations(model_paths, 2))
-    print(f"Tournament Schedule: {len(schedule)} unique matches to run.")
-    for i, (model_A, model_B) in enumerate(schedule):
-        if vecenv is None:
-            vecenv = load_env(env_name, args)
-        modelA_name = Path(model_A).stem
-        modelB_name = Path(model_B).stem
-        print(f"Running match {i+1}/{len(schedule)}: {modelA_name} vs {modelB_name}")
-        win_rate_1, wins_1, draws, total_games = run_match(
-            env_name,
-            args,
-            vecenv,
-            model_A,
-            model_B,
-            num_games
-        )
-        wins_2 = total_games - wins_1 - draws
-        print(f"  Match Result: {modelA_name} W/D/L: {wins_1}/{draws}/{wins_2}")
-        # Model 1 Aggregation (Wins are wins_1, Losses are wins_2)
-        results[model_A]['wins'] += wins_1
-        results[model_A]['draws'] += draws
-        results[model_A]['losses'] += wins_2
-        results[model_A]['games_played'] += total_games
+    print(f"Tournament Schedule: {len(schedule)} unique matchups × 2 (each side plays both colors)")
+    
+    head_to_head = {(a, b): {'wins_A': 0, 'draws': 0, 'games': 0} for a, b in schedule}
+    
+    match_num = 0
+    total_matches = len(schedule) * 2
+    
+    for model_A_path, model_B_path in schedule:
+        weights_A = weights.get(model_A_path)
+        weights_B = weights.get(model_B_path)
+    
+        if model_A_path != RANDOM_BASELINE and weights_A is None:
+            print(f"Skipping - {Path(model_A_path).stem} failed to load")
+            continue
+        if model_B_path != RANDOM_BASELINE and weights_B is None:
+            print(f"Skipping - {Path(model_B_path).stem} failed to load")
+            continue
         
-        # Model 2 Aggregation (Wins are wins_2, Losses are wins_1)
-        results[model_B]['wins'] += wins_2
-        results[model_B]['draws'] += draws
-        results[model_B]['losses'] += wins_1
-        results[model_B]['games_played'] += total_games
-        vecenv.close()
-        vecenv = None
-    # Calculate final aggregate win rate for sorting
+        modelA_name = results[model_A_path]['model_name']
+        modelB_name = results[model_B_path]['model_name']
+        
+        match_num += 1
+        print(f"[{match_num}/{total_matches}] {modelA_name} (W) vs {modelB_name} (B)...", end=" ", flush=True)
+        
+        pool.load_next(weights_A, weights_B)
+        pool.swap_to_next()
+        
+        win_rate, wins_A, draws, total = run_match(env_name, args, pool, num_games // 2)
+        losses_A = total - wins_A - draws
+        print(f"W/D/L: {wins_A}/{draws}/{losses_A}")
+        
+        results[model_A_path]['wins'] += wins_A
+        results[model_A_path]['draws'] += draws
+        results[model_A_path]['losses'] += losses_A
+        results[model_A_path]['games_played'] += total
+        
+        results[model_B_path]['wins'] += losses_A
+        results[model_B_path]['draws'] += draws
+        results[model_B_path]['losses'] += wins_A
+        results[model_B_path]['games_played'] += total
+        
+        head_to_head[(model_A_path, model_B_path)]['wins_A'] += wins_A
+        head_to_head[(model_A_path, model_B_path)]['draws'] += draws
+        head_to_head[(model_A_path, model_B_path)]['games'] += total
+        
+        match_num += 1
+        print(f"[{match_num}/{total_matches}] {modelB_name} (W) vs {modelA_name} (B)...", end=" ", flush=True)
+        
+        pool.load_next(weights_B, weights_A)
+        pool.swap_to_next()
+        
+        win_rate, wins_B, draws, total = run_match(env_name, args, pool, num_games // 2)
+        losses_B = total - wins_B - draws
+        print(f"W/D/L: {wins_B}/{draws}/{losses_B}")
+        
+        results[model_B_path]['wins'] += wins_B
+        results[model_B_path]['draws'] += draws
+        results[model_B_path]['losses'] += losses_B
+        results[model_B_path]['games_played'] += total
+        
+        results[model_A_path]['wins'] += losses_B
+        results[model_A_path]['draws'] += draws
+        results[model_A_path]['losses'] += wins_B
+        results[model_A_path]['games_played'] += total
+        
+        head_to_head[(model_A_path, model_B_path)]['wins_A'] += losses_B
+        head_to_head[(model_A_path, model_B_path)]['draws'] += draws
+        head_to_head[(model_A_path, model_B_path)]['games'] += total
+    
     for path, data in results.items():
-        data['win_rate'] = (data['wins'] + 0.5 * data['draws']) / data['games_played'] if data['games_played'] > 0 else 0
-
-    # Sort models by win rate
-    final_ranking = sorted(results.values(), key=lambda x: x['win_rate'], reverse=True)
-
-    print(f"{'Rank':<5}{'Model Name':<50}{'Overall Win Rate':<20}{'Aggregate W/D/L':<20}")
-    print("-" * 80)
+        if data['games_played'] > 0:
+            data['win_rate'] = (data['wins'] + 0.5 * data['draws']) / data['games_played']
+        else:
+            data['win_rate'] = 0.0
+    
+    elos = {path: 0.0 for path in model_paths}
+    K = 32
+    
+    for _ in range(100):
+        for (model_A, model_B), h2h in head_to_head.items():
+            if h2h['games'] == 0:
+                continue
+            
+            R_A, R_B = elos[model_A], elos[model_B]
+            E_A = 1 / (1 + 10**((R_B - R_A) / 400))
+            S_A = (h2h['wins_A'] + 0.5 * h2h['draws']) / h2h['games']
+            
+            elos[model_A] += K * (S_A - E_A)
+            elos[model_B] += K * ((1 - S_A) - (1 - E_A))
+    
+    random_elo = elos[RANDOM_BASELINE]
+    for path in model_paths:
+        results[path]['elo'] = int(elos[path] - random_elo)
+    
+    final_ranking = sorted(results.values(), key=lambda x: x['elo'], reverse=True)
+    
+    print("\n" + "=" * 115)
+    print("TOURNAMENT RESULTS (ELO grounded to random baseline = 0)")
+    print("=" * 115)
+    print(f"{'Rank':<5}{'Model Name':<40}{'ELO':<8}{'Win Rate':<12}{'W':<8}{'D':<8}{'L':<8}{'Games':<8}")
+    print("-" * 115)
     for i, data in enumerate(final_ranking):
-        record = f"{data['wins']}/{data['draws']}/{data['losses']} ({data['games_played']})"
-        print(f"{i+1:<5}{data['model_name']:<50}{data['win_rate']:.4f}{'':<16}{record:<20}")
-
-
+        print(f"{i+1:<5}{data['model_name']:<40}{data['elo']:<8}{data['win_rate']:.3f}{'':<6}{data['wins']:<8}{data['draws']:<8}{data['losses']:<8}{data['games_played']:<8}")
+    print("=" * 115)
+    
     return final_ranking
 
 def eval(env_name, args=None, vecenv=None, policy=None):
@@ -1663,7 +1796,7 @@ def load_policy(args, vecenv, env_name='',enemy_policy=0):
         else:
             raise pufferlib.APIUsageError('No run id provided for eval')
 
-        state_dict = torch.load(path, map_location=device)
+        state_dict = torch.load(path, map_location=device, weights_only=False)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
     if enemy_policy and args['load_enemy_model_path']:
@@ -1674,11 +1807,11 @@ def load_policy(args, vecenv, env_name='',enemy_policy=0):
         load_path = max(glob.glob(f"experiments/{env_name}*.pt"), key=os.path.getctime)
 
     if load_path is not None:
-        state_dict = torch.load(load_path, map_location=device)
+        state_dict = torch.load(load_path, map_location=device, weights_only=False)
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         policy.load_state_dict(state_dict)
         #state_path = os.path.join(*load_path.split('/')[:-1], 'state.pt')
-        #optim_state = torch.load(state_path)['optimizer_state_dict']
+        #optim_state = torch.load(state_path, weights_only=False)['optimizer_state_dict']
         #pufferl.optimizer.load_state_dict(optim_state)
 
 
@@ -1726,6 +1859,8 @@ def make_parser():
                         help='Path to a pretrained checkpoint')
     parser.add_argument('--tournament-directory', type=str, default=None,
                         help='Directory containing pretrained checkpoints')
+    parser.add_argument('--tournament-games', type=int, default=1024,
+                        help='Number of games per matchup in tournament')
     parser.add_argument('--load-id', type=str,
         default=None, help='Kickstart/eval from from a finished Wandb/Neptune run')
     parser.add_argument('--render-mode', type=str, default='auto',
