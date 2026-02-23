@@ -25,7 +25,7 @@ import torch.nn.functional as F
 
 
 class ChessSeven(nn.Module):
-    def __init__(self, env, square_dim=64, proj_dim=8, hidden_size=256,
+    def __init__(self, env, proj_dim=20, hidden_size=256,
                  embed_dim=32, use_action_masking=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
@@ -33,19 +33,7 @@ class ChessSeven(nn.Module):
         self.use_action_masking = bool(use_action_masking)
         self.num_actions = env.single_action_space.n
 
-        sqs = torch.arange(64, dtype=torch.float32)
-        r, f = sqs // 8, sqs % 8
-        diag = (r + f) / 14.0
-        anti = (r - f + 7) / 14.0
-        cdist = (torch.where(r < 4, 3 - r, r - 4) + torch.where(f < 4, 3 - f, f - 4)) / 6.0
-        sq_color = ((r + f) % 2).float()
-        square_geo_planes = torch.stack([diag, anti, cdist, sq_color], dim=0).view(1, 4, 8, 8)
-        self.register_buffer('square_geo_planes', square_geo_planes)
-
-        self.square_embed = layer_init(nn.Conv2d(21, square_dim, kernel_size=1))
-        self.channel_proj = layer_init(nn.Conv2d(square_dim, proj_dim, kernel_size=1))
-        self.spatial_mix = layer_init(nn.Conv2d(
-            proj_dim, proj_dim, kernel_size=3, padding=1, groups=proj_dim))
+        self.global_mix = layer_init(nn.Linear(64 * 17, 64 * proj_dim))
 
         if embed_dim % 2 != 0:
             raise ValueError(f'embed_dim must be even, got {embed_dim}')
@@ -54,10 +42,11 @@ class ChessSeven(nn.Module):
         self.ep_embed = nn.Embedding(65, embed_dim)
         self.phase_embed = nn.Embedding(2, embed_dim // 2)
 
-        board_flat = 64 * proj_dim + 32
-        total_features = board_flat + (3 * embed_dim) + 5
+        board_flat = 64 * proj_dim
+        total_features = board_flat + 32 + (3 * embed_dim) + 5
 
         self.proj = nn.Sequential(
+            nn.LayerNorm(total_features),
             layer_init(nn.Linear(total_features, hidden_size)),
             nn.ReLU(),
         )
@@ -75,13 +64,8 @@ class ChessSeven(nn.Module):
         obs = observations
 
         squares_u8 = obs[:, :1088].view(B, 64, 17)
-        squares = squares_u8.float().view(B, 8, 8, 17).permute(0, 3, 1, 2)
-        geo = self.square_geo_planes.expand(B, -1, -1, -1)
-        x = torch.cat([squares, geo], dim=1)
-        x = F.relu(self.square_embed(x))
-        x = F.relu(self.channel_proj(x))
-        x = x + F.relu(self.spatial_mix(x))
-        board_features = x.flatten(1)
+        x = squares_u8.float().flatten(1)
+        board_features = F.relu(self.global_mix(x))
 
         promos_mask = obs[:, 1088:1120] > 0
         promos = promos_mask.float()
