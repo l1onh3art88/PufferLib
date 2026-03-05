@@ -43,16 +43,18 @@ class ChessNNUE(nn.Module):
         self.phase_embed = nn.Embedding(2, meta_embed_dim)
 
         self.scalar_layer = nn.Sequential(
-            nn.Linear(5, hidden_size),
+            nn.Linear(5, 64),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(64, 64),
             nn.ReLU()
         )
 
-        total_features = rel_embed_dim + 4 * meta_embed_dim + hidden_size
+        total_features = rel_embed_dim + 4 * meta_embed_dim + 64
 
         self.proj = nn.Sequential(
             nn.Linear(total_features, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
         )
 
@@ -385,14 +387,13 @@ class Chess(nn.Module):
         self.use_action_masking = bool(use_action_masking)
         self.num_actions = env.single_action_space.n
 
-        self.spatial_cnn = nn.Sequential(
-            layer_init(nn.Conv2d(16, cnn_channels, 3, stride=2, padding=1)),
+        self.board_layer = nn.Sequential(
+            layer_init(nn.Linear(768, self.hidden_size*2)),
             nn.ReLU(),
-            layer_init(nn.Conv2d(cnn_channels, cnn_channels, 3, stride=2, padding=1)),
+            layer_init(nn.Linear(self.hidden_size*2, self.hidden_size)),
             nn.ReLU(),
-            nn.Flatten(),
         )
-        cnn_flat_size = cnn_channels * 4
+
         self.side_embed = nn.Embedding(2, embed_dim)
         self.castle_embed = nn.Embedding(16, embed_dim)
         self.ep_embed = nn.Embedding(65, embed_dim)
@@ -400,12 +401,12 @@ class Chess(nn.Module):
 
         self.scalar_size = 5
         self.scalar_layer = nn.Sequential(
-            layer_init(nn.Linear(self.scalar_size, hidden_size)),
+            layer_init(nn.Linear(self.scalar_size, 64)),
             nn.ReLU(),
-            layer_init(nn.Linear(hidden_size, self.hidden_size)),
+            layer_init(nn.Linear(64, 64)),
             nn.ReLU(),
         )
-        total_features = cnn_flat_size + 4 * embed_dim + self.hidden_size
+        total_features = self.hidden_size + 4 * embed_dim + 64
 
         self.proj = nn.Sequential(
             layer_init(nn.Linear(total_features, hidden_size)),
@@ -433,17 +434,10 @@ class Chess(nn.Module):
         B = observations.shape[0]
         obs = observations.float()
 
-        board = obs[:, :768].view(B, 12, 8, 8)
-        selected_piece = obs[:, 853:917].view(B, 1, 8, 8)
-        valid_pieces = obs[:, 917:981].view(B, 1, 8, 8)
-        valid_dests = obs[:, 981:1045].view(B, 1, 8, 8)
-        valid_promos = obs[:, 1045:1077].view(B, 1, 4, 8)
-        valid_promos_padded = F.pad(valid_promos, (0, 0, 0, 4), value=0).view(B, 1, 8, 8)
-
-        spatial_input = torch.cat([
-            board, selected_piece, valid_pieces, valid_dests, valid_promos_padded
-        ], dim=1)
-        spatial_features = self.spatial_cnn(spatial_input)
+        board = obs[:, :768]
+        board = torch.where(board == 255, torch.tensor(-1.0, device=board.device), board)
+        
+        spatial_features = self.board_layer(board)
 
         side_idx = obs[:, 768:770].argmax(dim=1)
         side_features = self.side_embed(side_idx)
@@ -471,7 +465,7 @@ class Chess(nn.Module):
         x = self.proj(x)
 
         return x
-
+    
     def decode_actions(self, hidden, state=None):
         logits = self.actor(hidden)
 
@@ -504,7 +498,7 @@ class Chess(nn.Module):
                 for idx in torch.where(all_masked)[0]:
                     mask[idx] = 1
 
-            logits = logits.masked_fill(mask == 0, -1e8)
+            logits = logits.masked_fill(mask == 0, -1e10)
 
         value = self.value_head(hidden)
 

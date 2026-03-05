@@ -468,8 +468,8 @@ typedef struct {
     ExtMove moves[256];
     int count;
 } MoveList;
-
-/*enum {
+/*
+enum {
     // Relational NNUE tokens
     O_TOKEN_COUNT = 0,                    
     O_TOKEN_DATA  = 2,                  
@@ -490,8 +490,8 @@ typedef struct {
     O_PASS_VALID = 443,
 
     OBS_SIZE = 444
-};*/
-
+};
+*/
 enum {
     O_BOARD = 0,
     O_SIDE = 768,
@@ -2227,7 +2227,8 @@ void populate_observations(Chess* env) {
         memset(player_obs, 0, OBS_SIZE);
         uint8_t* board_planes = player_obs + O_BOARD;
         
-        /*uint16_t* token_count_ptr = (uint16_t*)(player_obs + O_TOKEN_COUNT);
+        /*
+        uint16_t* token_count_ptr = (uint16_t*)(player_obs + O_TOKEN_COUNT);
         uint16_t* token_buffer = (uint16_t*)(player_obs + O_TOKEN_DATA);
         int token_count = 0;
         ChessColor us = (ChessColor)player;  // 0=White, 1=Black
@@ -2286,7 +2287,7 @@ void populate_observations(Chess* env) {
             int plane = 6 + (pt - 1);  // 6-11
             while (bb) {
                 Square sq = pop_lsb(&bb);
-                board_planes[plane * 64 + (sq ^ flip)] = 1;
+                board_planes[plane * 64 + (sq ^ flip)] = -1;
             }
         }
         /*
