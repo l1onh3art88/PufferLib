@@ -54,32 +54,64 @@ enum {
     NORTH_WEST = 7, SOUTH_WEST = -9
 };
 
-// #define MAX_TOKENS 64
 #define MOVE_NONE 0
 #define MOVE_NULL 65
 
-#define make_move(from, to) ((Move)((to) | ((from) << 6)))
-#define make_promotion(from, to, pt) ((Move)((to) | ((from) << 6) | (PROMOTION << 14) | (((pt) - KNIGHT) << 12)))
-#define make_enpassant(from, to) ((Move)((to) | ((from) << 6) | (ENPASSANT << 14)))
-#define make_castling(from, to) ((Move)((to) | ((from) << 6) | (CASTLING << 14)))
+static inline Move make_move(Square from, Square to) {
+    return (Move)(to | (from << 6));
+}
 
-#define from_sq(m) (((m) >> 6) & 0x3f)
-#define to_sq(m) ((m) & 0x3f)
-#define type_of_m(m) ((m) >> 14)
-#define promotion_type(m) ((((m) >> 12) & 3) + KNIGHT)
+static inline Move make_promotion(Square from, Square to, int pt) {
+    return (Move)(to | (from << 6) | (PROMOTION << 14) | ((pt - KNIGHT) << 12));
+}
 
-#define make_square(f, r) ((Square)(((r) << 3) + (f)))
-#define file_of(s) ((s) & 7)
-#define rank_of(s) ((s) >> 3)
-#define make_piece(c, pt) ((Piece)(((c) << 3) + (pt)))
-#define type_of_p(p) ((p) & 7)
-#define color_of(p) ((p) >> 3)
+static inline Move make_enpassant(Square from, Square to) {
+    return (Move)(to | (from << 6) | (ENPASSANT << 14));
+}
 
-#define pieces(pos) ((pos)->byTypeBB[0])
-#define pieces_p(pos, p) ((pos)->byTypeBB[p])
-#define pieces_c(pos, c) ((pos)->byColorBB[c])
-#define pieces_cp(pos, c, p) (pieces_p(pos, p) & pieces_c(pos, c))
-#define piece_on(pos, s) ((pos)->board[s])
+static inline Move make_castling(Square from, Square to) {
+    return (Move)(to | (from << 6) | (CASTLING << 14));
+}
+
+static inline Square from_sq(Move m) {
+    return (Square)((m >> 6) & 0x3f);
+}
+
+static inline Square to_sq(Move m) {
+    return (Square)(m & 0x3f);
+}
+
+static inline int type_of_m(Move m) {
+    return (int)(m >> 14);
+}
+
+static inline int promotion_type(Move m) {
+    return (int)(((m >> 12) & 3) + KNIGHT);
+}
+
+static inline Square make_square(int f, int r) {
+    return (Square)((r << 3) + f);
+}
+
+static inline int file_of(Square s) {
+    return (int)(s & 7);
+}
+
+static inline int rank_of(Square s) {
+    return (int)(s >> 3);
+}
+
+static inline Piece make_piece(int c, int pt) {
+    return (Piece)((c << 3) + pt);
+}
+
+static inline int type_of_p(Piece p) {
+    return (int)(p & 7);
+}
+
+static inline int color_of(Piece p) {
+    return (int)(p >> 3);
+}
 #define MAX_GAME_PLIES 2048
 
 #define FileABB 0x0101010101010101ULL
@@ -211,6 +243,26 @@ typedef struct {
     Key key;
 } Position;
 
+static inline Bitboard pieces(const Position* pos) {
+    return pos->byTypeBB[0];
+}
+
+static inline Bitboard pieces_p(const Position* pos, int p) {
+    return pos->byTypeBB[p];
+}
+
+static inline Bitboard pieces_c(const Position* pos, int c) {
+    return pos->byColorBB[c];
+}
+
+static inline Bitboard pieces_cp(const Position* pos, int c, int p) {
+    return pieces_p(pos, p) & pieces_c(pos, c);
+}
+
+static inline Piece piece_on(const Position* pos, Square s) {
+    return (Piece)pos->board[s];
+}
+
 typedef struct {
     Move move;
 } ExtMove;
@@ -220,75 +272,26 @@ typedef struct {
     int count;
 } MoveList;
 
-// Relational NNUE tokens
-/*enum {
-    O_TOKEN_COUNT = 0,                    
-    O_TOKEN_DATA  = 2,                  
-    O_SIDE = 130,                      
-    O_CASTLE = 132,                   
-    O_EP = 148,                      
-    O_PICK_PHASE = 213,             
-    O_SELECTED_PIECE = 215,        
-    O_VALID_PIECES = 279,         
-    O_VALID_DESTS = 343,         
-    O_VALID_PROMOS = 407,       
-
-    O_SELF_CHECK = 439,
-    O_OPP_CHECK = 440,
-    O_RULE50 = 441,
-    O_REPETITION = 442,
-    O_PASS_VALID = 443,
-
-    OBS_SIZE = 444
-};*/
-
-/*enum {
-    O_BOARD = 0,
-    O_SIDE = 768,
-    O_CASTLE = 770,
-    O_EP = 786,
-    O_PICK_PHASE = 851,
-    O_SELECTED_PIECE = 853,
-    O_VALID_PIECES = 917,
-    O_VALID_DESTS = 981,
-    O_VALID_PROMOS = 1045,
-    O_SELF_CHECK = 1077,
-    O_OPP_CHECK = 1078,
-    O_RULE50 = 1079,
-    O_REPETITION = 1080,
-    O_PASS_VALID = 1081,
-    O_CONTROL_US = 1082,
-    O_CONTROL_THEM = 1146,
-    OBS_SIZE = 1210
-};*/
-
-// NNUE: relational token encoding
-// static inline uint16_t make_rel_token(int king_sq, int piece_type, int piece_sq) {
-//     return (uint16_t)(king_sq * 12 * 64 + piece_type * 64 + piece_sq);
-// }
-
-#define SQ_FEATURES 17
+#define SQ_FEATURES 15
 enum {
     O_SQUARES = 0,
-    O_VALID_PROMOS = 1088,
-    O_SIDE = 1120,
-    O_CASTLE = 1121,
-    O_EP = 1122,
-    O_PICK_PHASE = 1123,
-    O_SELF_CHECK = 1124,
-    O_OPP_CHECK = 1125,
-    O_RULE50 = 1126,
-    O_REPETITION = 1127,
-    O_PASS_VALID = 1128,
-    OBS_SIZE = 1129
+    O_VALID_PROMOS = 960,
+    O_CASTLE = 992,
+    O_EP = 993,
+    O_PICK_PHASE = 994,
+    O_RULE50 = 995,
+    O_REPETITION = 996,
+    O_PASS_VALID = 997,
+    OBS_SIZE = 998
 };
 
 #define PASS_ACTION 96
 #define NUM_ACTIONS 97
 enum {
-    CHESS_MODE_SELFPLAY = 0,
-    CHESS_MODE_HUMAN = 1,
-    CHESS_MODE_RANDOM_BOT = 2
+    CHESS_MODE_RANDOM = 0,
+    CHESS_MODE_SELFPLAY = 1,
+    CHESS_MODE_HUMAN = 2,
+    CHESS_MODE_HUMAN_RANDOM = 3
 };
 
 typedef struct {
@@ -336,9 +339,6 @@ typedef struct {
     float reward_draw;
     float episode_reward;
     int render_fps;
-    int selfplay;
-    int human_play;
-    int random_bot;
     int mode;
     
     char starting_fen[128];
@@ -349,12 +349,19 @@ typedef struct {
     
     UndoInfo undo_stack[MAX_GAME_PLIES];
     int undo_stack_ptr;
+    uint8_t repetition_matches;
     
     int invalid_actions_this_episode;
     
     int pick_phase[2];
     Square selected_square[2];
     MoveList valid_destinations[2];
+    Bitboard valid_from_mask[2];
+    Bitboard valid_to_mask[2];
+    Bitboard obs_selected_view_mask[2];
+    Bitboard obs_valid_from_view_mask[2];
+    Bitboard obs_valid_to_view_mask[2];
+    uint32_t obs_valid_promo_mask[2];
     float reward_invalid_piece;
     float reward_invalid_move;
     float reward_repetition;
@@ -1043,7 +1050,7 @@ static void undo_move(Position* pos, Move m, UndoInfo* undo_stack, int* undo_sta
     }
 }
 
-static void add_move(MoveList* ml, Move m) {
+static inline void add_move(MoveList* ml, Move m) {
     ml->moves[ml->count].move = m;
     ml->count++;
 }
@@ -1127,42 +1134,6 @@ static void generate_pawn_moves(Position* pos, MoveList* ml, ChessColor us) {
         while (ep_pawns) {
             Square from = pop_lsb(&ep_pawns);
             add_move(ml, make_enpassant(from, pos->epSquare));
-        }
-    }
-}
-
-static void generate_piece_moves(Position* pos, MoveList* ml, int pt, ChessColor us) {
-    Bitboard pieces_bb = pieces_cp(pos, us, pt);
-    Bitboard target = ~pieces_c(pos, us);
-    Bitboard occupied = pieces(pos);
-    
-    while (pieces_bb) {
-        Square from = pop_lsb(&pieces_bb);
-        Bitboard attacks = 0;
-        
-        switch (pt) {
-            case KNIGHT:
-                attacks = knight_attacks_bb(from);
-                break;
-            case BISHOP:
-                attacks = bishop_attacks_bb(from, occupied);
-                break;
-            case ROOK:
-                attacks = rook_attacks_bb(from, occupied);
-                break;
-            case QUEEN:
-                attacks = queen_attacks_bb(from, occupied);
-                break;
-            case KING:
-                attacks = king_attacks_bb(from);
-                break;
-        }
-        
-        attacks &= target;
-        
-        while (attacks) {
-            Square to = pop_lsb(&attacks);
-            add_move(ml, make_move(from, to));
         }
     }
 }
@@ -1311,28 +1282,106 @@ static inline bool is_legal_move(Position* pos, Move m) {
 static inline void generate_pseudo_legal(Position* pos, MoveList* ml, ChessColor us) {
     ml->count = 0;
     generate_pawn_moves(pos, ml, us);
-    generate_piece_moves(pos, ml, KNIGHT, us);
-    generate_piece_moves(pos, ml, BISHOP, us);
-    generate_piece_moves(pos, ml, ROOK, us);
-    generate_piece_moves(pos, ml, QUEEN, us);
-    generate_piece_moves(pos, ml, KING, us);
+
+    Bitboard occupied = pieces(pos);
+    Bitboard target = ~pieces_c(pos, us);
+    Bitboard bb = pieces_cp(pos, us, KNIGHT);
+    while (bb) {
+        Square from = pop_lsb(&bb);
+        Bitboard attacks = knight_attacks_bb(from) & target;
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            add_move(ml, make_move(from, to));
+        }
+    }
+
+    bb = pieces_cp(pos, us, BISHOP);
+    while (bb) {
+        Square from = pop_lsb(&bb);
+        Bitboard attacks = bishop_attacks_bb(from, occupied) & target;
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            add_move(ml, make_move(from, to));
+        }
+    }
+
+    bb = pieces_cp(pos, us, ROOK);
+    while (bb) {
+        Square from = pop_lsb(&bb);
+        Bitboard attacks = rook_attacks_bb(from, occupied) & target;
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            add_move(ml, make_move(from, to));
+        }
+    }
+
+    bb = pieces_cp(pos, us, QUEEN);
+    while (bb) {
+        Square from = pop_lsb(&bb);
+        Bitboard attacks = queen_attacks_bb(from, occupied) & target;
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            add_move(ml, make_move(from, to));
+        }
+    }
+
+    bb = pieces_cp(pos, us, KING);
+    while (bb) {
+        Square from = pop_lsb(&bb);
+        Bitboard attacks = king_attacks_bb(from) & target;
+        while (attacks) {
+            Square to = pop_lsb(&attacks);
+            add_move(ml, make_move(from, to));
+        }
+    }
+
     generate_castling(pos, ml, us);
 }
 
 static void generate_legal(Position* pos, MoveList* ml, UndoInfo* undo_stack, int* undo_stack_ptr) {
     generate_pseudo_legal(pos, ml, pos->sideToMove);
     ChessColor us = pos->sideToMove;
+    ChessColor them = (ChessColor)!us;
     Bitboard king_bb = pieces_cp(pos, us, KING);
     Square ksq = king_bb ? lsb(king_bb) : SQ_NONE;
     Bitboard pinned = compute_pinned(pos, us);
     bool in_check = is_check(pos, us);
+    int check_count = 0;
+    Bitboard evasion_mask = 0;
+    if (in_check) {
+        Bitboard checkers = attackers_to_sq(pos, ksq, pieces(pos)) & pieces_c(pos, them);
+        check_count = popcount(checkers);
+        if (check_count == 1) {
+            Square checker_sq = lsb(checkers);
+            evasion_mask = sq_bb(checker_sq);
+            Piece checker = piece_on(pos, checker_sq);
+            if (checker != NO_PIECE) {
+                int checker_type = type_of_p(checker);
+                if (checker_type == BISHOP || checker_type == ROOK || checker_type == QUEEN) {
+                    evasion_mask |= BetweenBB[ksq][checker_sq];
+                }
+            }
+        }
+    }
     
     int write = 0;
     for (int i = 0; i < ml->count; i++) {
         Move m = ml->moves[i].move;
-        bool legal = in_check
-            ? is_legal_move(pos, m)
-            : is_legal_move_fast(pos, m, pinned, ksq, us);
+        Square from = from_sq(m);
+        bool legal;
+        if (!in_check) {
+            legal = is_legal_move_fast(pos, m, pinned, ksq, us);
+        } else if (from == ksq) {
+            legal = is_legal_move_fast(pos, m, pinned, ksq, us);
+        } else if (check_count > 1) {
+            legal = false;
+        } else if (type_of_m(m) == ENPASSANT) {
+            legal = is_legal_move(pos, m);
+        } else if ((sq_bb(to_sq(m)) & evasion_mask) == 0) {
+            legal = false;
+        } else {
+            legal = is_legal_move_fast(pos, m, pinned, ksq, us);
+        }
         if (legal) {
             ml->moves[write++] = ml->moves[i];
         }
@@ -1366,83 +1415,39 @@ static inline bool is_insufficient_material(const Position* pos) {
     return false;
 }
 
-static inline Bitboard all_pawn_attacks(Bitboard pawns, ChessColor c) {
-    if (c == CHESS_WHITE) {
-        return ((pawns << 7) & ~FileHBB) | ((pawns << 9) & ~FileABB);
-    } else {
-        return ((pawns >> 7) & ~FileABB) | ((pawns >> 9) & ~FileHBB);
-    }
+static void clear_player_selection(Chess* env, int side) {
+    env->pick_phase[side] = 0;
+    env->selected_square[side] = SQ_NONE;
+    env->valid_destinations[side].count = 0;
+    env->valid_to_mask[side] = 0;
 }
 
-static inline Bitboard control_map_for_side(Position* pos, ChessColor side) {
-    Bitboard occupied = pieces(pos);
-    Bitboard attacks = 0;
-
-    Bitboard bb = pieces_cp(pos, side, PAWN);
-    attacks |= all_pawn_attacks(bb, side);
-
-    bb = pieces_cp(pos, side, KNIGHT);
-    while (bb) {
-        Square sq = pop_lsb(&bb);
-        attacks |= knight_attacks_bb(sq);
+static void rebuild_legal_state(Chess* env) {
+    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
+    env->legal_dirty = 0;
+    env->valid_from_mask[0] = 0;
+    env->valid_from_mask[1] = 0;
+    env->valid_to_mask[0] = 0;
+    env->valid_to_mask[1] = 0;
+    int side = (int)env->pos.sideToMove;
+    Bitboard from_mask = 0;
+    for (int i = 0; i < env->legal_moves.count; i++) {
+        from_mask |= sq_bb(from_sq(env->legal_moves.moves[i].move));
     }
-
-    bb = pieces_cp(pos, side, KING);
-    if (bb) {
-        attacks |= king_attacks_bb(lsb(bb));
-    }
-
-    bb = pieces_cp(pos, side, BISHOP);
-    while (bb) {
-        Square sq = pop_lsb(&bb);
-        attacks |= bishop_attacks_bb(sq, occupied);
-    }
-
-    bb = pieces_cp(pos, side, ROOK);
-    while (bb) {
-        Square sq = pop_lsb(&bb);
-        attacks |= rook_attacks_bb(sq, occupied);
-    }
-
-    bb = pieces_cp(pos, side, QUEEN);
-    while (bb) {
-        Square sq = pop_lsb(&bb);
-        attacks |= queen_attacks_bb(sq, occupied);
-    }
-
-    return attacks;
+    env->valid_from_mask[side] = from_mask;
 }
 
 static void populate_observations(Chess* env) {
     uint8_t* obs = env->observations;
     Position* pos = &env->pos;
-    Bitboard white_control = control_map_for_side(pos, CHESS_WHITE);
-    Bitboard black_control = control_map_for_side(pos, CHESS_BLACK);
     ChessColor side_to_move = pos->sideToMove;
 
     uint8_t rep_val = 255;
-    if (env->undo_stack_ptr >= 4) {
-        uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
-        if (plies >= 4) {
-            int repetitions = 0;
-            for (int i = 4; i <= plies; i += 2) {
-                int idx = env->undo_stack_ptr - i;
-                if (idx >= 0 && env->undo_stack[idx].key == pos->key) {
-                    repetitions++;
-                    if (repetitions >= 2) {
-                        break;
-                    }
-                }
-            }
-            if (repetitions >= 2) {
-                rep_val = 0;
-            } else if (repetitions == 1) {
-                rep_val = 128;
-            }
-        }
-    }
+    if (env->repetition_matches >= 2) rep_val = 0;
+    else if (env->repetition_matches == 1) rep_val = 128;
 
     int num_players = env->mode == CHESS_MODE_SELFPLAY ? 2 : 1;
+    memset(obs, 0, (size_t)(num_players * OBS_SIZE));
     for (int player_iter = 0; player_iter < num_players; player_iter++) {
         int player = env->mode == CHESS_MODE_SELFPLAY ? player_iter : env->learner_color;
         int buffer_idx = env->mode == CHESS_MODE_SELFPLAY
@@ -1450,7 +1455,6 @@ static void populate_observations(Chess* env) {
             : 0;
 
         uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
-        memset(player_obs, 0, OBS_SIZE);
 
         ChessColor us = (ChessColor)player;
         ChessColor them = (ChessColor)!us;
@@ -1460,55 +1464,80 @@ static void populate_observations(Chess* env) {
         Bitboard valid_from_bb = 0;
         Bitboard valid_to_bb = 0;
         if (side_to_move == us) {
-            int mark_destinations = env->pick_phase[player_idx] == 1;
-            MoveList* marks = mark_destinations ? &env->valid_destinations[player_idx] : &env->legal_moves;
-            for (int i = 0; i < marks->count; i++) {
-                Move m = marks->moves[i].move;
-                if (mark_destinations) {
-                    valid_to_bb |= sq_bb(to_sq(m));
-                } else {
-                    valid_from_bb |= sq_bb(from_sq(m));
-                }
-            }
+            if (env->pick_phase[player_idx] == 1) valid_to_bb = env->valid_to_mask[player_idx];
+            else valid_from_bb = env->valid_from_mask[player_idx];
         }
-
-        Bitboard us_control = (us == CHESS_WHITE) ? white_control : black_control;
-        Bitboard them_control = (us == CHESS_WHITE) ? black_control : white_control;
 
         Bitboard selected_bb = 0;
         if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE)
             selected_bb = sq_bb(env->selected_square[player_idx]);
 
         uint8_t* sq_out = player_obs + O_SQUARES;
-        for (int sq = 0; sq < 64; sq++) {
-            int view_sq = sq ^ flip;
-            uint8_t* feat = sq_out + view_sq * SQ_FEATURES;
-            Piece pc = pos->board[sq];
-            if (pc != NO_PIECE) {
-                int pt = type_of_p(pc);
-                ChessColor c = color_of(pc);
-                int channel = (c == us) ? (pt - 1) : (6 + pt - 1);
-                feat[channel] = 1;
+        for (int pt = PAWN; pt <= KING; pt++) {
+            Bitboard bb = pieces_cp(pos, us, pt);
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                int view_sq = (int)(sq ^ flip);
+                sq_out[view_sq * SQ_FEATURES + (pt - 1)] = 1;
             }
-            Bitboard bb = sq_bb(sq);
-            feat[12] = (selected_bb & bb) ? 1 : 0;
-            feat[13] = (valid_from_bb & bb) ? 1 : 0;
-            feat[14] = (valid_to_bb & bb) ? 1 : 0;
-            feat[15] = (us_control & bb) ? 1 : 0;
-            feat[16] = (them_control & bb) ? 1 : 0;
         }
+        for (int pt = PAWN; pt <= KING; pt++) {
+            Bitboard bb = pieces_cp(pos, them, pt);
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                int view_sq = (int)(sq ^ flip);
+                sq_out[view_sq * SQ_FEATURES + (6 + pt - 1)] = 1;
+            }
+        }
+        Bitboard selected_view_mask = 0;
+        {
+            Bitboard bb = selected_bb;
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                int view_sq = (int)(sq ^ flip);
+                selected_view_mask |= sq_bb((Square)view_sq);
+                sq_out[view_sq * SQ_FEATURES + 12] = 1;
+            }
+        }
+        Bitboard valid_from_view_mask = 0;
+        {
+            Bitboard bb = valid_from_bb;
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                int view_sq = (int)(sq ^ flip);
+                valid_from_view_mask |= sq_bb((Square)view_sq);
+                sq_out[view_sq * SQ_FEATURES + 13] = 1;
+            }
+        }
+        Bitboard valid_to_view_mask = 0;
+        {
+            Bitboard bb = valid_to_bb;
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                int view_sq = (int)(sq ^ flip);
+                valid_to_view_mask |= sq_bb((Square)view_sq);
+                sq_out[view_sq * SQ_FEATURES + 14] = 1;
+            }
+        }
+        env->obs_selected_view_mask[buffer_idx] = selected_view_mask;
+        env->obs_valid_from_view_mask[buffer_idx] = valid_from_view_mask;
+        env->obs_valid_to_view_mask[buffer_idx] = valid_to_view_mask;
 
         uint8_t* valid_promos = player_obs + O_VALID_PROMOS;
+        uint32_t promo_mask = 0;
         if (env->pick_phase[player_idx] == 1 && env->valid_destinations[player_idx].count > 0) {
             for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
                 Move m = env->valid_destinations[player_idx].moves[i].move;
                 if (type_of_m(m) == PROMOTION) {
                     int type_idx = QUEEN - promotion_type(m);
                     int file_idx = file_of(to_sq(m));
-                    valid_promos[type_idx * 8 + file_idx] = 1;
+                    int promo_idx = type_idx * 8 + file_idx;
+                    promo_mask |= (1u << promo_idx);
+                    valid_promos[promo_idx] = 1;
                 }
             }
         }
+        env->obs_valid_promo_mask[buffer_idx] = promo_mask;
 
         uint8_t castle_rights = pos->castlingRights;
         if (player == 1) {
@@ -1519,18 +1548,14 @@ static void populate_observations(Chess* env) {
             if (castle_rights & WHITE_OOO) flipped |= BLACK_OOO;
             castle_rights = flipped;
         }
-
-        player_obs[O_SIDE] = (pos->sideToMove == us) ? 0 : 1;
         player_obs[O_CASTLE] = castle_rights;
         player_obs[O_EP] = (pos->epSquare < 64)
             ? (uint8_t)((player == 1) ? (pos->epSquare ^ 56) : pos->epSquare)
             : 64;
         player_obs[O_PICK_PHASE] = (uint8_t)env->pick_phase[player_idx];
-        player_obs[O_SELF_CHECK] = is_check(pos, us) ? 255 : 0;
-        player_obs[O_OPP_CHECK] = is_check(pos, them) ? 255 : 0;
         player_obs[O_RULE50] = (uint8_t)((pos->rule50 * 255) / 100);
-        player_obs[O_PASS_VALID] = (side_to_move != us) ? 255 : 0;
         player_obs[O_REPETITION] = rep_val;
+        player_obs[O_PASS_VALID] = (side_to_move != us) ? 255 : 0;
     }
 }
 
@@ -1646,10 +1671,12 @@ static void export_pgn_append(Chess* env, const char* filename, int append) {
     FILE* f = fopen(filename, append ? "a" : "w");
     if (!f) return;
     
-    if (env->mode == CHESS_MODE_HUMAN) {
-        fprintf(f, "[Event \"Human vs AI\"]\n");
-        fprintf(f, "[White \"%s\"]\n", env->human_color == CHESS_WHITE ? "Human" : "AI");
-        fprintf(f, "[Black \"%s\"]\n", env->human_color == CHESS_BLACK ? "Human" : "AI");
+    if (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM) {
+        const char* opponent_name = env->mode == CHESS_MODE_HUMAN ? "AI" : "Random";
+        const char* event_name = env->mode == CHESS_MODE_HUMAN ? "Human vs AI" : "Human vs Random";
+        fprintf(f, "[Event \"%s\"]\n", event_name);
+        fprintf(f, "[White \"%s\"]\n", env->human_color == CHESS_WHITE ? "Human" : opponent_name);
+        fprintf(f, "[Black \"%s\"]\n", env->human_color == CHESS_BLACK ? "Human" : opponent_name);
     } else {
         fprintf(f, "[Event \"Selfplay Eval Game %d\"]\n", env->pgn_game_number);
         fprintf(f, "[White \"%s\"]\n", env->learner_color == CHESS_BLACK ? "Learner" : "Opponent");
@@ -1761,19 +1788,16 @@ static void generate_random_fen(char* fen_out) {
 static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
     env->chess_moves++;
     
-    if ((env->mode == CHESS_MODE_HUMAN || env->log_pgn) && env->pgn_move_count < MAX_GAME_PLIES) {
+    if ((env->mode == CHESS_MODE_HUMAN
+            || env->mode == CHESS_MODE_HUMAN_RANDOM
+            || env->log_pgn) && env->pgn_move_count < MAX_GAME_PLIES) {
         env->pgn_moves[env->pgn_move_count++] = chosen;
     }
     
     ChessColor side_before = env->pos.sideToMove;
     do_move(&env->pos, chosen, env->undo_stack, &env->undo_stack_ptr);
     env->legal_dirty = 1;
-    {
-        int side = (int)env->pos.sideToMove;
-        env->pick_phase[side] = 0;
-        env->selected_square[side] = SQ_NONE;
-        env->valid_destinations[side].count = 0;
-    }
+    clear_player_selection(env, (int)env->pos.sideToMove);
     
     if (env->undo_stack_ptr > 0) {
         Piece cap = env->undo_stack[env->undo_stack_ptr - 1].captured;
@@ -1795,9 +1819,19 @@ static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
             env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull = 99;
         }
     }
+
+    env->repetition_matches = 0;
+    if (env->undo_stack_ptr >= 4) {
+        int max_back = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
+        if (max_back > env->undo_stack_ptr) max_back = env->undo_stack_ptr;
+        for (int i = 4; i <= max_back; i += 2) {
+            if (env->undo_stack[env->undo_stack_ptr - i].key != env->pos.key) continue;
+            env->repetition_matches++;
+            if (env->repetition_matches == 2) break;
+        }
+    }
     
-    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
-    env->legal_dirty = 0;
+    rebuild_legal_state(env);
 
     int game_result = 0;
     *is_timeout = 0;
@@ -1814,21 +1848,8 @@ static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
         game_result = 3;
     } else if (env->enable_50_move_rule && env->pos.rule50 >= 100) {
         game_result = 3;
-    } else if (env->enable_threefold_repetition && env->undo_stack_ptr >= 4) {
-        uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
-        if (plies >= 4) {
-            int repetitions = 0;
-            for (int i = 4; i <= plies; i += 2) {
-                int idx = env->undo_stack_ptr - i;
-                if (idx >= 0 && env->undo_stack[idx].key == env->pos.key) {
-                    repetitions++;
-                    if (repetitions >= 2) {
-                        game_result = 3;
-                        break;
-                    }
-                }
-            }
-        }
+    } else if (env->enable_threefold_repetition && env->repetition_matches >= 2) {
+        game_result = 3;
     }
 
     populate_observations(env);
@@ -1840,21 +1861,20 @@ void c_reset(Chess* env) {
     env->chess_moves = 0;
     env->game_result = 0;
     env->undo_stack_ptr = 0;
+    env->repetition_matches = 0;
     env->invalid_actions_this_episode = 0;
     env->episode_reward = 0.0f;
     env->pgn_move_count = 0;
     env->show_game_end_popup = 0;
-    env->pick_phase[0] = 0;
-    env->pick_phase[1] = 0;
-    env->selected_square[0] = SQ_NONE;
-    env->selected_square[1] = SQ_NONE;
-    env->valid_destinations[0].count = 0;
-    env->valid_destinations[1].count = 0;
+    clear_player_selection(env, 0);
+    clear_player_selection(env, 1);
+    env->valid_from_mask[0] = 0;
+    env->valid_from_mask[1] = 0;
     
     memset(env->white_captured, 0, sizeof(env->white_captured));
     memset(env->black_captured, 0, sizeof(env->black_captured));
     
-    if (env->mode == CHESS_MODE_HUMAN) {
+    if (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM) {
         env->human_color = -1;
     } else {
         env->learner_color = 1 - env->learner_color;
@@ -1878,9 +1898,7 @@ void c_reset(Chess* env) {
         pos_set(&env->pos, env->starting_fen);
     }
     
-    env->legal_dirty = 1;
-    generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
-    env->legal_dirty = 0;
+    rebuild_legal_state(env);
     populate_observations(env);
 
 }
@@ -1889,7 +1907,8 @@ void c_step(Chess* env) {
     if (env->render_paused && env->client != NULL) {
         return;
     }
-    if (env->mode == CHESS_MODE_HUMAN && env->human_color == -1) {
+    if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->human_color == -1) {
         return;
     }
     
@@ -1901,15 +1920,15 @@ void c_step(Chess* env) {
         env->log_pgn_choice_made = 1;
     }
 
-    if (env->mode == CHESS_MODE_HUMAN && env->show_game_end_popup) {
+    if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->show_game_end_popup) {
         env->rewards[0] = 0.0f;
         env->terminals[0] = 0;
         return;
     }
 
     if (env->legal_dirty) {
-        generate_legal(&env->pos, &env->legal_moves, env->undo_stack, &env->undo_stack_ptr);
-        env->legal_dirty = 0;
+        rebuild_legal_state(env);
     }
     
     env->rewards[0] = 0.0f;
@@ -1921,15 +1940,11 @@ void c_step(Chess* env) {
     int game_result = 0;
     int is_timeout = 0;
 
-    if (env->mode == CHESS_MODE_RANDOM_BOT && env->pos.sideToMove != env->learner_color) {
+    if ((env->mode == CHESS_MODE_RANDOM && env->pos.sideToMove != env->learner_color)
+            || (env->mode == CHESS_MODE_HUMAN_RANDOM && env->pos.sideToMove != env->human_color)) {
         if (env->legal_moves.count > 0) {
             int idx = rand() % env->legal_moves.count;
-            int opp = (int)!env->learner_color;
-            env->pick_phase[opp] = 0;
-            env->selected_square[opp] = SQ_NONE;
-            env->valid_destinations[opp].count = 0;
-            mover = env->pos.sideToMove;
-            mover_idx = (int)mover;
+            clear_player_selection(env, mover_idx);
             game_result = apply_move_to_env(env, env->legal_moves.moves[idx].move, &is_timeout);
             move_completed = 1;
         }
@@ -1938,20 +1953,14 @@ void c_step(Chess* env) {
         if (env->mode == CHESS_MODE_SELFPLAY) {
             ChessColor current_side = env->pos.sideToMove;
             action = (current_side == env->learner_color) ? env->actions[0] : env->actions[1];
-        } else if (env->mode == CHESS_MODE_HUMAN && env->pos.sideToMove == env->human_color) {
+        } else if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+                && env->pos.sideToMove == env->human_color) {
             action = -1;
             env->actions[0] = -1;
         }
 
-        if (action == -1) {
-            populate_observations(env);
-            return;
-        }
-
-        if (action == PASS_ACTION) {
-            populate_observations(env);
-            return;
-        }
+        if (action == -1) goto refresh_action_observations;
+        if (action == PASS_ACTION) goto refresh_action_observations;
 
         mover = env->pos.sideToMove;
         mover_idx = (int)mover;
@@ -1963,21 +1972,15 @@ void c_step(Chess* env) {
                 env->invalid_actions_this_episode++;
             }
             if (env->pick_phase[mover_idx] == 1) {
-                env->pick_phase[mover_idx] = 0;
-                env->selected_square[mover_idx] = SQ_NONE;
-                env->valid_destinations[mover_idx].count = 0;
+                clear_player_selection(env, mover_idx);
             }
         } else {
             bool is_promo = (action >= 64 && action < 96);
 
             if (env->legal_moves.count == 0) {
-                env->pick_phase[mover_idx] = 0;
-                env->selected_square[mover_idx] = SQ_NONE;
-                env->valid_destinations[mover_idx].count = 0;
+                clear_player_selection(env, mover_idx);
             } else if (env->pick_phase[mover_idx] == 0) {
-                env->pick_phase[mover_idx] = 0;
-                env->selected_square[mover_idx] = SQ_NONE;
-                env->valid_destinations[mover_idx].count = 0;
+                clear_player_selection(env, mover_idx);
 
                 bool valid_pick = !is_promo;
                 Square picked_sq = SQ_NONE;
@@ -1990,20 +1993,22 @@ void c_step(Chess* env) {
                 if (valid_pick) {
                     MoveList* dests = &env->valid_destinations[mover_idx];
                     dests->count = 0;
+                    Bitboard to_mask = 0;
                     for (int i = 0; i < env->legal_moves.count; i++) {
                         if (from_sq(env->legal_moves.moves[i].move) == picked_sq) {
                             dests->moves[dests->count++] = env->legal_moves.moves[i];
+                            to_mask |= sq_bb(to_sq(env->legal_moves.moves[i].move));
                         }
                     }
 
                     if (dests->count > 0) {
                         env->selected_square[mover_idx] = picked_sq;
                         env->pick_phase[mover_idx] = 1;
+                        env->valid_to_mask[mover_idx] = to_mask;
+                        goto refresh_action_observations;
                     } else {
                         valid_pick = false;
-                        env->pick_phase[mover_idx] = 0;
-                        env->selected_square[mover_idx] = SQ_NONE;
-                        env->valid_destinations[mover_idx].count = 0;
+                        clear_player_selection(env, mover_idx);
                     }
                 }
 
@@ -2053,25 +2058,13 @@ void c_step(Chess* env) {
                         env->rewards[0] += env->reward_invalid_move;
                         env->invalid_actions_this_episode++;
                     }
-                    env->pick_phase[mover_idx] = 0;
-                    env->selected_square[mover_idx] = SQ_NONE;
-                    env->valid_destinations[mover_idx].count = 0;
+                    clear_player_selection(env, mover_idx);
                 } else {
                     game_result = apply_move_to_env(env, chosen_move, &is_timeout);
                     if (env->reward_repetition != 0.0f
                             && mover == env->learner_color
-                            && env->undo_stack_ptr >= 4) {
-                        uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
-                        if (plies >= 4) {
-                            Key current_key = env->pos.key;
-                            for (int i = 4; i <= plies; i += 2) {
-                                int idx = env->undo_stack_ptr - i;
-                                if (idx >= 0 && env->undo_stack[idx].key == current_key) {
-                                    env->rewards[0] += env->reward_repetition;
-                                    break;
-                                }
-                            }
-                        }
+                            && env->repetition_matches >= 1) {
+                        env->rewards[0] += env->reward_repetition;
                     }
                     move_completed = 1;
                 }
@@ -2094,21 +2087,8 @@ void c_step(Chess* env) {
                 game_result = 3;
             } else if (env->enable_50_move_rule && env->pos.rule50 >= 100) {
                 game_result = 3;
-            } else if (env->enable_threefold_repetition && env->undo_stack_ptr >= 4) {
-                uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
-                if (plies >= 4) {
-                    int repetitions = 0;
-                    for (int i = 4; i <= plies; i += 2) {
-                        int idx = env->undo_stack_ptr - i;
-                        if (idx >= 0 && env->undo_stack[idx].key == env->pos.key) {
-                            repetitions++;
-                            if (repetitions >= 2) {
-                                game_result = 3;
-                                break;
-                            }
-                        }
-                    }
-                }
+            } else if (env->enable_threefold_repetition && env->repetition_matches >= 2) {
+                game_result = 3;
             }
         }
     }
@@ -2170,7 +2150,7 @@ void c_step(Chess* env) {
 
         env->log.n += 1.0f;
 
-        if (env->mode == CHESS_MODE_HUMAN) {
+        if (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM) {
             env->show_game_end_popup = 1;
         } else {
             if (env->log_pgn && env->pgn_filename[0] != '\0') {
@@ -2183,8 +2163,105 @@ void c_step(Chess* env) {
         env->episode_reward += env->rewards[0];
     }
 
-    if (!move_completed) {
-        populate_observations(env);
+refresh_action_observations:
+    if (!move_completed && game_result == 0) {
+        uint8_t* obs = env->observations;
+        ChessColor side_to_move = env->pos.sideToMove;
+        int player = env->mode == CHESS_MODE_SELFPLAY ? (int)side_to_move : env->learner_color;
+        int buffer_idx = env->mode == CHESS_MODE_SELFPLAY
+            ? ((env->learner_color == CHESS_WHITE) ? player : (1 - player))
+            : 0;
+        uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
+        int player_idx = player;
+        int flip = player * 56;
+        Bitboard valid_from_bb = 0;
+        Bitboard valid_to_bb = 0;
+        if (env->pick_phase[player_idx] == 1) valid_to_bb = env->valid_to_mask[player_idx];
+        else valid_from_bb = env->valid_from_mask[player_idx];
+
+        Bitboard selected_bb = 0;
+        if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE)
+            selected_bb = sq_bb(env->selected_square[player_idx]);
+
+        uint8_t* sq_out = player_obs + O_SQUARES;
+        Bitboard selected_view_mask = 0;
+        while (selected_bb) {
+            Square sq = pop_lsb(&selected_bb);
+            int view_sq = (int)(sq ^ flip);
+            selected_view_mask |= sq_bb((Square)view_sq);
+        }
+        Bitboard valid_from_view_mask = 0;
+        while (valid_from_bb) {
+            Square sq = pop_lsb(&valid_from_bb);
+            int view_sq = (int)(sq ^ flip);
+            valid_from_view_mask |= sq_bb((Square)view_sq);
+        }
+        Bitboard valid_to_view_mask = 0;
+        while (valid_to_bb) {
+            Square sq = pop_lsb(&valid_to_bb);
+            int view_sq = (int)(sq ^ flip);
+            valid_to_view_mask |= sq_bb((Square)view_sq);
+        }
+
+        Bitboard clear_selected = env->obs_selected_view_mask[buffer_idx] & ~selected_view_mask;
+        while (clear_selected) {
+            Square view_sq = pop_lsb(&clear_selected);
+            sq_out[(int)view_sq * SQ_FEATURES + 12] = 0;
+        }
+        Bitboard set_selected = selected_view_mask & ~env->obs_selected_view_mask[buffer_idx];
+        while (set_selected) {
+            Square view_sq = pop_lsb(&set_selected);
+            sq_out[(int)view_sq * SQ_FEATURES + 12] = 1;
+        }
+        env->obs_selected_view_mask[buffer_idx] = selected_view_mask;
+
+        Bitboard clear_from = env->obs_valid_from_view_mask[buffer_idx] & ~valid_from_view_mask;
+        while (clear_from) {
+            Square view_sq = pop_lsb(&clear_from);
+            sq_out[(int)view_sq * SQ_FEATURES + 13] = 0;
+        }
+        Bitboard set_from = valid_from_view_mask & ~env->obs_valid_from_view_mask[buffer_idx];
+        while (set_from) {
+            Square view_sq = pop_lsb(&set_from);
+            sq_out[(int)view_sq * SQ_FEATURES + 13] = 1;
+        }
+        env->obs_valid_from_view_mask[buffer_idx] = valid_from_view_mask;
+
+        Bitboard clear_to = env->obs_valid_to_view_mask[buffer_idx] & ~valid_to_view_mask;
+        while (clear_to) {
+            Square view_sq = pop_lsb(&clear_to);
+            sq_out[(int)view_sq * SQ_FEATURES + 14] = 0;
+        }
+        Bitboard set_to = valid_to_view_mask & ~env->obs_valid_to_view_mask[buffer_idx];
+        while (set_to) {
+            Square view_sq = pop_lsb(&set_to);
+            sq_out[(int)view_sq * SQ_FEATURES + 14] = 1;
+        }
+        env->obs_valid_to_view_mask[buffer_idx] = valid_to_view_mask;
+
+        uint8_t* valid_promos = player_obs + O_VALID_PROMOS;
+        uint32_t promo_mask = 0;
+        if (env->pick_phase[player_idx] == 1 && env->valid_destinations[player_idx].count > 0) {
+            for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
+                Move m = env->valid_destinations[player_idx].moves[i].move;
+                if (type_of_m(m) == PROMOTION) {
+                    int type_idx = QUEEN - promotion_type(m);
+                    int file_idx = file_of(to_sq(m));
+                    int promo_idx = type_idx * 8 + file_idx;
+                    promo_mask |= (1u << promo_idx);
+                }
+            }
+        }
+        uint32_t promo_diff = env->obs_valid_promo_mask[buffer_idx] ^ promo_mask;
+        while (promo_diff) {
+            int promo_idx = __builtin_ctz(promo_diff);
+            promo_diff &= promo_diff - 1;
+            valid_promos[promo_idx] = (uint8_t)((promo_mask >> promo_idx) & 1u);
+        }
+        env->obs_valid_promo_mask[buffer_idx] = promo_mask;
+
+        player_obs[O_PICK_PHASE] = (uint8_t)env->pick_phase[player_idx];
+        player_obs[O_PASS_VALID] = (env->pos.sideToMove != player) ? 255 : 0;
     }
 }
 
@@ -2295,7 +2372,8 @@ void c_render(Chess* env) {
     
     if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) { CloseWindow(); exit(0); }
     
-    int flip_board = (env->mode == CHESS_MODE_HUMAN && env->human_color == CHESS_BLACK) ? 1 : 0;
+    int flip_board = ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+        && env->human_color == CHESS_BLACK) ? 1 : 0;
     Vector2 mouse = GetMousePosition();
     int clicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
     
@@ -2307,7 +2385,11 @@ void c_render(Chess* env) {
         if (speed_idx > 0) { speed_idx--; SetTargetFPS(SPEED_FPS[speed_idx]); }
     }
     
-    if (!env->render_paused && env->mode == CHESS_MODE_HUMAN && env->human_color != -1 && !env->show_game_end_popup && clicked) {
+    if (!env->render_paused
+            && (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->human_color != -1
+            && !env->show_game_end_popup
+            && clicked) {
         int file = (int)(mouse.x) / cell_size;
         int rank = 7 - ((int)(mouse.y) / cell_size);
         if (flip_board) { file = 7 - file; rank = 7 - rank; }
@@ -2343,7 +2425,8 @@ void c_render(Chess* env) {
     BeginDrawing();
     ClearBackground((Color){40, 40, 40, 255});
     
-    if (env->mode == CHESS_MODE_HUMAN && env->show_game_end_popup) {
+    if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->show_game_end_popup) {
         int pw = 300, ph = 200;
         int px = (board_size - pw) / 2, py = (board_size - ph) / 2;
         DrawRectangle(px, py, pw, ph, (Color){60, 60, 60, 255});
@@ -2397,7 +2480,8 @@ void c_render(Chess* env) {
                 printf("PGN logging disabled\n");
             }
         }
-    } else if (env->mode == CHESS_MODE_HUMAN && env->human_color == -1) {
+    } else if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->human_color == -1) {
         int cx = board_size / 2;
         DrawText("Choose Your Color", cx - 100, 200, 24, WHITE);
         
@@ -2474,7 +2558,7 @@ void c_render(Chess* env) {
         snprintf(buf, sizeof(buf), "Move: %d", env->chess_moves);
         DrawText(buf, board_size - 100, scoreboard_y, 18, LIGHTGRAY);
         
-        if (env->mode != CHESS_MODE_HUMAN) {
+        if (env->mode != CHESS_MODE_HUMAN && env->mode != CHESS_MODE_HUMAN_RANDOM) {
             DrawText(env->learner_color == CHESS_WHITE ? "Learner: White" : "Learner: Black",
                      board_size - 120, scoreboard_y + 22, 16, LIGHTGRAY);
         }
@@ -2561,7 +2645,8 @@ void c_render(Chess* env) {
         int btn_w = 36;
         int btn_h = 24;
         int btn_y = scoreboard_y + 100;
-        int btn_x = env->mode == CHESS_MODE_HUMAN ? board_size / 2 - 100 : board_size / 2 - 70;
+        int btn_x = (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            ? board_size / 2 - 100 : board_size / 2 - 70;
         Rectangle minus_btn = {btn_x, btn_y, btn_w, btn_h};
         Rectangle pause_btn = {btn_x + btn_w + 5, btn_y, btn_w + 10, btn_h};
         Rectangle plus_btn = {btn_x + 2 * btn_w + 20, btn_y, btn_w, btn_h};
@@ -2583,7 +2668,7 @@ void c_render(Chess* env) {
         DrawText(speed_buf, btn_x + 3 * btn_w + 30, btn_y + 4, 14, env->render_paused ? RED : LIGHTGRAY);
         
         Rectangle restart_btn = {0, 0, 0, 0};
-        if (env->mode == CHESS_MODE_HUMAN) {
+        if (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM) {
             restart_btn = (Rectangle){board_size - 60, minus_btn.y, 55, minus_btn.height};
             DrawRectangleRec(restart_btn, MAROON);
             DrawRectangleLinesEx(restart_btn, 2, LIGHTGRAY);
@@ -2603,7 +2688,8 @@ void c_render(Chess* env) {
             if (CheckCollisionPointRec(mouse, plus_btn)) {
                 if (speed_idx < NUM_SPEEDS - 1) { speed_idx++; SetTargetFPS(SPEED_FPS[speed_idx]); }
             }
-            if (env->mode == CHESS_MODE_HUMAN && CheckCollisionPointRec(mouse, restart_btn)) c_reset(env);
+            if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+                    && CheckCollisionPointRec(mouse, restart_btn)) c_reset(env);
         }
     }
     
