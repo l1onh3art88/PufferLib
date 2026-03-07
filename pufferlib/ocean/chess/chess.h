@@ -271,8 +271,30 @@ typedef struct {
     ExtMove moves[256];
     int count;
 } MoveList;
+/*
+enum {
+    // Relational NNUE tokens
+    O_TOKEN_COUNT = 0,                    
+    O_TOKEN_DATA  = 2,                  
+    // Meta data
+    O_SIDE = 130,                      
+    O_CASTLE = 132,                   
+    O_EP = 148,                      
+    O_PICK_PHASE = 213,             
+    O_SELECTED_PIECE = 215,        
+    O_VALID_PIECES = 279,         
+    O_VALID_DESTS = 343,         
+    O_VALID_PROMOS = 407,       
 
-#define SQ_FEATURES 15
+    O_SELF_CHECK = 439,
+    O_OPP_CHECK = 440,
+    O_RULE50 = 441,
+    O_REPETITION = 442,
+    O_PASS_VALID = 443,
+
+    OBS_SIZE = 444
+};
+*/
 enum {
     O_SQUARES = 0,
     O_VALID_PROMOS = 960,
