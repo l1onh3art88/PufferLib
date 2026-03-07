@@ -23,95 +23,84 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class ChessSeven(nn.Module):
-    def __init__(self, env, proj_dim=20, hidden_size=256,
-                 embed_dim=32, use_action_masking=1, **kwargs):
+class ChessFive(nn.Module):
+    def __init__(self, env, hidden_size=256, embed_dim=16, use_action_masking=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
         self.is_continuous = False
         self.use_action_masking = bool(use_action_masking)
         self.num_actions = env.single_action_space.n
 
-        self.global_mix = layer_init(nn.Linear(64 * 17, 64 * proj_dim))
-
-        if embed_dim % 2 != 0:
-            raise ValueError(f'embed_dim must be even, got {embed_dim}')
-        self.side_embed = nn.Embedding(2, embed_dim // 2)
         self.castle_embed = nn.Embedding(16, embed_dim)
         self.ep_embed = nn.Embedding(65, embed_dim)
-        self.phase_embed = nn.Embedding(2, embed_dim // 2)
+        self.phase_embed = nn.Embedding(2, embed_dim)
 
-        board_flat = 64 * proj_dim
-        total_features = board_flat + 32 + (3 * embed_dim) + 5
-
-        self.proj = nn.Sequential(
-            nn.LayerNorm(total_features),
-            layer_init(nn.Linear(total_features, hidden_size)),
+        input_size = 64 * SQ_FEATURES + 3 * embed_dim + 2
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(input_size, 2048)),
+            nn.ReLU(),
+            layer_init(nn.Linear(2048, 2048)),
+            nn.ReLU(),
+            layer_init(nn.Linear(2048, 1050)),
+            nn.ReLU(),
+            layer_init(nn.Linear(1050, hidden_size)),
             nn.ReLU(),
         )
 
         self.actor = layer_init(nn.Linear(hidden_size, self.num_actions), std=0.01)
-        self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
-        self.current_mask = None
+        self.value_fn = layer_init(nn.Linear(hidden_size, 1), std=1)
+        self.mask_squares = None
+        self.valid_promos = None
+        self.pass_valid = None
 
     def load_state_dict(self, state_dict, strict=True):
         super().load_state_dict(state_dict, strict=strict)
-        self.current_mask = None
-
-    def encode_observations(self, observations, state=None):
-        B = observations.shape[0]
-        obs = observations
-
-        squares_u8 = obs[:, :1088].view(B, 64, 17)
-        x = squares_u8.float().flatten(1)
-        board_features = F.relu(self.global_mix(x))
-
-        promos_mask = obs[:, 1088:1120] > 0
-        promos = promos_mask.float()
-        side_features = self.side_embed(obs[:, 1120].long())
-        castle_features = self.castle_embed(obs[:, 1121].long())
-        ep_features = self.ep_embed(obs[:, 1122].long())
-        phase_features = self.phase_embed(obs[:, 1123].long())
-        scalars = obs[:, 1124:1129].float() / 255.0
-
-        if self.use_action_masking:
-            pick_phase = obs[:, 1123] > 0
-            pass_valid = obs[:, 1128] > 0
-            valid_pieces_mask = squares_u8[:, :, 13] > 0
-            valid_dests_mask = squares_u8[:, :, 14] > 0
-
-            mask_squares = torch.where(pick_phase.unsqueeze(1), valid_dests_mask, valid_pieces_mask)
-            full_mask = torch.cat([mask_squares, promos_mask, pass_valid.unsqueeze(1)], dim=1)
-            full_mask[:, :-1] = full_mask[:, :-1] & (~pass_valid.unsqueeze(1))
-            all_masked = ~full_mask.any(dim=1, keepdim=True)
-            full_mask = full_mask | all_masked
-            self.current_mask = full_mask
-        else:
-            self.current_mask = None
-
-        x = torch.cat([board_features, promos,
-                        side_features, castle_features, ep_features, phase_features,
-                        scalars], dim=1)
-        x = self.proj(x)
-        return x
-
-    def decode_actions(self, hidden, state=None):
-        logits = self.actor(hidden)
-        if self.use_action_masking and self.current_mask is not None:
-            logits.masked_fill_(~self.current_mask, -1e8)
-        value = self.value_head(hidden)
-        return logits, value
-
-    def forward(self, observations, state=None):
-        hidden = self.encode_observations(observations, state)
-        logits, value = self.decode_actions(hidden, state)
-        return logits, value
+        self.mask_squares = None
+        self.valid_promos = None
+        self.pass_valid = None
 
     def forward_eval(self, observations, state=None):
-        return self.forward(observations, state)
+        hidden = self.encode_observations(observations, state=state)
+        actions, value = self.decode_actions(hidden, state=state)
+        return actions, value
 
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
 
+    def encode_observations(self, observations, state=None):
+        spatial = observations[:, O_SQUARES:O_SQUARES + 64 * SQ_FEATURES].to(torch.float32)
+
+        castle = self.castle_embed(observations[:, O_CASTLE].long())
+        ep = self.ep_embed(observations[:, O_EP].long())
+        phase = self.phase_embed(observations[:, O_PICK_PHASE].long())
+
+        cont = observations[:, O_RULE50:O_REPETITION + 1].to(torch.float32)
+        cont.mul_(1.0 / 255.0)
+        if self.use_action_masking:
+            batch = observations.shape[0]
+            squares = observations[:, O_SQUARES:O_SQUARES + 64 * SQ_FEATURES].view(batch, 64, SQ_FEATURES)
+            pick_phase = observations[:, O_PICK_PHASE].bool().unsqueeze(1)
+            valid_pieces = squares[:, :, 13] > 0
+            valid_dests = squares[:, :, 14] > 0
+            self.mask_squares = torch.where(pick_phase, valid_dests, valid_pieces)
+            self.valid_promos = observations[:, O_VALID_PROMOS:O_VALID_PROMOS + 32] > 0
+            self.pass_valid = observations[:, O_PASS_VALID] > 127
+        else:
+            self.mask_squares = None
+            self.valid_promos = None
+            self.pass_valid = None
+        return self.network(torch.cat([spatial, castle, ep, phase, cont], dim=1))
+
+    def decode_actions(self, flat_hidden, state=None):
+        logits = self.actor(flat_hidden)
+
+        if self.use_action_masking and self.mask_squares is not None:
+            logits[:, :64].masked_fill_(~self.mask_squares, -1e8)
+            logits[:, 64:96].masked_fill_(~self.valid_promos, -1e8)
+            logits[:, 96].masked_fill_(~self.pass_valid, -1e8)
+
+        value = self.value_fn(flat_hidden)
+        return logits, value
 
 class ChessNNUE(nn.Module):
 
