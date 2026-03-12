@@ -390,7 +390,7 @@ class Chess(nn.Module):
         self.board_layer = nn.Sequential(
             layer_init(nn.Linear(768, self.hidden_size*2)),
             nn.ReLU(),
-            layer_init(nn.Linear(self.hidden_size*2, self.hidden_size)),
+            layer_init(nn.Linear(self.hidden_size*2, self.hidden_size*2)),
             nn.ReLU(),
         )
 
@@ -406,7 +406,7 @@ class Chess(nn.Module):
             layer_init(nn.Linear(64, 64)),
             nn.ReLU(),
         )
-        total_features = self.hidden_size + 4 * embed_dim + 64
+        total_features = self.hidden_size*2 + 4 * embed_dim + 64
 
         self.proj = nn.Sequential(
             layer_init(nn.Linear(total_features, hidden_size)),
@@ -414,7 +414,7 @@ class Chess(nn.Module):
         )
 
         self.actor = layer_init(nn.Linear(hidden_size, self.num_actions), std=0.01)
-        self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
+        self.value_head = layer_init(nn.Linear(hidden_size, 1), std = 1)
 
         self.last_observations = None
 
