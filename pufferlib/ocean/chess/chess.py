@@ -1,50 +1,62 @@
 import gymnasium
 import numpy as np
 import os
+import random
 
 import pufferlib
 from pufferlib.ocean.chess import binding
 
 CHESS_DIR = os.path.dirname(os.path.abspath(__file__))
+CHESS_MODE_RANDOM = 0
+CHESS_MODE_SELFPLAY = 1
+CHESS_MODE_HUMAN = 2
+CHESS_MODE_HUMAN_RANDOM = 3
 
 class Chess(pufferlib.PufferEnv):
     def __init__(self, num_envs=1, render_mode=None, log_interval=1, buf=None, seed=0,
                  max_moves=500, reward_draw=0.0,
-                 reward_invalid_piece=-0.01, reward_invalid_move=-0.01, 
-                 reward_valid_piece=0.0, reward_valid_move=0.0,
-                 reward_material=0.0, reward_position=0.0, reward_castling=0.0, reward_repetition=0.0,
-                 reward_check=0.0,
-                 render_fps=30, selfplay=1, human_play=0, random_bot = 0,
+                 reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
+                 reward_repetition=0.0,
+                 render_fps=30, mode='selfplay',
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                  random_fen_pct=0,
                  fen_curric_pct=0,
                  fen_file=None,
-                 enable_50_move_rule=1, enable_threefold_repetition=1,
-                 debug=0):
+                 enable_50_move_rule=1, enable_threefold_repetition=1):
         
         self.render_mode = render_mode
         self.num_agents = num_envs
         self.log_interval = log_interval
         self.cumulative_games = 0.0 
         self.tick = 0
-        self.selfplay = selfplay
         self.random_fen_pct = random_fen_pct
-        self.debug = debug
+
+        if isinstance(mode, str):
+            mode_name = mode.lower()
+            if mode_name == 'random':
+                mode = CHESS_MODE_RANDOM
+            elif mode_name == 'selfplay':
+                mode = CHESS_MODE_SELFPLAY
+            elif mode_name == 'human':
+                mode = CHESS_MODE_HUMAN
+            elif mode_name in ('human_random', 'human-random'):
+                mode = CHESS_MODE_HUMAN_RANDOM
+            else:
+                raise ValueError(f'Unknown chess mode: {mode}')
+
+        self.selfplay = mode == CHESS_MODE_SELFPLAY
         
         if fen_file and not os.path.isabs(fen_file):
             fen_file = os.path.join(CHESS_DIR, fen_file)
         self.c_curriculum = binding.shared(fen_file=fen_file)
         
         self.fen_curric_pct = fen_curric_pct
-        factor = 2 if selfplay else 1
+        factor = 2 if self.selfplay else 1
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(1082*factor,), dtype=np.uint8)
+            low=0, high=255, shape=(998*factor,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(97)
         
         super().__init__(buf)
-        
-        if self.selfplay:
-            self.actions = np.zeros(num_envs * 2, dtype=np.int32)
         c_envs = []
         for i in range(num_envs):
             if random_fen_pct > 0 and random_fen_pct < 100:
@@ -64,17 +76,9 @@ class Chess(pufferlib.PufferEnv):
                 reward_draw=reward_draw,
                 reward_invalid_piece=reward_invalid_piece,
                 reward_invalid_move=reward_invalid_move,
-                reward_valid_piece=reward_valid_piece,
-                reward_valid_move=reward_valid_move,
-                reward_material=reward_material,
-                reward_position=reward_position,
-                reward_castling=reward_castling,
                 reward_repetition=reward_repetition,
-                reward_check=reward_check,
                 render_fps=render_fps,
-                selfplay=selfplay,
-                human_play=human_play,
-                random_bot=random_bot,
+                mode=mode,
                 starting_fen=starting_fen,
                 random_fen=use_random_fen,
                 fen_curric_pct = fen_curric_pct,
@@ -82,8 +86,7 @@ class Chess(pufferlib.PufferEnv):
                 enable_50_move_rule=enable_50_move_rule,
                 enable_threefold_repetition=enable_threefold_repetition,
                 learner_color=i % 2,
-                seed=seed + i,
-                debug=debug
+                seed=seed + i
             ))
         self.c_envs = binding.vectorize(*c_envs)
     
@@ -94,7 +97,8 @@ class Chess(pufferlib.PufferEnv):
     
     def step(self, actions):
         self.tick += 1
-        self.actions[:] = actions
+        if actions is not self.actions:
+            self.actions[:] = actions
         binding.vec_step(self.c_envs)
         info = []
         if self.tick % self.log_interval == 0:

@@ -23,6 +23,84 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class ChessFive(nn.Module):
+    def __init__(self, env, hidden_size=256, embed_dim=16, use_action_masking=1, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.use_action_masking = bool(use_action_masking)
+        self.num_actions = env.single_action_space.n
+
+        self.castle_embed = nn.Embedding(16, embed_dim)
+        self.ep_embed = nn.Embedding(65, embed_dim)
+        self.phase_embed = nn.Embedding(2, embed_dim)
+
+        input_size = 64 * SQ_FEATURES + 3 * embed_dim + 2
+        self.network = nn.Sequential(
+            layer_init(nn.Linear(input_size, 2048)),
+            nn.ReLU(),
+            layer_init(nn.Linear(2048, 2048)),
+            nn.ReLU(),
+            layer_init(nn.Linear(2048, 1050)),
+            nn.ReLU(),
+            layer_init(nn.Linear(1050, hidden_size)),
+            nn.ReLU(),
+        )
+
+        self.actor = layer_init(nn.Linear(hidden_size, self.num_actions), std=0.01)
+        self.value_fn = layer_init(nn.Linear(hidden_size, 1), std=1)
+        self.mask_squares = None
+        self.valid_promos = None
+        self.pass_valid = None
+
+    def load_state_dict(self, state_dict, strict=True):
+        super().load_state_dict(state_dict, strict=strict)
+        self.mask_squares = None
+        self.valid_promos = None
+        self.pass_valid = None
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations, state=state)
+        actions, value = self.decode_actions(hidden, state=state)
+        return actions, value
+
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
+    def encode_observations(self, observations, state=None):
+        spatial = observations[:, O_SQUARES:O_SQUARES + 64 * SQ_FEATURES].to(torch.float32)
+
+        castle = self.castle_embed(observations[:, O_CASTLE].long())
+        ep = self.ep_embed(observations[:, O_EP].long())
+        phase = self.phase_embed(observations[:, O_PICK_PHASE].long())
+
+        cont = observations[:, O_RULE50:O_REPETITION + 1].to(torch.float32)
+        cont.mul_(1.0 / 255.0)
+        if self.use_action_masking:
+            batch = observations.shape[0]
+            squares = observations[:, O_SQUARES:O_SQUARES + 64 * SQ_FEATURES].view(batch, 64, SQ_FEATURES)
+            pick_phase = observations[:, O_PICK_PHASE].bool().unsqueeze(1)
+            valid_pieces = squares[:, :, 13] > 0
+            valid_dests = squares[:, :, 14] > 0
+            self.mask_squares = torch.where(pick_phase, valid_dests, valid_pieces)
+            self.valid_promos = observations[:, O_VALID_PROMOS:O_VALID_PROMOS + 32] > 0
+            self.pass_valid = observations[:, O_PASS_VALID] > 127
+        else:
+            self.mask_squares = None
+            self.valid_promos = None
+            self.pass_valid = None
+        return self.network(torch.cat([spatial, castle, ep, phase, cont], dim=1))
+
+    def decode_actions(self, flat_hidden, state=None):
+        logits = self.actor(flat_hidden)
+
+        if self.use_action_masking and self.mask_squares is not None:
+            logits[:, :64].masked_fill_(~self.mask_squares, -1e8)
+            logits[:, 64:96].masked_fill_(~self.valid_promos, -1e8)
+            logits[:, 96].masked_fill_(~self.pass_valid, -1e8)
+
+        value = self.value_fn(flat_hidden)
+        return logits, value
 
 class ChessNNUE(nn.Module):
 

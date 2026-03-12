@@ -69,28 +69,26 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->reward_draw = 0.0f;
     env->reward_invalid_piece = -0.1f;
     env->reward_invalid_move = -0.1f;
-    env->reward_valid_piece = 0.0f;
-    env->reward_valid_move = 0.0f;
-    env->reward_material = 0.0f;
-    env->reward_position = 0.0f;
-    env->reward_castling = 0.0f;
     env->reward_repetition = 0.0f;
     env->client = NULL;
     env->render_fps = 30;
-    env->selfplay = 1;
-    env->human_play = 0;
-    env->random_bot = 0;
+    env->mode = CHESS_MODE_SELFPLAY;
+    env->learner_color = CHESS_WHITE;
+    env->legal_dirty = 1;
     env->human_color = -1;
     env->fen_curriculum = NULL;
     env->num_fens = 0;
+    env->enable_50_move_rule = 1;
+    env->enable_threefold_repetition = 1;
+    env->random_fen = 0;
+    env->fen_curric_pct = 0.0f;
     strcpy(env->starting_fen, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
     
     env->log_pgn = 0;
     env->log_pgn_choice_made = 1;
     env->pgn_filename[0] = '\0';
     env->pgn_game_number = 0;
-    env->debug_mode = 0;
-    env->learner_color = 0; 
+    strcpy(env->last_result, "Game starting...");
     
     if (kwargs != NULL) {
         PyObject* max_moves_obj = PyDict_GetItemString(kwargs, "max_moves");
@@ -119,41 +117,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             env->reward_invalid_move = (float)PyLong_AsDouble(reward_invalid_move_obj);
         }
 
-        PyObject* reward_valid_piece_obj = PyDict_GetItemString(kwargs, "reward_valid_piece");
-        if (reward_valid_piece_obj != NULL && PyFloat_Check(reward_valid_piece_obj)) {
-            env->reward_valid_piece = (float)PyFloat_AsDouble(reward_valid_piece_obj);
-        } else if (reward_valid_piece_obj != NULL && PyLong_Check(reward_valid_piece_obj)) {
-            env->reward_valid_piece = (float)PyLong_AsDouble(reward_valid_piece_obj);
-        }
-
-        PyObject* reward_valid_move_obj = PyDict_GetItemString(kwargs, "reward_valid_move");
-        if (reward_valid_move_obj != NULL && PyFloat_Check(reward_valid_move_obj)) {
-            env->reward_valid_move = (float)PyFloat_AsDouble(reward_valid_move_obj);
-        } else if (reward_valid_move_obj != NULL && PyLong_Check(reward_valid_move_obj)) {
-            env->reward_valid_move = (float)PyLong_AsDouble(reward_valid_move_obj);
-        }
-
-        PyObject* reward_material_obj = PyDict_GetItemString(kwargs, "reward_material");
-        if (reward_material_obj != NULL && PyFloat_Check(reward_material_obj)) {
-            env->reward_material = (float)PyFloat_AsDouble(reward_material_obj);
-        } else if (reward_material_obj != NULL && PyLong_Check(reward_material_obj)) {
-            env->reward_material = (float)PyLong_AsDouble(reward_material_obj);
-        }
-
-        PyObject* reward_position_obj = PyDict_GetItemString(kwargs, "reward_position");
-        if (reward_position_obj != NULL && PyFloat_Check(reward_position_obj)) {
-            env->reward_position = (float)PyFloat_AsDouble(reward_position_obj);
-        } else if (reward_position_obj != NULL && PyLong_Check(reward_position_obj)) {
-            env->reward_position = (float)PyLong_AsDouble(reward_position_obj);
-        }
-
-        PyObject* reward_castling_obj = PyDict_GetItemString(kwargs, "reward_castling");
-        if (reward_castling_obj != NULL && PyFloat_Check(reward_castling_obj)) {
-            env->reward_castling = (float)PyFloat_AsDouble(reward_castling_obj);
-        } else if (reward_castling_obj != NULL && PyLong_Check(reward_castling_obj)) {
-            env->reward_castling = (float)PyLong_AsDouble(reward_castling_obj);
-        }
-
         PyObject* reward_repetition_obj = PyDict_GetItemString(kwargs, "reward_repetition");
         if (reward_repetition_obj != NULL && PyFloat_Check(reward_repetition_obj)) {
             env->reward_repetition = (float)PyFloat_AsDouble(reward_repetition_obj);
@@ -161,31 +124,14 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             env->reward_repetition = (float)PyLong_AsDouble(reward_repetition_obj);
         }
 
-        PyObject* reward_check = PyDict_GetItemString(kwargs, "reward_check");
-        if (reward_check != NULL && PyFloat_Check(reward_check)) {
-            env->reward_check = (float)PyFloat_AsDouble(reward_check);
-        } else if (reward_check != NULL && PyLong_Check(reward_check)) {
-            env->reward_check = (float)PyLong_AsDouble(reward_check);
-        }
-
         PyObject* fps_obj = PyDict_GetItemString(kwargs, "render_fps");
         if (fps_obj != NULL && PyLong_Check(fps_obj)) {
             env->render_fps = (int)PyLong_AsLong(fps_obj);
         }
 
-        PyObject* selfplay_obj = PyDict_GetItemString(kwargs, "selfplay");
-        if (selfplay_obj != NULL && PyLong_Check(selfplay_obj)) {
-            env->selfplay = (int)PyLong_AsLong(selfplay_obj);
-        }
-
-        PyObject* human_obj = PyDict_GetItemString(kwargs, "human_play");
-        if (human_obj != NULL && PyLong_Check(human_obj)) {
-            env->human_play = (int)PyLong_AsLong(human_obj);
-        }
-
-        PyObject* random_bot_obj = PyDict_GetItemString(kwargs, "random_bot");
-        if (random_bot_obj != NULL && PyLong_Check(random_bot_obj)) {
-            env->random_bot = (int)PyLong_AsLong(random_bot_obj);
+        PyObject* mode_obj = PyDict_GetItemString(kwargs, "mode");
+        if (mode_obj != NULL && PyLong_Check(mode_obj)) {
+            env->mode = (int)PyLong_AsLong(mode_obj);
         }
 
 
@@ -194,25 +140,21 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             env->learner_color = (int)PyLong_AsLong(learner_color_obj);
         }
 
-        env->enable_50_move_rule = 1;
         PyObject* enable_50_obj = PyDict_GetItemString(kwargs, "enable_50_move_rule");
         if (enable_50_obj != NULL && PyLong_Check(enable_50_obj)) {
             env->enable_50_move_rule = (int)PyLong_AsLong(enable_50_obj);
         }
         
-        env->enable_threefold_repetition = 1;
         PyObject* enable_3fold_obj = PyDict_GetItemString(kwargs, "enable_threefold_repetition");
         if (enable_3fold_obj != NULL && PyLong_Check(enable_3fold_obj)) {
             env->enable_threefold_repetition = (int)PyLong_AsLong(enable_3fold_obj);
         }
 
-        env->random_fen = 0;
         PyObject* random_fen_obj = PyDict_GetItemString(kwargs, "random_fen");
         if (random_fen_obj != NULL && PyLong_Check(random_fen_obj)) {
             env->random_fen = (int)PyLong_AsLong(random_fen_obj);
         }
 
-        env->fen_curric_pct = 0;
         PyObject* fen_curric_pct = PyDict_GetItemString(kwargs, "fen_curric_pct");
         if (fen_curric_pct != NULL && PyFloat_Check(fen_curric_pct)) {
             env->fen_curric_pct = (float)PyFloat_AsDouble(fen_curric_pct);
@@ -238,10 +180,15 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
             }
         }
         
-        PyObject* debug_obj = PyDict_GetItemString(kwargs, "debug");
-        if (debug_obj != NULL && PyLong_Check(debug_obj)) {
-            env->debug_mode = (int)PyLong_AsLong(debug_obj);
-        }
+    }
+
+    if (env->mode != CHESS_MODE_RANDOM
+            && env->mode != CHESS_MODE_SELFPLAY
+            && env->mode != CHESS_MODE_HUMAN
+            && env->mode != CHESS_MODE_HUMAN_RANDOM) {
+        PyErr_SetString(PyExc_ValueError,
+            "invalid mode: expected CHESS_MODE_RANDOM, CHESS_MODE_SELFPLAY, CHESS_MODE_HUMAN, or CHESS_MODE_HUMAN_RANDOM");
+        return -1;
     }
     
     return 0;
@@ -256,9 +203,5 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "invalid_action_rate", log->invalid_action_rate);
-    assign_to_dict(dict, "material_score", log->material_score);
-    assign_to_dict(dict, "positional_score", log->positional_score);
-    assign_to_dict(dict, "white_win_rate", log->white_winrate);
-    assign_to_dict(dict, "black_win_rate", log->black_winrate);
     return 0;
 }
