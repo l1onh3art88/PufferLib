@@ -132,6 +132,8 @@ static inline int color_of(Piece p) {
 #define Rank7BB (Rank1BB << 48)
 #define Rank8BB (Rank1BB << 56)
 
+#define SQ_FEATURES 15
+
 static const char* PIECE_CHARS[] = {
     "",
     "P", "N", "B", "R", "Q", "K",
@@ -295,7 +297,7 @@ enum {
     OBS_SIZE = 444
 };
 */
-enum {
+/*enum {
     O_SQUARES = 0,
     O_VALID_PROMOS = 960,
     O_CASTLE = 992,
@@ -305,6 +307,24 @@ enum {
     O_REPETITION = 996,
     O_PASS_VALID = 997,
     OBS_SIZE = 998
+};
+*/
+enum {
+    O_BOARD = 0,
+    O_SIDE = 768,
+    O_CASTLE = 770,
+    O_EP = 786,
+    O_PICK_PHASE = 851,
+    O_SELECTED_PIECE = 853,
+    O_VALID_PIECES = 917,
+    O_VALID_DESTS = 981,
+    O_VALID_PROMOS = 1045,
+    O_SELF_CHECK = 1077,
+    O_OPP_CHECK = 1078,
+    O_RULE50 = 1079,
+    O_REPETITION = 1080,
+    O_PASS_VALID = 1081,
+    OBS_SIZE = 1082
 };
 
 #define PASS_ACTION 96
@@ -1458,7 +1478,147 @@ static void rebuild_legal_state(Chess* env) {
     }
     env->valid_from_mask[side] = from_mask;
 }
+void populate_observations(Chess* env) {
+    uint8_t* obs = env->observations;
+    Position* pos = &env->pos;
+    
+    int num_players = env->mode == CHESS_MODE_SELFPLAY ? 2 : 1;
+    for (int player_iter = 0; player_iter < num_players; player_iter++) {
+        int player = env->mode == CHESS_MODE_SELFPLAY ? player_iter : env->learner_color;
+        int buffer_idx = env->mode == CHESS_MODE_SELFPLAY
+              ? ((env->learner_color == CHESS_WHITE) ? player_iter : (1 - player_iter))
+              : 0;        
+        uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
+        memset(player_obs, 0, OBS_SIZE);
+        uint8_t* board_planes = player_obs + O_BOARD;
+        
+        ChessColor us = (ChessColor)player;  // 0=White, 1=Black
+        ChessColor them = (ChessColor)!us;
 
+        int flip = player * 56;
+
+
+        // our pieces
+        for (int pt = PAWN; pt <= KING; pt++) {
+            Bitboard bb = pieces_cp(pos, player, pt);
+            int plane = pt - 1;  // 0-5
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                board_planes[plane * 64 + (sq ^ flip)] = 1;
+            }
+        }
+        
+        // Their pieces (planes 6-11)
+        for (int pt = PAWN; pt <= KING; pt++) {
+            Bitboard bb = pieces_cp(pos, them, pt);
+            int plane = 6 + (pt - 1);  // 6-11
+            while (bb) {
+                Square sq = pop_lsb(&bb);
+                board_planes[plane * 64 + (sq ^ flip)] = 1;
+            }
+        }
+               
+        ChessColor side_to_move = pos->sideToMove;
+        
+        uint8_t* side_onehot = player_obs + O_SIDE;
+        side_onehot[(pos->sideToMove == us) ? 0 : 1] = 1;
+        
+        uint8_t* castle_onehot = player_obs + O_CASTLE;
+        uint8_t castle_rights = pos->castlingRights;
+        if (player == 1) {
+            uint8_t flipped = 0;
+            if (castle_rights & BLACK_OO) flipped |= WHITE_OO;
+            if (castle_rights & BLACK_OOO) flipped |= WHITE_OOO;
+            if (castle_rights & WHITE_OO) flipped |= BLACK_OO;
+            if (castle_rights & WHITE_OOO) flipped |= BLACK_OOO;
+            castle_rights = flipped;
+        }
+        castle_onehot[castle_rights] = 1;
+
+        uint8_t* ep_onehot = player_obs + O_EP;
+        if (pos->epSquare < 64) {
+                int ep_sq = (player == 1) ? (pos->epSquare ^ 56) : pos->epSquare;
+                ep_onehot[ep_sq] = 1;
+        } else {
+            ep_onehot[64] = 1;
+        }
+    
+        uint8_t* valid_pieces = player_obs + O_VALID_PIECES;
+        uint8_t* valid_dests = player_obs + O_VALID_DESTS;
+        
+        int player_idx = (int)us;
+        
+        if (side_to_move == us) {
+            if (env->pick_phase[player_idx] == 0) {
+                if (env->legal_moves.count > 0) {
+                    for (int i = 0; i < env->legal_moves.count; i++) {
+                        Square from = from_sq(env->legal_moves.moves[i].move);
+                        int view_from = (player == 1) ? (from ^ 56) : from;
+                        valid_pieces[view_from] = 1;
+                    }
+                } 
+            } else {
+                if (env->valid_destinations[player_idx].count > 0) {
+                    for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
+                        Square to = to_sq(env->valid_destinations[player_idx].moves[i].move);
+                        int view_to = (player == 1) ? (to ^ 56) : to;
+                        valid_dests[view_to] = 1;
+                    }
+                }
+            }
+        } 
+        player_obs[O_PASS_VALID] = (side_to_move != us) ? 255 : 0;
+        
+        uint8_t* phase_onehot = player_obs + O_PICK_PHASE;
+        phase_onehot[env->pick_phase[player_idx]] = 1;
+        
+        uint8_t* selected_piece_plane = player_obs + O_SELECTED_PIECE;
+        if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE) {
+            int view_selected = (player == 1) ? (env->selected_square[player_idx] ^ 56) : env->selected_square[player_idx];
+            selected_piece_plane[view_selected] = 1;
+        }
+        
+        uint8_t* valid_promos = player_obs + O_VALID_PROMOS;
+        
+        if (env->pick_phase[player_idx] == 1 && env->valid_destinations[player_idx].count > 0) {
+            for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
+                Move m = env->valid_destinations[player_idx].moves[i].move;
+                if (type_of_m(m) == PROMOTION) {
+                    int type_idx = QUEEN - promotion_type(m);
+                    int file_idx = file_of(to_sq(m));
+                    valid_promos[type_idx * 8 + file_idx] = 1;
+                }
+            }
+        }
+        
+        player_obs[O_SELF_CHECK] = is_check(pos, us) ? 255 : 0;
+        player_obs[O_OPP_CHECK] = is_check(pos, them) ? 255 : 0;
+        
+        player_obs[O_RULE50] = (uint8_t)((pos->rule50 * 255) / 100);
+        
+        uint8_t rep_val = 255;
+        if (env->undo_stack_ptr >= 4) {
+            uint8_t plies = env->undo_stack[env->undo_stack_ptr - 1].pliesFromNull;
+            if (plies >= 4) {
+                int repetitions = 0;
+                for (int i = 4; i <= plies; i += 2) {
+                    int idx = env->undo_stack_ptr - i;
+                    if (idx >= 0 && env->undo_stack[idx].key == pos->key) {
+                        repetitions++;
+                    }
+                }
+                if (repetitions >= 2) {
+                    rep_val = 0;
+                } else if (repetitions == 1) {
+                    rep_val = 128;
+                }
+            }
+        }
+        player_obs[O_REPETITION] = rep_val;
+    }
+}
+
+/*
 static void populate_observations(Chess* env) {
     uint8_t* obs = env->observations;
     Position* pos = &env->pos;
@@ -1580,7 +1740,7 @@ static void populate_observations(Chess* env) {
         player_obs[O_PASS_VALID] = (side_to_move != us) ? 255 : 0;
     }
 }
-
+*/
 static int move_to_san(Position* pos, Move m, char* buf, UndoInfo* undo_stack, int* undo_stack_ptr) {
     const char files[] = "abcdefgh";
     const char ranks[] = "12345678";
@@ -1981,8 +2141,8 @@ void c_step(Chess* env) {
             env->actions[0] = -1;
         }
 
-        if (action == -1) goto refresh_action_observations;
-        if (action == PASS_ACTION) goto refresh_action_observations;
+        //if (action == -1) goto refresh_action_observations;
+        //if (action == PASS_ACTION) goto refresh_action_observations;
 
         mover = env->pos.sideToMove;
         mover_idx = (int)mover;
@@ -2027,7 +2187,7 @@ void c_step(Chess* env) {
                         env->selected_square[mover_idx] = picked_sq;
                         env->pick_phase[mover_idx] = 1;
                         env->valid_to_mask[mover_idx] = to_mask;
-                        goto refresh_action_observations;
+                        //goto refresh_action_observations;
                     } else {
                         valid_pick = false;
                         clear_player_selection(env, mover_idx);
@@ -2185,108 +2345,8 @@ void c_step(Chess* env) {
         env->episode_reward += env->rewards[0];
     }
 
-refresh_action_observations:
-    if (!move_completed && game_result == 0) {
-        uint8_t* obs = env->observations;
-        ChessColor side_to_move = env->pos.sideToMove;
-        int player = env->mode == CHESS_MODE_SELFPLAY ? (int)side_to_move : env->learner_color;
-        int buffer_idx = env->mode == CHESS_MODE_SELFPLAY
-            ? ((env->learner_color == CHESS_WHITE) ? player : (1 - player))
-            : 0;
-        uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
-        int player_idx = player;
-        int flip = player * 56;
-        Bitboard valid_from_bb = 0;
-        Bitboard valid_to_bb = 0;
-        if (env->pick_phase[player_idx] == 1) valid_to_bb = env->valid_to_mask[player_idx];
-        else valid_from_bb = env->valid_from_mask[player_idx];
-
-        Bitboard selected_bb = 0;
-        if (env->pick_phase[player_idx] == 1 && env->selected_square[player_idx] != SQ_NONE)
-            selected_bb = sq_bb(env->selected_square[player_idx]);
-
-        uint8_t* sq_out = player_obs + O_SQUARES;
-        Bitboard selected_view_mask = 0;
-        while (selected_bb) {
-            Square sq = pop_lsb(&selected_bb);
-            int view_sq = (int)(sq ^ flip);
-            selected_view_mask |= sq_bb((Square)view_sq);
-        }
-        Bitboard valid_from_view_mask = 0;
-        while (valid_from_bb) {
-            Square sq = pop_lsb(&valid_from_bb);
-            int view_sq = (int)(sq ^ flip);
-            valid_from_view_mask |= sq_bb((Square)view_sq);
-        }
-        Bitboard valid_to_view_mask = 0;
-        while (valid_to_bb) {
-            Square sq = pop_lsb(&valid_to_bb);
-            int view_sq = (int)(sq ^ flip);
-            valid_to_view_mask |= sq_bb((Square)view_sq);
-        }
-
-        Bitboard clear_selected = env->obs_selected_view_mask[buffer_idx] & ~selected_view_mask;
-        while (clear_selected) {
-            Square view_sq = pop_lsb(&clear_selected);
-            sq_out[(int)view_sq * SQ_FEATURES + 12] = 0;
-        }
-        Bitboard set_selected = selected_view_mask & ~env->obs_selected_view_mask[buffer_idx];
-        while (set_selected) {
-            Square view_sq = pop_lsb(&set_selected);
-            sq_out[(int)view_sq * SQ_FEATURES + 12] = 1;
-        }
-        env->obs_selected_view_mask[buffer_idx] = selected_view_mask;
-
-        Bitboard clear_from = env->obs_valid_from_view_mask[buffer_idx] & ~valid_from_view_mask;
-        while (clear_from) {
-            Square view_sq = pop_lsb(&clear_from);
-            sq_out[(int)view_sq * SQ_FEATURES + 13] = 0;
-        }
-        Bitboard set_from = valid_from_view_mask & ~env->obs_valid_from_view_mask[buffer_idx];
-        while (set_from) {
-            Square view_sq = pop_lsb(&set_from);
-            sq_out[(int)view_sq * SQ_FEATURES + 13] = 1;
-        }
-        env->obs_valid_from_view_mask[buffer_idx] = valid_from_view_mask;
-
-        Bitboard clear_to = env->obs_valid_to_view_mask[buffer_idx] & ~valid_to_view_mask;
-        while (clear_to) {
-            Square view_sq = pop_lsb(&clear_to);
-            sq_out[(int)view_sq * SQ_FEATURES + 14] = 0;
-        }
-        Bitboard set_to = valid_to_view_mask & ~env->obs_valid_to_view_mask[buffer_idx];
-        while (set_to) {
-            Square view_sq = pop_lsb(&set_to);
-            sq_out[(int)view_sq * SQ_FEATURES + 14] = 1;
-        }
-        env->obs_valid_to_view_mask[buffer_idx] = valid_to_view_mask;
-
-        uint8_t* valid_promos = player_obs + O_VALID_PROMOS;
-        uint32_t promo_mask = 0;
-        if (env->pick_phase[player_idx] == 1 && env->valid_destinations[player_idx].count > 0) {
-            for (int i = 0; i < env->valid_destinations[player_idx].count; i++) {
-                Move m = env->valid_destinations[player_idx].moves[i].move;
-                if (type_of_m(m) == PROMOTION) {
-                    int type_idx = QUEEN - promotion_type(m);
-                    int file_idx = file_of(to_sq(m));
-                    int promo_idx = type_idx * 8 + file_idx;
-                    promo_mask |= (1u << promo_idx);
-                }
-            }
-        }
-        uint32_t promo_diff = env->obs_valid_promo_mask[buffer_idx] ^ promo_mask;
-        while (promo_diff) {
-            int promo_idx = __builtin_ctz(promo_diff);
-            promo_diff &= promo_diff - 1;
-            valid_promos[promo_idx] = (uint8_t)((promo_mask >> promo_idx) & 1u);
-        }
-        env->obs_valid_promo_mask[buffer_idx] = promo_mask;
-
-        player_obs[O_PICK_PHASE] = (uint8_t)env->pick_phase[player_idx];
-        player_obs[O_PASS_VALID] = (env->pos.sideToMove != player) ? 255 : 0;
-    }
+    populate_observations(env);
 }
-
 static Font load_piece_font(int cell_size, int* loaded) {
     const char* candidates[] = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+'''
 class ChessFive(nn.Module):
     def __init__(self, env, hidden_size=256, embed_dim=16, use_action_masking=1, **kwargs):
         super().__init__()
@@ -102,6 +102,7 @@ class ChessFive(nn.Module):
         value = self.value_fn(flat_hidden)
         return logits, value
 
+'''
 class ChessNNUE(nn.Module):
 
     def __init__(self, env, hidden_size=512, rel_embed_dim=256, meta_embed_dim=32, use_action_masking=1):

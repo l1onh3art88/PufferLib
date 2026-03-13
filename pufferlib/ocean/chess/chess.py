@@ -18,6 +18,7 @@ class Chess(pufferlib.PufferEnv):
                  reward_invalid_piece=-0.01, reward_invalid_move=-0.01,
                  reward_repetition=0.0,
                  render_fps=30, mode='selfplay',
+                 selfplay = "",
                  starting_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                  random_fen_pct=0,
                  fen_curric_pct=0,
@@ -53,7 +54,7 @@ class Chess(pufferlib.PufferEnv):
         self.fen_curric_pct = fen_curric_pct
         factor = 2 if self.selfplay else 1
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(998*factor,), dtype=np.uint8)
+            low=0, high=255, shape=(1082*factor,), dtype=np.uint8)
         self.single_action_space = gymnasium.spaces.Discrete(97)
         
         super().__init__(buf)
