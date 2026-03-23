@@ -280,7 +280,7 @@ class ChessNNUE(nn.Module):
         return logits, value
 
 
-class ChessTwo(nn.Module):
+"""class ChessTwo(nn.Module):
     def __init__(self, env, cnn_channels=256, hidden_size=512, embed_dim=32, use_action_masking=1, **kwargs):
         super().__init__()
         self.hidden_size = hidden_size
@@ -330,7 +330,202 @@ class ChessTwo(nn.Module):
         self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
 
         self.last_observations = None
-
+        """
+ 
+# ---- Clifford primitives (from CliffordNet paper, pure PyTorch) ----
+ 
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_channels, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+ 
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+ 
+ 
+ 
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+ 
+    def forward(self, x):
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.bernoulli(torch.full(shape, keep, device=x.device, dtype=x.dtype))
+        return x * mask / keep
+class CliffordInteraction(nn.Module):
+    """
+    Memory-efficient Clifford Geometric Product interaction.
+    Instead of cat(all_feats) -> single big conv, we split the projection
+    and accumulate per-shift, so only 1-2 interaction tensors are alive at a time.
+    """
+    def __init__(self, dim, cli_mode='full', ctx_mode='diff', shifts=[1, 2]):
+        super().__init__()
+        self.dim = dim
+        self.cli_mode = cli_mode
+        self.ctx_mode = ctx_mode
+        self.act = nn.SiLU()
+        self.shifts = [s for s in shifts if s < dim]
+ 
+        # One small projection per (shift, component) instead of one big concat
+        self.projs = nn.ModuleList()
+        for s in self.shifts:
+            if cli_mode in ['wedge', 'full']:
+                self.projs.append(nn.Conv2d(dim, dim, kernel_size=1, bias=False))
+            if cli_mode in ['inner', 'full']:
+                self.projs.append(nn.Conv2d(dim, dim, kernel_size=1, bias=False))
+        self.out_bias = nn.Parameter(torch.zeros(dim))
+ 
+    def forward(self, z_state, z_context):
+        if self.ctx_mode == 'diff':
+            C = z_context - z_state
+        else:
+            C = z_context
+ 
+        out = torch.zeros_like(z_state)
+        proj_idx = 0
+ 
+        for s in self.shifts:
+            C_shifted = torch.roll(C, shifts=s, dims=1)
+            if self.cli_mode in ['wedge', 'full']:
+                z_state_shifted = torch.roll(z_state, shifts=s, dims=1)
+                wedge = z_state * C_shifted - C * z_state_shifted
+                out = out + self.projs[proj_idx](wedge)
+                proj_idx += 1
+                del wedge, z_state_shifted
+            if self.cli_mode in ['inner', 'full']:
+                inner = self.act(z_state * C_shifted)
+                out = out + self.projs[proj_idx](inner)
+                proj_idx += 1
+                del inner
+            del C_shifted
+ 
+        return out + self.out_bias[None, :, None, None] 
+ 
+class CliffordAlgebraBlock(nn.Module):
+    """
+    Full Clifford Algebra Block from the paper (Algorithm 1):
+      1. LayerNorm2d
+      2. Dual stream: state (1x1 conv) + context (2x dwconv3x3 + BN + SiLU)
+      3. Clifford interaction (wedge + inner with shifts)
+      4. Optional gFFN-G (global context interaction)
+      5. Gated Geometric Residual
+    """
+    def __init__(self, dim, cli_mode='full', ctx_mode='diff', shifts=[1, 2],
+                 enable_gFFNG=False, drop_path=0.1, init_values=1e-5):
+        super().__init__()
+        self.norm = LayerNorm2d(dim)
+        self.get_state = nn.Conv2d(dim, dim, kernel_size=1)
+        self.get_context_local = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(),
+        )
+        self.clifford_local = CliffordInteraction(dim, cli_mode, ctx_mode, shifts)
+ 
+        self.enable_gFFNG = enable_gFFNG
+        if enable_gFFNG:
+            self.clifford_global = CliffordInteraction(dim, 'full', 'diff', [1, 2])
+ 
+        self.gate_fc = nn.Conv2d(dim * 2, dim, kernel_size=1)
+        self.gamma = nn.Parameter(torch.full((1, dim, 1, 1), init_values))
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+ 
+    def forward(self, x):
+        shortcut = x
+        x_ln = self.norm(x)
+ 
+        z_state = self.get_state(x_ln)
+        z_ctx_local = self.get_context_local(x_ln)
+        g_feat = self.clifford_local(z_state, z_ctx_local)
+ 
+        if self.enable_gFFNG:
+            z_ctx_global = x_ln.mean(dim=[-2, -1], keepdim=True).expand_as(x_ln)
+            g_feat = g_feat + self.clifford_global(z_state, z_ctx_global)
+ 
+        combined = torch.cat([x_ln, g_feat], dim=1)
+        gate = torch.sigmoid(self.gate_fc(combined))
+        x_mixed = F.silu(x_ln) + gate * g_feat
+ 
+        return shortcut + self.drop_path(self.gamma * x_mixed)
+ 
+ 
+# ---- Chess model with Clifford backbone ----
+ 
+class ChessTwo(nn.Module):
+    def __init__(self, env, cnn_channels=128, hidden_size=128, embed_dim=32,
+                 use_action_masking=1, clifford_depth=1, clifford_shifts=[1, 2],
+                 enable_gFFNG=False, drop_path_rate=0.1, **kwargs):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.is_continuous = False
+        self.use_action_masking = bool(use_action_masking)
+        self.num_actions = env.single_action_space.n
+ 
+        # === Clifford spatial backbone ===
+        # Stem: project 16 input channels -> cnn_channels, keep 8x8
+        self.stem = nn.Sequential(
+            nn.Conv2d(16, cnn_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(cnn_channels),
+            nn.SiLU(),
+        )
+ 
+        # Stack of Clifford blocks (isotropic: 8x8 throughout)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, clifford_depth)]
+        self.blocks = nn.ModuleList([
+            CliffordAlgebraBlock(
+                dim=cnn_channels,
+                cli_mode='full',
+                ctx_mode='diff',
+                shifts=clifford_shifts,
+                enable_gFFNG=enable_gFFNG,
+                drop_path=dpr[i],
+            )
+            for i in range(clifford_depth)
+        ])
+ 
+        # Final norm before pooling
+        self.final_norm = LayerNorm2d(cnn_channels)
+ 
+        # Compute flattened size (8x8 spatial preserved throughout)
+        cnn_flat_size = cnn_channels * 8 * 8  # 128 * 64 = 8192
+ 
+        # === Non-spatial features (unchanged) ===
+        self.side_embed = nn.Embedding(2, embed_dim)
+        self.castle_embed = nn.Embedding(16, embed_dim)
+        self.ep_embed = nn.Embedding(65, embed_dim)
+        self.phase_embed = nn.Embedding(2, embed_dim)
+ 
+        self.scalar_size = 5
+        self.scalar_layer = nn.Sequential(
+            layer_init(nn.Linear(self.scalar_size, hidden_size)),
+            nn.ReLU(),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
+            nn.ReLU(),
+        )
+ 
+        total_features = cnn_flat_size + 4 * embed_dim + hidden_size
+ 
+        self.proj = nn.Sequential(
+            layer_init(nn.Linear(total_features, hidden_size)),
+            nn.ReLU(),
+        )
+ 
+        self.actor = layer_init(nn.Linear(hidden_size, self.num_actions), std=0.01)
+        self.value_head = layer_init(nn.Linear(hidden_size, 1), std=1)
+ 
+        self.last_observations = None
+ 
+ 
     def load_state_dict(self, state_dict, strict=True):
         super().load_state_dict(state_dict, strict=strict)
         self.last_observations = None
@@ -365,7 +560,7 @@ class ChessTwo(nn.Module):
         ], dim=1)
 
         # New spatial processing (initial conv + 1 residual block, unrolled)
-        x = self.conv1(spatial_input)
+        """x = self.conv1(spatial_input)
         x = nn.ReLU()(x)
         residual = x
         x = self.conv2(x)
@@ -375,6 +570,11 @@ class ChessTwo(nn.Module):
         x = nn.ReLU()(x)
         x = self.conv4(x)
         x = nn.ReLU()(x)
+        """
+        x = self.stem(spatial_input)          # (B, C, 8, 8)
+        for block in self.blocks:
+            x = block(x)                      # (B, C, 8, 8) — isotropic
+        x = self.final_norm(x)
         spatial_features = x.flatten(1)
 
         side_idx = obs[:, 768:770].argmax(dim=1)
