@@ -2141,13 +2141,12 @@ void c_step(Chess* env) {
             env->actions[0] = -1;
         }
 
-        //if (action == -1) goto refresh_action_observations;
-        //if (action == PASS_ACTION) goto refresh_action_observations;
-
         mover = env->pos.sideToMove;
         mover_idx = (int)mover;
 
-        if (action < 0 || action >= PASS_ACTION) {
+        if (env->legal_moves.count == 0) {
+            clear_player_selection(env, mover_idx);
+        } else if (action < 0 || action >= PASS_ACTION) {
             if (mover == env->learner_color) {
                 env->rewards[0] += (env->pick_phase[mover_idx] == 0)
                     ? env->reward_invalid_piece : env->reward_invalid_move;
@@ -2159,9 +2158,7 @@ void c_step(Chess* env) {
         } else {
             bool is_promo = (action >= 64 && action < 96);
 
-            if (env->legal_moves.count == 0) {
-                clear_player_selection(env, mover_idx);
-            } else if (env->pick_phase[mover_idx] == 0) {
+            if (env->pick_phase[mover_idx] == 0) {
                 clear_player_selection(env, mover_idx);
 
                 bool valid_pick = !is_promo;
@@ -2187,7 +2184,6 @@ void c_step(Chess* env) {
                         env->selected_square[mover_idx] = picked_sq;
                         env->pick_phase[mover_idx] = 1;
                         env->valid_to_mask[mover_idx] = to_mask;
-                        //goto refresh_action_observations;
                     } else {
                         valid_pick = false;
                         clear_player_selection(env, mover_idx);
