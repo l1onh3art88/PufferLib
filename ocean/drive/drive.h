@@ -240,6 +240,11 @@ struct Drive {
     float reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn;
     unsigned int rng;
+    unsigned int map_set_rng;
+    int ready_for_resample;
+    int* valid_map_ids;
+    int* agents_per_valid_map;
+    int num_valid_maps;
 };
 
 void add_log(Drive* env) {
@@ -682,8 +687,8 @@ int collision_check(Drive* env, int agent_idx) {
 
     float half_length = agent->length / 2.0f;
     float half_width = agent->width / 2.0f;
-    float cos_heading = cosf(agent->heading);
-    float sin_heading = sinf(agent->heading);
+    float cos_heading = agent->heading_x;
+    float sin_heading = agent->heading_y;
     float corners[4][2];
     for (int i = 0; i < 4; i++) {
         corners[i][0] = agent->x + (offsets[i][0] * half_length * cos_heading - offsets[i][1] * half_width * sin_heading);
@@ -877,6 +882,7 @@ void remove_bad_trajectories(Drive* env) {
 
 // Initialization / Cleanup
 void init(Drive* env) {
+    env->ready_for_resample = 0;
     env->human_agent_idx = 0;
     env->timestep = 0;
     env->entities = load_map_binary(env->map_name, env);
@@ -907,6 +913,7 @@ void c_close(Drive* env) {
     free(env->neighbor_cache_indices);
     free(env->static_agent_indices);
     free(env->expert_static_agent_indices);
+    free(env->map_name);
 }
 
 void allocate(Drive* env) {
@@ -944,7 +951,7 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx) {
     speed = speed + 0.5f * acceleration * SIM_DT;
     speed = clipSpeed(speed);
 
-    float beta = tanh(0.5 * tanf(steering));
+    float beta = tanhf(0.5 * tanf(steering));
     float yaw_rate = (speed * cosf(beta) * tanf(steering)) / agent->length;
     float new_vx = speed * cosf(heading + beta);
     float new_vy = speed * sinf(heading + beta);
@@ -1080,6 +1087,7 @@ void compute_observations(Drive* env) {
 }
 
 void c_reset(Drive* env) {
+    env->ready_for_resample = 0;
     env->timestep = 0;
     set_start_position(env);
     for (int x = 0; x < env->active_agent_count; x++) {
@@ -1116,6 +1124,7 @@ void c_step(Drive* env) {
     if (env->timestep == TRAJECTORY_LENGTH) {
         add_log(env);
         c_reset(env);
+        env->ready_for_resample = 1;
         return;
     }
 

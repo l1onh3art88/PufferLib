@@ -129,6 +129,11 @@ void render(pybind11::object pufferl_obj, int env_id) {
     static_vec_render(pufferl.vec, env_id);
 }
 
+void reset(pybind11::object pufferl_obj){
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    my_vec_reset(pufferl.vec);
+}
+
 void rollouts(pybind11::object pufferl_obj) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     pybind11::gil_scoped_release no_gil;
@@ -461,6 +466,7 @@ PYBIND11_MODULE(_C, m) {
     m.def("eval_log", &puf_eval_log);
     m.def("render", &render);
     m.def("rollouts", &rollouts);
+    m.def("reset", &reset);
     m.def("train", &train);
     m.def("close", &puf_close);
     m.def("save_weights", &save_weights);

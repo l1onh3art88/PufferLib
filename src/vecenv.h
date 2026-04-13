@@ -107,6 +107,7 @@ enum EvalProfileIdx {
 // Functions implemented by env's static library
 StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs);
 void static_vec_reset(StaticVec* vec);
+void my_vec_reset(StaticVec* vec);
 void static_vec_close(StaticVec* vec);
 void static_vec_log(StaticVec* vec, Dict* out);
 void static_vec_eval_log(StaticVec* vec, Dict* out);
@@ -228,13 +229,9 @@ static void* static_omp_threadmanager(void* arg) {
 
     int agents_per_buffer = vec->agents_per_buffer;
     int agent_start = buf * agents_per_buffer;
-    int env_start = vec->buffer_env_starts[buf];
-    int env_count = vec->buffer_env_counts[buf];
     atomic_int* buffer_states = threading->buffer_states;
     int num_workers = threading->num_threads / vec->buffers;
     if (num_workers < 1) num_workers = 1;
-
-    Env* envs = (Env*)vec->envs;
 
     printf("Num workers: %d\n", num_workers);
     while (true) {
@@ -243,6 +240,9 @@ static void* static_omp_threadmanager(void* arg) {
                 return NULL;
             }
         }
+        int env_start = vec->buffer_env_starts[buf];
+        int env_count = vec->buffer_env_counts[buf];
+        Env* envs = (Env*)vec->envs;
         cudaStream_t stream = vec->streams[buf];
 
         float* my_accum = &threading->accum[buf * NUM_EVAL_PROF];
@@ -368,6 +368,13 @@ void my_vec_close(Env* envs) {
 }
 #endif
 
+#ifdef MY_VEC_RESET
+void my_vec_reset(StaticVec* vec);
+#else
+void my_vec_reset(StaticVec* vec) {
+    return;
+}
+#endif
 StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* vec_kwargs, Dict* env_kwargs) {
     StaticVec* vec = (StaticVec*)calloc(1, sizeof(StaticVec));
     vec->total_agents = total_agents;

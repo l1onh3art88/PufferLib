@@ -6,6 +6,8 @@
 #define MAP_BINARY_DIR "drive_data/binaries"
 
 #define MY_VEC_INIT
+#define MY_VEC_CLOSE
+#define MY_VEC_RESET
 #define Env Drive
 #include "vecenv.h"
 
@@ -33,26 +35,31 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     fclose(test_fp);
 
     // Scan all maps for agent counts; collect valid (>0) ones
-    int agents_per_map[num_maps];
-    int valid_map_ids[num_maps];
+    int* agents_per_map = (int*)calloc(num_maps, sizeof(int));
+    int* valid_map_ids = (int*)calloc(num_maps, sizeof(int));
+    int* agents_per_valid_map = (int*)calloc(num_maps, sizeof(int));
     int num_valid_maps = 0;
     for (int m = 0; m < num_maps; m++) {
         char map_file[512];
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
         Env temp_env = {0};
-        temp_env.map_name = map_file;
+        temp_env.map_name = strdup(map_file);
         init(&temp_env);
         agents_per_map[m] = temp_env.active_agent_count < MAX_AGENTS
                           ? temp_env.active_agent_count : MAX_AGENTS;
         c_close(&temp_env);
         if (agents_per_map[m] > 0) {
+            agents_per_valid_map[num_valid_maps] = agents_per_map[m];
             valid_map_ids[num_valid_maps++] = m;
         }
     }
+    free(agents_per_map);
     printf("Scanned %d maps from %s/, %d valid\n", num_maps, MAP_BINARY_DIR, num_valid_maps);
 
     if (num_valid_maps == 0) {
         printf("ERROR: No valid maps found\n");
+        free(valid_map_ids);
+        free(agents_per_valid_map);
         *num_envs_out = 0;
         return NULL;
     }
@@ -65,13 +72,15 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
     int total_envs = 0;
     int cursor = 0; // advances across buffers
+    unsigned int map_set_rng= 42;
 
     for (int b = 0; b < num_buffers; b++) {
         buffer_env_starts[b] = total_envs;
         int buffer_agents = 0;
         while (buffer_agents < agents_per_buffer) {
-            int m = valid_map_ids[cursor % num_valid_maps];
-            int cap = agents_per_map[m];
+            int vi = rand_r(&map_set_rng) % num_valid_maps;
+            int m = valid_map_ids[vi];
+            int cap = agents_per_valid_map[vi];
             int remaining = agents_per_buffer - buffer_agents;
             if (cap <= remaining) {
                 // Full map fits
@@ -83,8 +92,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
             } else {
                 // Pack remaining slots as 1-agent envs, one map each
                 while (buffer_agents < agents_per_buffer) {
-                    int mm = valid_map_ids[cursor % num_valid_maps];
-                    env_map_ids[total_envs] = mm;
+                    int vv = rand_r(&map_set_rng) % num_valid_maps;
+                    env_map_ids[total_envs] = valid_map_ids[vv];
                     env_max_agents[total_envs] = 1;
                     buffer_agents++;
                     total_envs++;
@@ -100,10 +109,15 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     // Initialize all envs
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
     for (int i = 0; i < total_envs; i++) {
+        srand(i);
         char map_file[512];
         snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, env_map_ids[i]);
         Env* env = &envs[i];
         memset(env, 0, sizeof(Env));
+        env->rng = i;
+        env->valid_map_ids = valid_map_ids;
+        env->agents_per_valid_map = agents_per_valid_map;
+        env->num_valid_maps = num_valid_maps;
         env->map_name = strdup(map_file);
         env->human_agent_idx = human_agent_idx;
         env->reward_vehicle_collision = reward_vehicle_collision;
@@ -111,6 +125,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_goal_post_respawn = reward_goal_post_respawn;
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->max_agents = env_max_agents[i];
+        env->map_set_rng = map_set_rng;
         init(env);
         env->num_agents = env->active_agent_count;
     }
@@ -125,6 +140,119 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     return envs;
 }
 
+void my_vec_reset(StaticVec* vec) {
+    Env* envs = (Env*)vec->envs;
+
+    // Grab shared state before closing envs
+    int* valid_map_ids = envs[0].valid_map_ids;
+    int* agents_per_valid_map = envs[0].agents_per_valid_map;
+    int num_valid_maps = envs[0].num_valid_maps;
+    int human_agent_idx = envs[0].human_agent_idx;
+    float reward_vehicle_collision = envs[0].reward_vehicle_collision;
+    float reward_offroad_collision = envs[0].reward_offroad_collision;
+    float reward_goal_post_respawn = envs[0].reward_goal_post_respawn;
+    float reward_vehicle_collision_post_respawn = envs[0].reward_vehicle_collision_post_respawn;
+    unsigned int map_set_rng = envs[0].map_set_rng;
+    int num_buffers = vec->buffers;
+    int agents_per_buffer = vec->agents_per_buffer;
+
+    // Close and free each env's internals (c_close does not free valid_map_ids or agents_per_valid_map)
+    for (int i = 0; i < vec->size; i++) {
+        c_close(&envs[i]);
+    }
+    free(vec->envs);
+    vec->envs = NULL;
+
+    // Build new env layout with fresh map sampling
+    int max_envs = agents_per_buffer * num_buffers;
+    int* env_map_ids = (int*)malloc(max_envs * sizeof(int));
+    int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
+    int total_envs = 0;
+    int cursor = 0;
+    map_set_rng++;
+
+    for (int b = 0; b < num_buffers; b++) {
+        vec->buffer_env_starts[b] = total_envs;
+        int buffer_agents = 0;
+        while (buffer_agents < agents_per_buffer) {
+            int vi = rand_r(&map_set_rng) % num_valid_maps;
+            int m = valid_map_ids[vi];
+            int cap = agents_per_valid_map[vi];
+            int remaining = agents_per_buffer - buffer_agents;
+            if (cap <= remaining) {
+                env_map_ids[total_envs] = m;
+                env_max_agents[total_envs] = cap;
+                buffer_agents += cap;
+                total_envs++;
+                cursor++;
+            } else {
+                while (buffer_agents < agents_per_buffer) {
+                    int vv = rand_r(&map_set_rng) % num_valid_maps;
+                    env_map_ids[total_envs] = valid_map_ids[vv];
+                    env_max_agents[total_envs] = 1;
+                    buffer_agents++;
+                    total_envs++;
+                    cursor++;
+                }
+            }
+        }
+        vec->buffer_env_counts[b] = total_envs - vec->buffer_env_starts[b];
+    }
+
+    // Allocate and initialize new envs
+    envs = (Env*)calloc(total_envs, sizeof(Env));
+    for (int i = 0; i < total_envs; i++) {
+        srand(i);
+        char map_file[512];
+        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, env_map_ids[i]);
+        Env* env = &envs[i];
+        memset(env, 0, sizeof(Env));
+        env->rng = i;
+        env->valid_map_ids = valid_map_ids;
+        env->agents_per_valid_map = agents_per_valid_map;
+        env->num_valid_maps = num_valid_maps;
+        env->map_name = strdup(map_file);
+        env->human_agent_idx = human_agent_idx;
+        env->reward_vehicle_collision = reward_vehicle_collision;
+        env->reward_offroad_collision = reward_offroad_collision;
+        env->reward_goal_post_respawn = reward_goal_post_respawn;
+        env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
+        env->map_set_rng = map_set_rng;
+        env->max_agents = env_max_agents[i];
+        init(env);
+        env->num_agents = env->active_agent_count;
+    }
+
+    free(env_map_ids);
+    free(env_max_agents);
+
+    vec->envs = envs;
+    vec->size = total_envs;
+
+    // Re-wire obs/actions/rewards/terminals to existing vec buffers
+    size_t obs_elem_size = obs_element_size();
+    for (int buf = 0; buf < num_buffers; buf++) {
+        int buf_start = buf * agents_per_buffer;
+        int buf_agent = 0;
+        int env_start = vec->buffer_env_starts[buf];
+        int env_count = vec->buffer_env_counts[buf];
+        for (int e = 0; e < env_count; e++) {
+            Env* env = &envs[env_start + e];
+            int slot = buf_start + buf_agent;
+            env->observations = (void*)((char*)vec->observations + slot * OBS_SIZE * obs_elem_size);
+            env->actions = vec->actions + slot * NUM_ATNS;
+            env->rewards = vec->rewards + slot;
+            env->terminals = vec->terminals + slot;
+            buf_agent += env->num_agents;
+        }
+    }
+
+    printf("joint reset complete: %d envs (%d maps cycled)\n", total_envs, cursor);
+}
+void my_vec_close(Env* envs) {
+    free(envs[0].valid_map_ids);
+    free(envs[0].agents_per_valid_map);
+}
 void my_init(Env* env, Dict* kwargs) {
     env->human_agent_idx = dict_get(kwargs, "human_agent_idx")->value;
     env->reward_vehicle_collision = dict_get(kwargs, "reward_vehicle_collision")->value;

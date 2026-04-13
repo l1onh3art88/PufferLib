@@ -228,6 +228,8 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
+        if epoch > 0 and epoch % 10 == 0:
+            backend.reset(pufferl) # for custom resets if wanted | default do nothing
         backend.rollouts(pufferl)
 
         if epoch < train_epochs:
@@ -333,15 +335,8 @@ def train(env_name, args=None, gpus=None, **kwargs):
         if rank == 0 and not subprocess:
             _train(env_name, worker_args, verbose=True)
         else:
-            # Spawn pickling uses CUDA IPC, unsupported on WSL2. Move to CPU first.
-            sweep_obj = kwargs.get('sweep_obj')
-            device = getattr(sweep_obj, 'device', None)
-            if device and device.type != 'cpu':
-                sweep_obj.to('cpu')
             ctx.Process(target=_train, args=(env_name, worker_args),
                 kwargs=kwargs).start()
-            if device and device.type != 'cpu':
-                sweep_obj.to(device)
 
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
@@ -431,6 +426,7 @@ def eval(env_name, args=None, load_path=None):
     while True:
         backend.render(pufferl, 0)
         backend.rollouts(pufferl)
+        breakpoint()
 
     backend.close(pufferl)
 
