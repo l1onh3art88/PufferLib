@@ -242,9 +242,7 @@ struct Drive {
     unsigned int rng;
     unsigned int map_set_rng;
     int ready_for_resample;
-    int* valid_map_ids;
-    int* agents_per_valid_map;
-    int num_valid_maps;
+    int num_maps;
 };
 
 void add_log(Drive* env) {
