@@ -7,26 +7,53 @@
 
 #define MY_VEC_INIT
 #define MY_VEC_RESET
+#define MY_VEC_CLOSE
 #define Env Drive
 #include "vecenv.h"
 
-// Returns the map id and writes the capped agent count to *agent_count_out.
-static int sample_valid_map(unsigned int* rng, int num_maps, int* agent_count_out) {
-    while (1) {
-        int map_id = rand_r(rng) % num_maps;
+// Scan all maps in parallel; returns count of valid maps.
+// Caller must free *ids_out and *caps_out.
+static int prescan_valid_maps(int num_maps, int** ids_out, int** caps_out) {
+    int* map_caps = (int*)calloc(num_maps, sizeof(int));
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int m = 0; m < num_maps; m++) {
         char map_file[512];
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, map_id);
+        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", MAP_BINARY_DIR, m);
         Env temp_env = {0};
         temp_env.map_name = strdup(map_file);
         init(&temp_env);
         int count = temp_env.active_agent_count < MAX_AGENTS
                   ? temp_env.active_agent_count : MAX_AGENTS;
         c_close(&temp_env);
-        if (count > 0) {
-            *agent_count_out = count;
-            return map_id;
+        map_caps[m] = count;
+    }
+    int* ids = (int*)malloc(num_maps * sizeof(int));
+    int* caps = (int*)malloc(num_maps * sizeof(int));
+    int valid = 0;
+    for (int m = 0; m < num_maps; m++) {
+        if (map_caps[m] > 0) {
+            ids[valid] = m;
+            caps[valid] = map_caps[m];
+            valid++;
         }
     }
+    free(map_caps);
+    *ids_out = ids;
+    *caps_out = caps;
+    return valid;
+}
+
+// O(1) sample from pre-built valid map list.
+static int sample_from_valid(unsigned int* rng, int* valid_ids, int* valid_caps,
+                              int valid_count, int* cap_out) {
+    int idx = rand_r(rng) % valid_count;
+    *cap_out = valid_caps[idx];
+    return valid_ids[idx];
+}
+
+void my_vec_close(Env* envs) {
+    free(envs[0].valid_map_ids);
+    free(envs[0].valid_map_caps);
 }
 
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts, Dict* vec_kwargs, Dict* env_kwargs) {
@@ -52,8 +79,21 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     }
     fclose(test_fp);
 
-    // Build per-env layout with lazy map sampling (no upfront scan).
-    // For each slot, randomly pick a map, probe it for agents, retry if invalid.
+    // Pre-scan all maps in parallel once; pointer lives for the lifetime of the vec.
+    int* valid_map_ids;
+    int* valid_map_caps;
+    printf("Scanning %d maps...\n", num_maps);
+    int valid_count = prescan_valid_maps(num_maps, &valid_map_ids, &valid_map_caps);
+    if (valid_count == 0) {
+        printf("ERROR: No valid maps found in %s/\n", MAP_BINARY_DIR);
+        *num_envs_out = 0;
+        return NULL;
+    }
+    printf("Found %d valid maps out of %d total\n", valid_count, num_maps);
+    // valid_map_ids / valid_map_caps are NOT freed here; stored on every env so
+    // my_vec_reset can reuse them without rescanning.
+
+    // Build per-env layout; each sample is now an O(1) array lookup.
     int max_envs = agents_per_buffer * num_buffers;
     int* env_map_ids = (int*)malloc(max_envs * sizeof(int));
     int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
@@ -65,7 +105,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         int buffer_agents = 0;
         while (buffer_agents < agents_per_buffer) {
             int cap;
-            int map_id = sample_valid_map(&map_set_rng, num_maps, &cap);
+            int map_id = sample_from_valid(&map_set_rng, valid_map_ids, valid_map_caps, valid_count, &cap);
             int remaining = agents_per_buffer - buffer_agents;
             if (cap <= remaining) {
                 env_map_ids[total_envs] = map_id;
@@ -76,7 +116,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
                 // Map has more agents than slots remaining; fill the rest with 1-agent envs
                 while (buffer_agents < agents_per_buffer) {
                     int fcap;
-                    int fmap_id = sample_valid_map(&map_set_rng, num_maps, &fcap);
+                    int fmap_id = sample_from_valid(&map_set_rng, valid_map_ids, valid_map_caps, valid_count, &fcap);
                     env_map_ids[total_envs] = fmap_id;
                     env_max_agents[total_envs] = 1;
                     buffer_agents++;
@@ -89,7 +129,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 
     printf("total envs: %d\n", total_envs);
 
-    // Initialize all envs
+    // Initialize all envs; each env holds the shared valid-map pointers.
     Env* envs = (Env*)calloc(total_envs, sizeof(Env));
     for (int i = 0; i < total_envs; i++) {
         srand(i);
@@ -107,6 +147,9 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->max_agents = env_max_agents[i];
         env->map_set_rng = map_set_rng;
+        env->valid_map_count = valid_count;
+        env->valid_map_ids = valid_map_ids;
+        env->valid_map_caps = valid_map_caps;
         init(env);
         env->num_agents = env->active_agent_count;
     }
@@ -124,7 +167,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 void my_vec_reset(StaticVec* vec) {
     Env* envs = (Env*)vec->envs;
 
-    // Grab shared state before closing envs
+    // Grab shared state before closing envs (valid map list survives; just borrow pointer).
     int num_maps = envs[0].num_maps;
     int human_agent_idx = envs[0].human_agent_idx;
     float reward_vehicle_collision = envs[0].reward_vehicle_collision;
@@ -132,6 +175,9 @@ void my_vec_reset(StaticVec* vec) {
     float reward_goal_post_respawn = envs[0].reward_goal_post_respawn;
     float reward_vehicle_collision_post_respawn = envs[0].reward_vehicle_collision_post_respawn;
     unsigned int map_set_rng = envs[0].map_set_rng + 1;
+    int valid_count = envs[0].valid_map_count;
+    int* valid_map_ids = envs[0].valid_map_ids;
+    int* valid_map_caps = envs[0].valid_map_caps;
     int num_buffers = vec->buffers;
     int agents_per_buffer = vec->agents_per_buffer;
 
@@ -142,7 +188,7 @@ void my_vec_reset(StaticVec* vec) {
     free(vec->envs);
     vec->envs = NULL;
 
-    // Build new env layout with fresh lazy map sampling
+    // Build new env layout with O(1) map sampling (valid map list reused from init).
     int max_envs = agents_per_buffer * num_buffers;
     int* env_map_ids = (int*)malloc(max_envs * sizeof(int));
     int* env_max_agents = (int*)malloc(max_envs * sizeof(int));
@@ -153,7 +199,7 @@ void my_vec_reset(StaticVec* vec) {
         int buffer_agents = 0;
         while (buffer_agents < agents_per_buffer) {
             int cap;
-            int map_id = sample_valid_map(&map_set_rng, num_maps, &cap);
+            int map_id = sample_from_valid(&map_set_rng, valid_map_ids, valid_map_caps, valid_count, &cap);
             int remaining = agents_per_buffer - buffer_agents;
             if (cap <= remaining) {
                 env_map_ids[total_envs] = map_id;
@@ -163,7 +209,7 @@ void my_vec_reset(StaticVec* vec) {
             } else {
                 while (buffer_agents < agents_per_buffer) {
                     int fcap;
-                    int fmap_id = sample_valid_map(&map_set_rng, num_maps, &fcap);
+                    int fmap_id = sample_from_valid(&map_set_rng, valid_map_ids, valid_map_caps, valid_count, &fcap);
                     env_map_ids[total_envs] = fmap_id;
                     env_max_agents[total_envs] = 1;
                     buffer_agents++;
@@ -174,7 +220,7 @@ void my_vec_reset(StaticVec* vec) {
         vec->buffer_env_counts[b] = total_envs - vec->buffer_env_starts[b];
     }
 
-    // Allocate and initialize new envs
+    // Allocate and initialize new envs; re-attach shared valid map pointers.
     envs = (Env*)calloc(total_envs, sizeof(Env));
     for (int i = 0; i < total_envs; i++) {
         srand(i);
@@ -192,7 +238,11 @@ void my_vec_reset(StaticVec* vec) {
         env->reward_vehicle_collision_post_respawn = reward_vehicle_collision_post_respawn;
         env->map_set_rng = map_set_rng;
         env->max_agents = env_max_agents[i];
+        env->valid_map_count = valid_count;
+        env->valid_map_ids = valid_map_ids;
+        env->valid_map_caps = valid_map_caps;
         init(env);
+        env->skip_next_log = 1;
         env->num_agents = env->active_agent_count;
     }
 

@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <unistd.h>
+#include <immintrin.h>
 #include <math.h>
 #include <assert.h>
 #include <string.h>
@@ -116,13 +117,8 @@ const Color PUFF_BACKGROUND2 = (Color){18, 72, 72, 255};
 const Color ROAD_COLOR       = (Color){35, 35, 37, 255};
 
 // Pre-baked geometry for each road segment entry in neighbor_cache_entities.
-// Computed once at init; same indexing as neighbor_cache_entities (pairs).
-typedef struct {
-    float mid_x, mid_y;
-    float cos_angle, sin_angle;
-    float half_length;
-    float type; // stored as float for direct obs write
-} RoadSegGeom;
+// Stored as SoA for SIMD-friendly access in compute_observations.
+// Same indexing as neighbor_cache_entities (pairs).
 
 // Pre-baked road edge segment endpoints for collision detection.
 // One entry per ROAD_EDGE segment within collision range of a grid cell.
@@ -248,7 +244,12 @@ struct Drive {
     int* neighbor_offsets;
     int* neighbor_cache_entities;
     int* neighbor_cache_indices;
-    RoadSegGeom* neighbor_cache_geom;
+    float* geom_mid_x;
+    float* geom_mid_y;
+    float* geom_cos_angle;
+    float* geom_sin_angle;
+    float* geom_half_length;
+    float* geom_type;
     int* collision_cache_indices;
     EdgeSeg* collision_edge_segs;
     float reward_vehicle_collision;
@@ -261,10 +262,18 @@ struct Drive {
     unsigned int rng;
     unsigned int map_set_rng;
     int ready_for_resample;
+    int skip_next_log;
     int num_maps;
+    int valid_map_count;
+    int* valid_map_ids;
+    int* valid_map_caps;
 };
 
 void add_log(Drive* env) {
+    if (env->skip_next_log) {
+        env->skip_next_log = 0;
+        return;
+    }
     for (int i = 0; i < env->active_agent_count; i++) {
         Entity* e = &env->entities[env->active_agent_indices[i]];
         if (e->reached_goal_this_episode) {
@@ -545,7 +554,12 @@ void cache_neighbor_offsets(Drive* env) {
     // Pre-bake road segment geometry so compute_observations avoids pointer chases.
     // Each pair (entity_idx, geometry_idx) in neighbor_cache_entities gets one entry.
     int total_pairs = env->neighbor_cache_indices[cell_count] / 2;
-    env->neighbor_cache_geom = (RoadSegGeom*)malloc(total_pairs * sizeof(RoadSegGeom));
+    env->geom_mid_x       = (float*)malloc(total_pairs * sizeof(float));
+    env->geom_mid_y       = (float*)malloc(total_pairs * sizeof(float));
+    env->geom_cos_angle   = (float*)malloc(total_pairs * sizeof(float));
+    env->geom_sin_angle   = (float*)malloc(total_pairs * sizeof(float));
+    env->geom_half_length = (float*)malloc(total_pairs * sizeof(float));
+    env->geom_type        = (float*)malloc(total_pairs * sizeof(float));
     for (int p = 0; p < total_pairs; p++) {
         int entity_idx   = env->neighbor_cache_entities[p * 2];
         int geometry_idx = env->neighbor_cache_entities[p * 2 + 1];
@@ -559,18 +573,17 @@ void cache_neighbor_offsets(Drive* env) {
         float dx      = end_x - mid_x;
         float dy      = end_y - mid_y;
         float len     = sqrtf(dx * dx + dy * dy);
-        RoadSegGeom* g = &env->neighbor_cache_geom[p];
-        g->mid_x      = mid_x;
-        g->mid_y      = mid_y;
-        g->half_length = len;
+        env->geom_mid_x[p]       = mid_x;
+        env->geom_mid_y[p]       = mid_y;
+        env->geom_half_length[p] = len;
         if (len > 0.0f) {
-            g->cos_angle = dx / len;
-            g->sin_angle = dy / len;
+            env->geom_cos_angle[p] = dx / len;
+            env->geom_sin_angle[p] = dy / len;
         } else {
-            g->cos_angle = 1.0f;
-            g->sin_angle = 0.0f;
+            env->geom_cos_angle[p] = 1.0f;
+            env->geom_sin_angle[p] = 0.0f;
         }
-        g->type = (float)(entity->type - ROAD_LANE);
+        env->geom_type[p] = (float)(entity->type - ROAD_LANE);
     }
 }
 
@@ -764,7 +777,7 @@ int collision_check(Drive* env, int agent_idx) {
 
     // Check road edge collisions via pre-baked cache
     int grid_idx = getGridIndex(env, agent->x, agent->y);
-    if (grid_idx >= 0 && grid_idx < env->grid_cols * env->grid_rows) {
+    if (grid_idx >= 0) {
         int base = env->collision_cache_indices[grid_idx];
         int end_idx = env->collision_cache_indices[grid_idx + 1];
         for (int i = base; i < end_idx; i++) {
@@ -975,7 +988,12 @@ void c_close(Drive* env) {
     free(env->neighbor_offsets);
     free(env->neighbor_cache_entities);
     free(env->neighbor_cache_indices);
-    free(env->neighbor_cache_geom);
+    free(env->geom_mid_x);
+    free(env->geom_mid_y);
+    free(env->geom_cos_angle);
+    free(env->geom_sin_angle);
+    free(env->geom_half_length);
+    free(env->geom_type);
     free(env->collision_cache_indices);
     free(env->collision_edge_segs);
     free(env->static_agent_indices);
@@ -1063,75 +1081,131 @@ void compute_observations(Drive* env) {
         obs[4] = ego->length / MAX_VEH_LEN;
         obs[5] = (ego->collision_state > NO_COLLISION) ? 1 : 0;
         obs[6] = (ego->respawn_timestep != -1) ? 1 : 0;
-        // Partner observations
-        int obs_idx = EGO_FEATURES;
-        int cars_seen = 0;
-        for (int j = 0; j < env->num_actors; j++) {
-            int index = -1;
-            if (j < env->active_agent_count) {
-                index = env->active_agent_indices[j];
-            } else if (j < env->num_actors) {
-                index = env->static_agent_indices[j - env->active_agent_count];
+        // Partner observations - collect, sort by distance, then write
+        float partner_dist[MAX_AGENTS - 1];
+        int   partner_idx[MAX_AGENTS - 1];
+        int partner_count = 0;
+
+        if (ego->respawn_timestep == -1) {
+            for (int j = 0; j < env->num_actors; j++) {
+                int index = -1;
+                if (j < env->active_agent_count) {
+                    index = env->active_agent_indices[j];
+                } else if (j < env->num_actors) {
+                    index = env->static_agent_indices[j - env->active_agent_count];
+                }
+                if (index == -1) continue;
+                if (env->entities[index].type > CYCLIST) break;
+                if (index == env->active_agent_indices[i]) continue;
+
+                Entity* other = &env->entities[index];
+                if (other->respawn_timestep != -1) continue;
+
+                float dx = other->x - ego->x;
+                float dy = other->y - ego->y;
+                float d2 = dx * dx + dy * dy;
+                if (d2 > OBS_DIST_SQ) continue;
+
+                // Insertion sort by distance
+                int pos = partner_count;
+                while (pos > 0 && partner_dist[pos - 1] > d2) {
+                    partner_dist[pos] = partner_dist[pos - 1];
+                    partner_idx[pos]  = partner_idx[pos - 1];
+                    pos--;
+                }
+                partner_dist[pos] = d2;
+                partner_idx[pos]  = index;
+                partner_count++;
             }
-            if (index == -1) continue;
-            if (env->entities[index].type > CYCLIST) break;
-            if (index == env->active_agent_indices[i]) continue;
+        }
 
-            Entity* other = &env->entities[index];
-            if (ego->respawn_timestep != -1) continue;
-            if (other->respawn_timestep != -1) continue;
-
+        int obs_idx = EGO_FEATURES;
+        for (int j = 0; j < partner_count; j++) {
+            Entity* other = &env->entities[partner_idx[j]];
             float dx = other->x - ego->x;
             float dy = other->y - ego->y;
-            if ((dx * dx + dy * dy) > OBS_DIST_SQ) continue;
-
-            float rel_x = dx * cos_h + dy * sin_h;
-            float rel_y = -dx * sin_h + dy * cos_h;
-
-            obs[obs_idx + 0] = rel_x * OBS_POSITION_SCALE;
-            obs[obs_idx + 1] = rel_y * OBS_POSITION_SCALE;
+            obs[obs_idx + 0] = (dx * cos_h + dy * sin_h) * OBS_POSITION_SCALE;
+            obs[obs_idx + 1] = (-dx * sin_h + dy * cos_h) * OBS_POSITION_SCALE;
             obs[obs_idx + 2] = other->width / MAX_VEH_WIDTH;
             obs[obs_idx + 3] = other->length / MAX_VEH_LEN;
             obs[obs_idx + 4] = other->heading_x * ego->heading_x + other->heading_y * ego->heading_y;
             obs[obs_idx + 5] = other->heading_y * ego->heading_x - other->heading_x * ego->heading_y;
             obs[obs_idx + 6] = other->speed / MAX_SPEED;
-            cars_seen++;
             obs_idx += PARTNER_FEATURES;
         }
-        int remaining_partner_obs = (MAX_AGENTS - 1 - cars_seen) * PARTNER_FEATURES;
+        int remaining_partner_obs = (MAX_AGENTS - 1 - partner_count) * PARTNER_FEATURES;
         memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
         obs_idx += remaining_partner_obs;
 
-        // Road observations - read from pre-baked geom cache (no pointer chasing)
+        // Road observations - SoA layout: all x_obs, then all y_obs, etc.
+        // Base offset into obs for road section (after ego + partner features)
+        int road_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+        float* ro_x = obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_y = obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_l = obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_w = obs + road_base + 3 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_c = obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_s = obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        float* ro_t = obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        memset(ro_x, 0, ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS * sizeof(float));
+
         int grid_idx = getGridIndex(env, ego->x, ego->y);
         int list_size = 0;
         int geom_base = 0;
-        if (grid_idx >= 0 && grid_idx < env->grid_cols * env->grid_rows) {
+        if (grid_idx >= 0) {
             int base_index = env->neighbor_cache_indices[grid_idx];
             int end_index  = env->neighbor_cache_indices[grid_idx + 1];
             list_size = (end_index - base_index) / 2;
             if (list_size > MAX_ROAD_SEGMENT_OBSERVATIONS) list_size = MAX_ROAD_SEGMENT_OBSERVATIONS;
             geom_base = base_index / 2;
         }
-        for (int k = 0; k < list_size; k++) {
-            RoadSegGeom* g = &env->neighbor_cache_geom[geom_base + k];
-            float rel_x  = g->mid_x - ego->x;
-            float rel_y  = g->mid_y - ego->y;
-            float x_obs  = rel_x * cos_h + rel_y * sin_h;
-            float y_obs  = -rel_x * sin_h + rel_y * cos_h;
-            float cos_angle = g->cos_angle * cos_h + g->sin_angle * sin_h;
-            float sin_angle = -g->cos_angle * sin_h + g->sin_angle * cos_h;
-            obs[obs_idx + 0] = x_obs * OBS_POSITION_SCALE;
-            obs[obs_idx + 1] = y_obs * OBS_POSITION_SCALE;
-            obs[obs_idx + 2] = g->half_length / MAX_ROAD_SEGMENT_LENGTH;
-            obs[obs_idx + 3] = 0.1f / MAX_ROAD_SCALE;
-            obs[obs_idx + 4] = cos_angle;
-            obs[obs_idx + 5] = sin_angle;
-            obs[obs_idx + 6] = g->type;
-            obs_idx += ROAD_FEATURES;
+
+        __m256 vcos_h     = _mm256_set1_ps(cos_h);
+        __m256 vsin_h     = _mm256_set1_ps(sin_h);
+        __m256 vego_x     = _mm256_set1_ps(ego->x);
+        __m256 vego_y     = _mm256_set1_ps(ego->y);
+        __m256 vpos_scale = _mm256_set1_ps(OBS_POSITION_SCALE);
+        __m256 vlen_scale = _mm256_set1_ps(1.0f / MAX_ROAD_SEGMENT_LENGTH);
+        __m256 vwidth     = _mm256_set1_ps(0.1f / MAX_ROAD_SCALE);
+
+        int k = 0;
+        int simd_end = list_size & ~7;
+        for (; k < simd_end; k += 8) {
+            int base = geom_base + k;
+            __m256 mx = _mm256_loadu_ps(&env->geom_mid_x[base]);
+            __m256 my = _mm256_loadu_ps(&env->geom_mid_y[base]);
+            __m256 ca = _mm256_loadu_ps(&env->geom_cos_angle[base]);
+            __m256 sa = _mm256_loadu_ps(&env->geom_sin_angle[base]);
+            __m256 hl = _mm256_loadu_ps(&env->geom_half_length[base]);
+            __m256 ty = _mm256_loadu_ps(&env->geom_type[base]);
+
+            __m256 rx    = _mm256_sub_ps(mx, vego_x);
+            __m256 ry    = _mm256_sub_ps(my, vego_y);
+            __m256 x_obs = _mm256_fmadd_ps(rx, vcos_h, _mm256_mul_ps(ry, vsin_h));
+            __m256 y_obs = _mm256_fmsub_ps(ry, vcos_h, _mm256_mul_ps(rx, vsin_h));
+            __m256 cos_r = _mm256_fmadd_ps(ca, vcos_h, _mm256_mul_ps(sa, vsin_h));
+            __m256 sin_r = _mm256_fmsub_ps(sa, vcos_h, _mm256_mul_ps(ca, vsin_h));
+
+            _mm256_storeu_ps(&ro_x[k], _mm256_mul_ps(x_obs, vpos_scale));
+            _mm256_storeu_ps(&ro_y[k], _mm256_mul_ps(y_obs, vpos_scale));
+            _mm256_storeu_ps(&ro_l[k], _mm256_mul_ps(hl, vlen_scale));
+            _mm256_storeu_ps(&ro_w[k], vwidth);
+            _mm256_storeu_ps(&ro_c[k], cos_r);
+            _mm256_storeu_ps(&ro_s[k], sin_r);
+            _mm256_storeu_ps(&ro_t[k], ty);
         }
-        int remaining_obs = (MAX_ROAD_SEGMENT_OBSERVATIONS - list_size) * ROAD_FEATURES;
-        memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
+        for (; k < list_size; k++) {
+            int base = geom_base + k;
+            float rel_x = env->geom_mid_x[base] - ego->x;
+            float rel_y = env->geom_mid_y[base] - ego->y;
+            ro_x[k] = (rel_x * cos_h + rel_y * sin_h) * OBS_POSITION_SCALE;
+            ro_y[k] = (rel_y * cos_h - rel_x * sin_h) * OBS_POSITION_SCALE;
+            ro_l[k] = env->geom_half_length[base] / MAX_ROAD_SEGMENT_LENGTH;
+            ro_w[k] = 0.1f / MAX_ROAD_SCALE;
+            ro_c[k] = env->geom_cos_angle[base] * cos_h + env->geom_sin_angle[base] * sin_h;
+            ro_s[k] = env->geom_sin_angle[base] * cos_h - env->geom_cos_angle[base] * sin_h;
+            ro_t[k] = env->geom_type[base];
+        }
     }
 }
 
@@ -1418,18 +1492,23 @@ void draw_agent_obs(Drive* env, int agent_index) {
         obs_idx += PARTNER_FEATURES;
     }
 
-    // Draw road edge observations
-    int map_start_idx = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    // Draw road edge observations (SoA layout)
+    int road_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    float* ro_x = agent_obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_y = agent_obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_l = agent_obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_c = agent_obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_s = agent_obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_t = agent_obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
     for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
-        int idx = map_start_idx + k * ROAD_FEATURES;
-        if (agent_obs[idx] == 0 && agent_obs[idx + 1] == 0) continue;
-        int entity_type = (int)agent_obs[idx + 6];
+        if (ro_x[k] == 0 && ro_y[k] == 0) continue;
+        int entity_type = (int)ro_t[k];
         if (entity_type + ROAD_LANE != ROAD_EDGE) continue;
 
-        float x_mid = agent_obs[idx] / OBS_POSITION_SCALE;
-        float y_mid = agent_obs[idx + 1] / OBS_POSITION_SCALE;
-        float rel_angle = atan2f(agent_obs[idx + 5], agent_obs[idx + 4]);
-        float seg_len = agent_obs[idx + 2] * MAX_ROAD_SEGMENT_LENGTH;
+        float x_mid = ro_x[k] / OBS_POSITION_SCALE;
+        float y_mid = ro_y[k] / OBS_POSITION_SCALE;
+        float rel_angle = atan2f(ro_s[k], ro_c[k]);
+        float seg_len = ro_l[k] * MAX_ROAD_SEGMENT_LENGTH;
 
         float x_start = x_mid - seg_len * cosf(rel_angle);
         float y_start = y_mid - seg_len * sinf(rel_angle);

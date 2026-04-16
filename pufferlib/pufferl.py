@@ -228,7 +228,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = train_epochs // 2
     for epoch in range(train_epochs + eval_epochs):
-        if epoch > 0 and epoch % 10 == 0:
+        if epoch > 0 and epoch % 50 == 0:
             backend.reset(pufferl) # for custom resets if wanted | default do nothing
         backend.rollouts(pufferl)
 
@@ -422,11 +422,13 @@ def eval(env_name, args=None, load_path=None):
     if load_path is not None:
         backend.load_weights(pufferl, load_path)
         print(f'Loaded weights from {load_path}')
-
+    flat_logs = {}
     while True:
         backend.render(pufferl, 0)
         backend.rollouts(pufferl)
-        breakpoint()
+        logs = backend.eval_log(pufferl)
+        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+        print(flat_logs)
 
     backend.close(pufferl)
 
