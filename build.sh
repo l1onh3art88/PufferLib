@@ -10,6 +10,7 @@ set -e
 #   ./build.sh breakout --fast       # Standalone executable (optimized)
 #   ./build.sh breakout --web        # Emscripten web build
 #   ./build.sh breakout --profile    # Kernel profiling binary
+#   ./build.sh breakout --fast --gprof   # Standalone executable with gprof instrumentation
 #   ./build.sh all                   # Build all envs with default and --float
 
 if [ -z "$1" ]; then
@@ -28,6 +29,7 @@ for arg in "$@"; do
         --web)   MODE=web ;;
         --profile) MODE=profile ;;
         --cpu)   MODE=cpu; PRECISION="-DPRECISION_FLOAT" ;;
+        --gprof) GPROF=1 ;;
         *) echo "Error: unknown argument '$arg'" && exit 1 ;;
     esac
 done
@@ -130,9 +132,13 @@ if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     NVCC_OPT="-O0 -g"
     LINK_OPT="-g"
 else
-    CLANG_OPT=(-O2 -DNDEBUG "${CLANG_WARN[@]}")
+    CLANG_OPT=(-O2 -DNDEBUG -mavx2 -mfma "${CLANG_WARN[@]}")
     NVCC_OPT="-O2 --threads 0"
     LINK_OPT="-O2"
+fi
+if [ -n "$GPROF" ]; then
+    CLANG_OPT+=(-pg)
+    LINK_OPT="$LINK_OPT -pg"
 fi
 if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
     FLAGS=(
