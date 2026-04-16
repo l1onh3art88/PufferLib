@@ -126,6 +126,29 @@ typedef struct {
     float sx, sy, ex, ey;
 } EdgeSeg;
 
+// bf16 helpers
+typedef uint16_t bf16;
+
+static inline bf16 f32_to_bf16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, 4);
+    return (uint16_t)(bits >> 16);
+}
+
+static inline float bf16_to_f32(bf16 b) {
+    uint32_t bits = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static inline void store_f32x8_as_bf16(bf16* dst, __m256 v) {
+    __m256i vi = _mm256_srli_epi32(_mm256_castps_si256(v), 16);
+    __m128i lo = _mm256_castsi256_si128(vi);
+    __m128i hi = _mm256_extracti128_si256(vi, 1);
+    _mm_storeu_si128((__m128i*)dst, _mm_packus_epi32(lo, hi));
+}
+
 // Forward declarations
 typedef struct Drive Drive;
 typedef struct Client Client;
@@ -214,7 +237,7 @@ float normalize_heading(float heading) {
 
 struct Drive {
     Client* client;
-    float* observations;
+    bf16* observations;
     float* actions;
     float* rewards;
     float* terminals;
@@ -1002,7 +1025,7 @@ void c_close(Drive* env) {
 
 void allocate(Drive* env) {
     init(env);
-    env->observations = (float*)calloc(env->active_agent_count * OBS_SIZE, sizeof(float));
+    env->observations = (bf16*)calloc(env->active_agent_count * OBS_SIZE, sizeof(bf16));
     env->actions = (float*)calloc(env->active_agent_count * 2, sizeof(float));
     env->rewards = (float*)calloc(env->active_agent_count, sizeof(float));
     env->terminals = (float*)calloc(env->active_agent_count, sizeof(float));
@@ -1056,10 +1079,10 @@ void move_dynamics(Drive* env, int action_idx, int agent_idx) {
 
 // Observations
 void compute_observations(Drive* env) {
-    float (*observations)[OBS_SIZE] = (float(*)[OBS_SIZE])env->observations;
+    bf16 (*observations)[OBS_SIZE] = (bf16(*)[OBS_SIZE])env->observations;
 
     for (int i = 0; i < env->active_agent_count; i++) {
-        float* obs = &observations[i][0];
+        bf16* obs = &observations[i][0];
         Entity* ego = &env->entities[env->active_agent_indices[i]];
         if (ego->type > CYCLIST) break;
 
@@ -1074,13 +1097,13 @@ void compute_observations(Drive* env) {
         float rel_goal_y = -goal_x * sin_h + goal_y * cos_h;
 
         // Ego features
-        obs[0] = rel_goal_x * OBS_GOAL_SCALE;
-        obs[1] = rel_goal_y * OBS_GOAL_SCALE;
-        obs[2] = ego_speed * OBS_SPEED_SCALE;
-        obs[3] = ego->width / MAX_VEH_WIDTH;
-        obs[4] = ego->length / MAX_VEH_LEN;
-        obs[5] = (ego->collision_state > NO_COLLISION) ? 1 : 0;
-        obs[6] = (ego->respawn_timestep != -1) ? 1 : 0;
+        obs[0] = f32_to_bf16(rel_goal_x * OBS_GOAL_SCALE);
+        obs[1] = f32_to_bf16(rel_goal_y * OBS_GOAL_SCALE);
+        obs[2] = f32_to_bf16(ego_speed * OBS_SPEED_SCALE);
+        obs[3] = f32_to_bf16(ego->width / MAX_VEH_WIDTH);
+        obs[4] = f32_to_bf16(ego->length / MAX_VEH_LEN);
+        obs[5] = f32_to_bf16((ego->collision_state > NO_COLLISION) ? 1.0f : 0.0f);
+        obs[6] = f32_to_bf16((ego->respawn_timestep != -1) ? 1.0f : 0.0f);
         // Partner observations - collect, sort by distance, then write
         float partner_dist[MAX_AGENTS - 1];
         int   partner_idx[MAX_AGENTS - 1];
@@ -1124,30 +1147,30 @@ void compute_observations(Drive* env) {
             Entity* other = &env->entities[partner_idx[j]];
             float dx = other->x - ego->x;
             float dy = other->y - ego->y;
-            obs[obs_idx + 0] = (dx * cos_h + dy * sin_h) * OBS_POSITION_SCALE;
-            obs[obs_idx + 1] = (-dx * sin_h + dy * cos_h) * OBS_POSITION_SCALE;
-            obs[obs_idx + 2] = other->width / MAX_VEH_WIDTH;
-            obs[obs_idx + 3] = other->length / MAX_VEH_LEN;
-            obs[obs_idx + 4] = other->heading_x * ego->heading_x + other->heading_y * ego->heading_y;
-            obs[obs_idx + 5] = other->heading_y * ego->heading_x - other->heading_x * ego->heading_y;
-            obs[obs_idx + 6] = other->speed / MAX_SPEED;
+            obs[obs_idx + 0] = f32_to_bf16((dx * cos_h + dy * sin_h) * OBS_POSITION_SCALE);
+            obs[obs_idx + 1] = f32_to_bf16((-dx * sin_h + dy * cos_h) * OBS_POSITION_SCALE);
+            obs[obs_idx + 2] = f32_to_bf16(other->width / MAX_VEH_WIDTH);
+            obs[obs_idx + 3] = f32_to_bf16(other->length / MAX_VEH_LEN);
+            obs[obs_idx + 4] = f32_to_bf16(other->heading_x * ego->heading_x + other->heading_y * ego->heading_y);
+            obs[obs_idx + 5] = f32_to_bf16(other->heading_y * ego->heading_x - other->heading_x * ego->heading_y);
+            obs[obs_idx + 6] = f32_to_bf16(other->speed / MAX_SPEED);
             obs_idx += PARTNER_FEATURES;
         }
         int remaining_partner_obs = (MAX_AGENTS - 1 - partner_count) * PARTNER_FEATURES;
-        memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(float));
+        memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(bf16));
         obs_idx += remaining_partner_obs;
 
         // Road observations - SoA layout: all x_obs, then all y_obs, etc.
         // Base offset into obs for road section (after ego + partner features)
         int road_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
-        float* ro_x = obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_y = obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_l = obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_w = obs + road_base + 3 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_c = obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_s = obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        float* ro_t = obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
-        memset(ro_x, 0, ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS * sizeof(float));
+        bf16* ro_x = obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_y = obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_l = obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_w = obs + road_base + 3 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_c = obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_s = obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_t = obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        memset(ro_x, 0, ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS * sizeof(bf16));
 
         int grid_idx = getGridIndex(env, ego->x, ego->y);
         int list_size = 0;
@@ -1186,25 +1209,25 @@ void compute_observations(Drive* env) {
             __m256 cos_r = _mm256_fmadd_ps(ca, vcos_h, _mm256_mul_ps(sa, vsin_h));
             __m256 sin_r = _mm256_fmsub_ps(sa, vcos_h, _mm256_mul_ps(ca, vsin_h));
 
-            _mm256_storeu_ps(&ro_x[k], _mm256_mul_ps(x_obs, vpos_scale));
-            _mm256_storeu_ps(&ro_y[k], _mm256_mul_ps(y_obs, vpos_scale));
-            _mm256_storeu_ps(&ro_l[k], _mm256_mul_ps(hl, vlen_scale));
-            _mm256_storeu_ps(&ro_w[k], vwidth);
-            _mm256_storeu_ps(&ro_c[k], cos_r);
-            _mm256_storeu_ps(&ro_s[k], sin_r);
-            _mm256_storeu_ps(&ro_t[k], ty);
+            store_f32x8_as_bf16(&ro_x[k], _mm256_mul_ps(x_obs, vpos_scale));
+            store_f32x8_as_bf16(&ro_y[k], _mm256_mul_ps(y_obs, vpos_scale));
+            store_f32x8_as_bf16(&ro_l[k], _mm256_mul_ps(hl, vlen_scale));
+            store_f32x8_as_bf16(&ro_w[k], vwidth);
+            store_f32x8_as_bf16(&ro_c[k], cos_r);
+            store_f32x8_as_bf16(&ro_s[k], sin_r);
+            store_f32x8_as_bf16(&ro_t[k], ty);
         }
         for (; k < list_size; k++) {
             int base = geom_base + k;
             float rel_x = env->geom_mid_x[base] - ego->x;
             float rel_y = env->geom_mid_y[base] - ego->y;
-            ro_x[k] = (rel_x * cos_h + rel_y * sin_h) * OBS_POSITION_SCALE;
-            ro_y[k] = (rel_y * cos_h - rel_x * sin_h) * OBS_POSITION_SCALE;
-            ro_l[k] = env->geom_half_length[base] / MAX_ROAD_SEGMENT_LENGTH;
-            ro_w[k] = 0.1f / MAX_ROAD_SCALE;
-            ro_c[k] = env->geom_cos_angle[base] * cos_h + env->geom_sin_angle[base] * sin_h;
-            ro_s[k] = env->geom_sin_angle[base] * cos_h - env->geom_cos_angle[base] * sin_h;
-            ro_t[k] = env->geom_type[base];
+            ro_x[k] = f32_to_bf16((rel_x * cos_h + rel_y * sin_h) * OBS_POSITION_SCALE);
+            ro_y[k] = f32_to_bf16((rel_y * cos_h - rel_x * sin_h) * OBS_POSITION_SCALE);
+            ro_l[k] = f32_to_bf16(env->geom_half_length[base] / MAX_ROAD_SEGMENT_LENGTH);
+            ro_w[k] = f32_to_bf16(0.1f / MAX_ROAD_SCALE);
+            ro_c[k] = f32_to_bf16(env->geom_cos_angle[base] * cos_h + env->geom_sin_angle[base] * sin_h);
+            ro_s[k] = f32_to_bf16(env->geom_sin_angle[base] * cos_h - env->geom_cos_angle[base] * sin_h);
+            ro_t[k] = f32_to_bf16(env->geom_type[base]);
         }
     }
 }
@@ -1451,8 +1474,10 @@ void draw_agent_obs(Drive* env, int agent_index) {
 
     if (!IsKeyDown(KEY_LEFT_CONTROL)) return;
 
-    float (*observations)[OBS_SIZE] = (float(*)[OBS_SIZE])env->observations;
-    float* agent_obs = &observations[agent_index][0];
+    float agent_obs_buf[OBS_SIZE];
+    bf16* raw_obs = &((bf16(*)[OBS_SIZE])env->observations)[agent_index][0];
+    for (int i = 0; i < OBS_SIZE; i++) agent_obs_buf[i] = bf16_to_f32(raw_obs[i]);
+    float* agent_obs = agent_obs_buf;
 
     // Draw goal
     float goal_x = agent_obs[0] / OBS_GOAL_SCALE;
