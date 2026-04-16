@@ -21,7 +21,10 @@ void demo() {
     int steer_delta = 4;
     while (!WindowShouldClose()) {
         float (*actions)[2] = (float(*)[2])env.actions;
-        forward_puffernet(net, env.observations, env.actions);
+        float obs_f32[env.active_agent_count * OBS_SIZE];
+        for (int j = 0; j < env.active_agent_count * OBS_SIZE; j++)
+            obs_f32[j] = bf16_to_f32(env.observations[j]);
+        forward_puffernet(net, obs_f32, env.actions);
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             actions[env.human_agent_idx][0] = 3;
             actions[env.human_agent_idx][1] = 6;
@@ -65,25 +68,26 @@ void performance_test() {
     allocate(&env);
     c_reset(&env);
 
-    Weights* weights = load_weights("resources/drive/drive_weights.bin");
-    int logit_sizes[2] = {7, 13};
-    PufferNet* net = make_puffernet(weights, env.active_agent_count, OBS_SIZE, 256, 4, logit_sizes, 2);
 
     long start = time(NULL);
     int i = 0;
+
+    float (*actions)[2] = (float(*)[2])env.actions;
     while (time(NULL) - start < test_time) {
-        forward_puffernet(net, env.observations, env.actions);
+        for(int i =0; i < env.active_agent_count; i++){
+            actions[i][0] = rand() % 7;
+            actions[i][1] = rand() % 13;
+        }
         c_step(&env);
         i++;
     }
     long end = time(NULL);
     printf("SPS: %ld\n", (long)(i*env.active_agent_count) / (end - start));
     free_allocated(&env);
-    free_puffernet(net);
-    free(weights);
 }
 
 int main() {
-    demo();
+    //demo();
+    performance_test();
     return 0;
 }
