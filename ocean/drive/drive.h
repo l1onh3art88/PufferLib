@@ -1000,6 +1000,8 @@ void init(Drive* env) {
 }
 
 void c_close(Drive* env) {
+    free(env->map_name);
+    env->map_name = NULL;
     for (int i = 0; i < env->num_entities; i++) {
         free_entity(&env->entities[i]);
     }

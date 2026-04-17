@@ -1,3 +1,4 @@
+#include <sys/file.h>
 #include "drive.h"
 #define NUM_ATNS 2
 #define ACT_SIZES {7, 13}
@@ -14,6 +15,41 @@
 // Scan all maps in parallel; returns count of valid maps.
 // Caller must free *ids_out and *caps_out.
 static int prescan_valid_maps(int num_maps, int** ids_out, int** caps_out) {
+    char cache_file[512];
+    char lock_file[512];
+    snprintf(cache_file, sizeof(cache_file), "%s/valid_map_cache.bin", MAP_BINARY_DIR);
+    snprintf(lock_file,  sizeof(lock_file),  "%s/valid_map_cache.lock", MAP_BINARY_DIR);
+
+    // Serialize across processes: only one scans; the rest wait and read the cache.
+    int lock_fd = open(lock_file, O_CREAT | O_RDWR, 0666);
+    flock(lock_fd, LOCK_EX);
+
+    // Try cache (may have been written by whoever held the lock before us).
+    FILE* cf = fopen(cache_file, "rb");
+    if (cf) {
+        int cached_num_maps, valid;
+        if (fread(&cached_num_maps, sizeof(int), 1, cf) == 1 &&
+            fread(&valid, sizeof(int), 1, cf) == 1 &&
+            cached_num_maps == num_maps && valid > 0) {
+            int* ids = (int*)malloc(valid * sizeof(int));
+            int* caps = (int*)malloc(valid * sizeof(int));
+            if (fread(ids, sizeof(int), valid, cf) == (size_t)valid &&
+                fread(caps, sizeof(int), valid, cf) == (size_t)valid) {
+                fclose(cf);
+                flock(lock_fd, LOCK_UN);
+                close(lock_fd);
+                printf("Loaded %d valid maps from cache\n", valid);
+                *ids_out = ids;
+                *caps_out = caps;
+                return valid;
+            }
+            free(ids);
+            free(caps);
+        }
+        fclose(cf);
+    }
+
+    // We hold the lock and no valid cache exists — do the scan.
     int* map_caps = (int*)calloc(num_maps, sizeof(int));
     #pragma omp parallel for schedule(dynamic, 4)
     for (int m = 0; m < num_maps; m++) {
@@ -38,6 +74,20 @@ static int prescan_valid_maps(int num_maps, int** ids_out, int** caps_out) {
         }
     }
     free(map_caps);
+
+    cf = fopen(cache_file, "wb");
+    if (cf) {
+        fwrite(&num_maps, sizeof(int), 1, cf);
+        fwrite(&valid, sizeof(int), 1, cf);
+        fwrite(ids, sizeof(int), valid, cf);
+        fwrite(caps, sizeof(int), valid, cf);
+        fclose(cf);
+        printf("Wrote valid map cache (%d valid / %d total)\n", valid, num_maps);
+    }
+
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+
     *ids_out = ids;
     *caps_out = caps;
     return valid;

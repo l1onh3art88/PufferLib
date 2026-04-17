@@ -9,8 +9,8 @@ void demo() {
         .human_agent_idx = 0,
         .reward_vehicle_collision = -0.1f,
         .reward_offroad_collision = -0.1f,
-	    .map_name = "resources/drive/map_010.bin",
     };
+    env.map_name = strdup("resources/drive/map_010.bin");
     allocate(&env);
     c_reset(&env);
     c_render(&env);
@@ -63,8 +63,8 @@ void performance_test() {
     Drive env = {
         .dynamics_model = CLASSIC,
         .human_agent_idx = 0,
-	    .map_name = "resources/drive/map_942.bin",
     };
+    env.map_name = strdup("resources/drive/map_942.bin");
     allocate(&env);
     c_reset(&env);
 
