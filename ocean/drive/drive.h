@@ -51,13 +51,13 @@
 #define VISION_RANGE 21
 
 // Observation Space
-#define NUM_LIDAR_RAYS 64
-#define MAX_LIDAR_DIST 100.0f
+#define MAX_ROAD_SEGMENT_OBSERVATIONS 75
 
 #define PARTNER_FEATURES 7
 #define EGO_FEATURES 7
+#define ROAD_FEATURES 7
 
-#define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1) + NUM_LIDAR_RAYS)
+#define OBS_SIZE (EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS)
 
 // Observation normalization
 #define MAX_SPEED 100.0f
@@ -147,19 +147,6 @@ static inline void store_f32x8_as_bf16(bf16* dst, __m256 v) {
     __m128i lo = _mm256_castsi256_si128(vi);
     __m128i hi = _mm256_extracti128_si256(vi, 1);
     _mm_storeu_si128((__m128i*)dst, _mm_packus_epi32(lo, hi));
-}
-
-// Fast atan2 returning angle in [0, 2π), used for lidar ray binning.
-// Polynomial approximation, max error ~0.15° — well within 64-ray bin spacing of 5.625°.
-static inline float fast_atan2_lidar(float y, float x) {
-    float ax = fabsf(x), ay = fabsf(y);
-    float mx = ax > ay ? ax : ay, mn = ax > ay ? ay : ax;
-    float t = mn / (mx + 1e-7f), t2 = t * t;
-    float r = t * (0.9997878412f + t2 * (-0.3258083975f + t2 * (0.1555786518f + t2 * -0.0443289900f)));
-    if (ay > ax) r = 1.57079632f - r;
-    if (x < 0.0f) r = 3.14159265f - r;
-    if (y < 0.0f) r = 6.28318530f - r;
-    return r;
 }
 
 // Forward declarations
@@ -1175,106 +1162,74 @@ void compute_observations(Drive* env) {
         memset(&obs[obs_idx], 0, remaining_partner_obs * sizeof(bf16));
         obs_idx += remaining_partner_obs;
 
-        // Lidar observations: 64 rays, nearest road segment per ray.
-        // obs layout: [lidar_dist x 64][lidar_type x 64]
-        int lidar_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
-        bf16* lidar_dist = obs + lidar_base;
-
-        float min_dist_sq[NUM_LIDAR_RAYS];
-        for (int r = 0; r < NUM_LIDAR_RAYS; r++)
-            min_dist_sq[r] = MAX_LIDAR_DIST * MAX_LIDAR_DIST;
+        // Road observations - SoA layout: all x_obs, then all y_obs, etc.
+        // Base offset into obs for road section (after ego + partner features)
+        int road_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+        bf16* ro_x = obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_y = obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_l = obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_w = obs + road_base + 3 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_c = obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_s = obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        bf16* ro_t = obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        memset(ro_x, 0, ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS * sizeof(bf16));
 
         int grid_idx = getGridIndex(env, ego->x, ego->y);
+        int list_size = 0;
+        int geom_base = 0;
         if (grid_idx >= 0) {
             int base_index = env->neighbor_cache_indices[grid_idx];
             int end_index  = env->neighbor_cache_indices[grid_idx + 1];
-            int list_size  = (end_index - base_index) / 2;
-            int geom_base  = base_index / 2;
-
-            // Reuse the pre-baked geom_mid_x/y (SoA) and geom_type arrays.
-            // SIMD: compute ego-relative transform + fast atan2 for 8 segments at once.
-            const float RAY_SCALE = NUM_LIDAR_RAYS / (2.0f * 3.14159265f);
-            __m256 vcos_h  = _mm256_set1_ps(cos_h);
-            __m256 vsin_h  = _mm256_set1_ps(sin_h);
-            __m256 vego_x  = _mm256_set1_ps(ego->x);
-            __m256 vego_y  = _mm256_set1_ps(ego->y);
-            __m256 VSCALE  = _mm256_set1_ps(RAY_SCALE);
-            __m256 VEPS    = _mm256_set1_ps(1e-7f);
-            __m256 VHPI    = _mm256_set1_ps(1.57079632f);
-            __m256 VPI     = _mm256_set1_ps(3.14159265f);
-            __m256 V2PI    = _mm256_set1_ps(6.28318530f);
-            __m256 VSIGN   = _mm256_set1_ps(-0.0f);
-            __m256i VMAXR  = _mm256_set1_epi32(NUM_LIDAR_RAYS - 1);
-
-            int simd_end = list_size & ~7;
-            for (int k = 0; k < simd_end; k += 8) {
-                int base = geom_base + k;
-
-                // Ego-relative position (same transform as before)
-                __m256 mx = _mm256_loadu_ps(&env->geom_mid_x[base]);
-                __m256 my = _mm256_loadu_ps(&env->geom_mid_y[base]);
-                __m256 rx = _mm256_sub_ps(mx, vego_x);
-                __m256 ry = _mm256_sub_ps(my, vego_y);
-                __m256 ex = _mm256_fmadd_ps(rx, vcos_h, _mm256_mul_ps(ry, vsin_h));
-                __m256 ey = _mm256_fmsub_ps(ry, vcos_h, _mm256_mul_ps(rx, vsin_h));
-
-                // Squared distance (defer sqrt to output)
-                __m256 dist_sq = _mm256_fmadd_ps(ex, ex, _mm256_mul_ps(ey, ey));
-
-                // Fast atan2 in [0, 2pi): polynomial on min/max ratio, then octant fixup
-                __m256 ax = _mm256_andnot_ps(VSIGN, ex);
-                __m256 ay = _mm256_andnot_ps(VSIGN, ey);
-                __m256 mx2 = _mm256_max_ps(ax, ay);
-                __m256 mn  = _mm256_min_ps(ax, ay);
-                __m256 t   = _mm256_div_ps(mn, _mm256_add_ps(mx2, VEPS));
-                __m256 t2  = _mm256_mul_ps(t, t);
-                __m256 r   = _mm256_fmadd_ps(_mm256_set1_ps(-0.0443289900f), t2, _mm256_set1_ps(0.1555786518f));
-                r = _mm256_fmadd_ps(r, t2, _mm256_set1_ps(-0.3258083975f));
-                r = _mm256_fmadd_ps(r, t2, _mm256_set1_ps(0.9997878412f));
-                r = _mm256_mul_ps(r, t);
-                r = _mm256_blendv_ps(r, _mm256_sub_ps(VHPI, r),
-                    _mm256_cmp_ps(ay, ax, _CMP_GT_OQ));           // octant: swap if ay>ax
-                r = _mm256_blendv_ps(r, _mm256_sub_ps(VPI, r),
-                    _mm256_cmp_ps(ex, _mm256_setzero_ps(), _CMP_LT_OQ));  // x<0: pi-r
-                r = _mm256_blendv_ps(r, _mm256_sub_ps(V2PI, r),
-                    _mm256_cmp_ps(ey, _mm256_setzero_ps(), _CMP_LT_OQ));  // y<0: 2pi-r
-
-                // Convert to ray bin index [0, NUM_LIDAR_RAYS)
-                __m256i bins = _mm256_cvttps_epi32(_mm256_mul_ps(r, VSCALE));
-                bins = _mm256_min_epi32(_mm256_max_epi32(bins, _mm256_setzero_si256()), VMAXR);
-
-                // Scatter: update per-ray minimum distance (can't vectorize scatter)
-                float ds[8]; _mm256_storeu_ps(ds, dist_sq);
-                int   bs[8]; _mm256_storeu_si256((__m256i*)bs, bins);
-                for (int lane = 0; lane < 8; lane++) {
-                    if ((int)env->geom_type[base + lane] != ROAD_EDGE - ROAD_LANE) continue;
-                    int b = bs[lane];
-                    if (ds[lane] < min_dist_sq[b])
-                        min_dist_sq[b] = ds[lane];
-                }
-            }
-
-            // Scalar tail
-            for (int k = simd_end; k < list_size; k++) {
-                int base = geom_base + k;
-                if ((int)env->geom_type[base] != ROAD_EDGE - ROAD_LANE) continue;
-                float rx_ = env->geom_mid_x[base] - ego->x;
-                float ry_ = env->geom_mid_y[base] - ego->y;
-                float ex_ = rx_ * cos_h + ry_ * sin_h;
-                float ey_ = ry_ * cos_h - rx_ * sin_h;
-                float ds  = ex_*ex_ + ey_*ey_;
-                int b = (int)(fast_atan2_lidar(ey_, ex_) * RAY_SCALE);
-                if (b >= NUM_LIDAR_RAYS) b = NUM_LIDAR_RAYS - 1;
-                if (ds < min_dist_sq[b])
-                    min_dist_sq[b] = ds;
-            }
+            list_size = (end_index - base_index) / 2;
+            if (list_size > MAX_ROAD_SEGMENT_OBSERVATIONS) list_size = MAX_ROAD_SEGMENT_OBSERVATIONS;
+            geom_base = base_index / 2;
         }
 
-        // Write to obs: normalize distance to [0, 1]
-        float inv_max = 1.0f / MAX_LIDAR_DIST;
-        for (int r = 0; r < NUM_LIDAR_RAYS; r++) {
-            float d = sqrtf(min_dist_sq[r]) * inv_max;
-            lidar_dist[r] = f32_to_bf16(d < 1.0f ? d : 1.0f);
+        __m256 vcos_h     = _mm256_set1_ps(cos_h);
+        __m256 vsin_h     = _mm256_set1_ps(sin_h);
+        __m256 vego_x     = _mm256_set1_ps(ego->x);
+        __m256 vego_y     = _mm256_set1_ps(ego->y);
+        __m256 vpos_scale = _mm256_set1_ps(OBS_POSITION_SCALE);
+        __m256 vlen_scale = _mm256_set1_ps(1.0f / MAX_ROAD_SEGMENT_LENGTH);
+        __m256 vwidth     = _mm256_set1_ps(0.1f / MAX_ROAD_SCALE);
+
+        int k = 0;
+        int simd_end = list_size & ~7;
+        for (; k < simd_end; k += 8) {
+            int base = geom_base + k;
+            __m256 mx = _mm256_loadu_ps(&env->geom_mid_x[base]);
+            __m256 my = _mm256_loadu_ps(&env->geom_mid_y[base]);
+            __m256 ca = _mm256_loadu_ps(&env->geom_cos_angle[base]);
+            __m256 sa = _mm256_loadu_ps(&env->geom_sin_angle[base]);
+            __m256 hl = _mm256_loadu_ps(&env->geom_half_length[base]);
+            __m256 ty = _mm256_loadu_ps(&env->geom_type[base]);
+
+            __m256 rx    = _mm256_sub_ps(mx, vego_x);
+            __m256 ry    = _mm256_sub_ps(my, vego_y);
+            __m256 x_obs = _mm256_fmadd_ps(rx, vcos_h, _mm256_mul_ps(ry, vsin_h));
+            __m256 y_obs = _mm256_fmsub_ps(ry, vcos_h, _mm256_mul_ps(rx, vsin_h));
+            __m256 cos_r = _mm256_fmadd_ps(ca, vcos_h, _mm256_mul_ps(sa, vsin_h));
+            __m256 sin_r = _mm256_fmsub_ps(sa, vcos_h, _mm256_mul_ps(ca, vsin_h));
+
+            store_f32x8_as_bf16(&ro_x[k], _mm256_mul_ps(x_obs, vpos_scale));
+            store_f32x8_as_bf16(&ro_y[k], _mm256_mul_ps(y_obs, vpos_scale));
+            store_f32x8_as_bf16(&ro_l[k], _mm256_mul_ps(hl, vlen_scale));
+            store_f32x8_as_bf16(&ro_w[k], vwidth);
+            store_f32x8_as_bf16(&ro_c[k], cos_r);
+            store_f32x8_as_bf16(&ro_s[k], sin_r);
+            store_f32x8_as_bf16(&ro_t[k], ty);
+        }
+        for (; k < list_size; k++) {
+            int base = geom_base + k;
+            float rel_x = env->geom_mid_x[base] - ego->x;
+            float rel_y = env->geom_mid_y[base] - ego->y;
+            ro_x[k] = f32_to_bf16((rel_x * cos_h + rel_y * sin_h) * OBS_POSITION_SCALE);
+            ro_y[k] = f32_to_bf16((rel_y * cos_h - rel_x * sin_h) * OBS_POSITION_SCALE);
+            ro_l[k] = f32_to_bf16(env->geom_half_length[base] / MAX_ROAD_SEGMENT_LENGTH);
+            ro_w[k] = f32_to_bf16(0.1f / MAX_ROAD_SCALE);
+            ro_c[k] = f32_to_bf16(env->geom_cos_angle[base] * cos_h + env->geom_sin_angle[base] * sin_h);
+            ro_s[k] = f32_to_bf16(env->geom_sin_angle[base] * cos_h - env->geom_cos_angle[base] * sin_h);
+            ro_t[k] = f32_to_bf16(env->geom_type[base]);
         }
     }
 }
@@ -1564,18 +1519,32 @@ void draw_agent_obs(Drive* env, int agent_index) {
         obs_idx += PARTNER_FEATURES;
     }
 
-    // Draw lidar rays from obs buffer
-    int lidar_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
-    float* ld = agent_obs + lidar_base;
-    float angle_step = 2.0f * 3.14159265f / NUM_LIDAR_RAYS;
-    for (int r = 0; r < NUM_LIDAR_RAYS; r++) {
-        float dist = ld[r] * MAX_LIDAR_DIST;
-        if (dist >= MAX_LIDAR_DIST * 0.99f) continue;
-        float angle = r * angle_step;
-        float rx = dist * cosf(angle);
-        float ry = dist * sinf(angle);
-        DrawLine3D((Vector3){0, 0, 0}, (Vector3){rx, ry, 1}, PUFF_CYAN);
-        DrawCube((Vector3){rx, ry, 1}, 0.5f, 0.5f, 0.5f, PUFF_CYAN);
+    // Draw road edge observations (SoA layout)
+    int road_base = EGO_FEATURES + PARTNER_FEATURES * (MAX_AGENTS - 1);
+    float* ro_x = agent_obs + road_base + 0 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_y = agent_obs + road_base + 1 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_l = agent_obs + road_base + 2 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_c = agent_obs + road_base + 4 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_s = agent_obs + road_base + 5 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    float* ro_t = agent_obs + road_base + 6 * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {
+        if (ro_x[k] == 0 && ro_y[k] == 0) continue;
+        int entity_type = (int)ro_t[k];
+        if (entity_type + ROAD_LANE != ROAD_EDGE) continue;
+
+        float x_mid = ro_x[k] / OBS_POSITION_SCALE;
+        float y_mid = ro_y[k] / OBS_POSITION_SCALE;
+        float rel_angle = atan2f(ro_s[k], ro_c[k]);
+        float seg_len = ro_l[k] * MAX_ROAD_SEGMENT_LENGTH;
+
+        float x_start = x_mid - seg_len * cosf(rel_angle);
+        float y_start = y_mid - seg_len * sinf(rel_angle);
+        float x_end = x_mid + seg_len * cosf(rel_angle);
+        float y_end = y_mid + seg_len * sinf(rel_angle);
+
+        DrawLine3D((Vector3){0, 0, 0}, (Vector3){x_mid, y_mid, 1}, PUFF_CYAN);
+        DrawCube((Vector3){x_mid, y_mid, 1}, 0.5f, 0.5f, 0.5f, PUFF_CYAN);
+        DrawLine3D((Vector3){x_start, y_start, 1}, (Vector3){x_end, y_end, 1}, BLUE);
     }
 }
 
