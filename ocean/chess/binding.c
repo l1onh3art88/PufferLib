@@ -91,14 +91,17 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         }
     }
 
-    int num_envs = total_agents;
+    int mode = (int)dict_get(env_kwargs, "mode")->value;
+    int agents_per_env = (mode == CHESS_MODE_SELFPLAY) ? 2 : 1;
+    int num_envs = total_agents / agents_per_env;
     Env* envs = (Env*)calloc(num_envs, sizeof(Env));
     for (int i = 0; i < num_envs; i++) {
         Env* env = &envs[i];
         apply_kwargs(env, env_kwargs);
-        env->num_agents = 1;
+        env->num_agents = agents_per_env;
         env->rng = i;
-        env->learner_color = i % 2;
+        // In selfplay, slot 0 is always WHITE and slot 1 is always BLACK; learner_color is unused.
+        env->learner_color = (agents_per_env == 1) ? (i % 2) : CHESS_WHITE;
         env->fen_curriculum = SHARED_FEN_CURRICULUM;
         env->num_fens = SHARED_NUM_FENS;
         init_bitboards();
@@ -109,7 +112,7 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     buffer_env_starts[0] = 0;
     buffer_env_counts[0] = 0;
     for (int i = 0; i < num_envs; i++) {
-        buf_agents += 1;
+        buf_agents += agents_per_env;
         buffer_env_counts[buf]++;
         if (buf_agents >= agents_per_buffer && buf < num_buffers - 1) {
             buf++;
@@ -136,7 +139,8 @@ void my_vec_close(Env* envs) {
 
 void my_init(Env* env, Dict* kwargs) {
     apply_kwargs(env, kwargs);
-    env->num_agents = 1;
+    env->num_agents = (env->mode == CHESS_MODE_SELFPLAY) ? 2 : 1;
+    env->learner_color = (env->num_agents == 1) ? CHESS_WHITE : CHESS_WHITE;
     env->fen_curriculum = NULL;
     env->num_fens = 0;
     init_bitboards();
