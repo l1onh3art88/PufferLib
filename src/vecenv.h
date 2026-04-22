@@ -82,14 +82,17 @@ typedef struct StaticVec {
     float* actions;
     float* rewards;
     float* terminals;
+    unsigned char* action_mask;  // NULL unless env defines MY_ACTION_MASK
     void* gpu_observations;
     float* gpu_actions;
     float* gpu_rewards;
     float* gpu_terminals;
+    unsigned char* gpu_action_mask;  // NULL unless env defines MY_ACTION_MASK
     cudaStream_t* streams;
     StaticThreading* threading;
     int obs_size;
     int num_atns;
+    int action_mask_size;        // 0 unless env defines MY_ACTION_MASK
     int gpu;
 } StaticVec;
 
@@ -286,6 +289,13 @@ static void* static_omp_threadmanager(void* arg) {
                 &vec->terminals[agent_start],
                 agents_per_buffer * sizeof(float),
                 cudaMemcpyHostToDevice, stream);
+#ifdef MY_ACTION_MASK
+            cudaMemcpyAsync(
+                vec->gpu_action_mask + agent_start * MY_ACTION_MASK,
+                vec->action_mask     + agent_start * MY_ACTION_MASK,
+                agents_per_buffer * MY_ACTION_MASK * sizeof(unsigned char),
+                cudaMemcpyHostToDevice, stream);
+#endif
         }
         cudaStreamSynchronize(stream);
         atomic_store(&buffer_states[buf], OMP_WAITING);
@@ -414,6 +424,23 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         vec->gpu_terminals = vec->terminals;
     }
 
+#ifdef MY_ACTION_MASK
+    vec->action_mask_size = MY_ACTION_MASK;
+    size_t mask_bytes = (size_t)total_agents * MY_ACTION_MASK * sizeof(unsigned char);
+    if (gpu) {
+        cudaHostAlloc((void**)&vec->action_mask, mask_bytes, cudaHostAllocPortable);
+        cudaMalloc((void**)&vec->gpu_action_mask, mask_bytes);
+        cudaMemset(vec->gpu_action_mask, 0, mask_bytes);
+    } else {
+        vec->action_mask = (unsigned char*)calloc(total_agents * MY_ACTION_MASK, sizeof(unsigned char));
+        vec->gpu_action_mask = vec->action_mask;
+    }
+#else
+    vec->action_mask = NULL;
+    vec->gpu_action_mask = NULL;
+    vec->action_mask_size = 0;
+#endif
+
     // Streams allocated here, created in create_static_threads
     vec->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
 
@@ -432,6 +459,9 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
             env->actions = vec->actions + slot * NUM_ATNS;
             env->rewards = vec->rewards + slot;
             env->terminals = vec->terminals + slot;
+#ifdef MY_ACTION_MASK
+            env->action_mask = vec->action_mask + slot * MY_ACTION_MASK;
+#endif
             buf_agent += env->num_agents;
         }
     }
@@ -449,6 +479,11 @@ void static_vec_reset(StaticVec* vec) {
             vec->total_agents * OBS_SIZE * obs_element_size(), cudaMemcpyHostToDevice);
         cudaMemset(vec->gpu_rewards,   0, vec->total_agents * sizeof(float));
         cudaMemset(vec->gpu_terminals, 0, vec->total_agents * sizeof(float));
+#ifdef MY_ACTION_MASK
+        cudaMemcpy(vec->gpu_action_mask, vec->action_mask,
+            (size_t)vec->total_agents * MY_ACTION_MASK * sizeof(unsigned char),
+            cudaMemcpyHostToDevice);
+#endif
         cudaDeviceSynchronize();
     } else {
         memset(vec->rewards, 0, vec->total_agents * sizeof(float));
@@ -516,11 +551,18 @@ void static_vec_close(StaticVec* vec) {
         cudaFreeHost(vec->actions);
         cudaFreeHost(vec->rewards);
         cudaFreeHost(vec->terminals);
+#ifdef MY_ACTION_MASK
+        cudaFree(vec->gpu_action_mask);
+        cudaFreeHost(vec->action_mask);
+#endif
     } else {
         free(vec->observations);
         free(vec->actions);
         free(vec->rewards);
         free(vec->terminals);
+#ifdef MY_ACTION_MASK
+        free(vec->action_mask);
+#endif
     }
 
     free(vec->streams);
