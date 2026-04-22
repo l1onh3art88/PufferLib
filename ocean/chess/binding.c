@@ -11,7 +11,7 @@
 #include "vecenv.h"
 
 #define DEFAULT_STARTING_FEN "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-#define FEN_CURRICULUM_PATH "ocean/chess/fens.txt"
+#define FEN_CURRICULUM_PATH "resources/chess/fens.txt"
 
 static char** SHARED_FEN_CURRICULUM = NULL;
 static int SHARED_NUM_FENS = 0;
