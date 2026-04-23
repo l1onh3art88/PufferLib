@@ -485,7 +485,7 @@ __global__ void sample_logits(
 
             // Step 4: Multinomial sampling using inverse CDF
             float cumsum = 0.0f;
-            int sampled_action = A - 1;  // default to last action
+            int sampled_action = -1;  // sentinel: no action chosen yet
 
             for (int a = 0; a < A; ++a) {
                 float l = masked_logit(logits, logits_base, logits_offset, a, action_mask, mask_base);
@@ -494,6 +494,19 @@ __global__ void sample_logits(
                 if (rand_val < cumsum) {
                     sampled_action = a;
                     break;
+                }
+            }
+
+            // Float rounding can leave cumsum < 1.0; fall back to the last legal action.
+            if (sampled_action < 0) {
+                sampled_action = A - 1;
+                if (action_mask != nullptr) {
+                    for (int a = A - 1; a >= 0; --a) {
+                        if (to_float(action_mask[mask_base + logits_offset + a]) != 0.0f) {
+                            sampled_action = a;
+                            break;
+                        }
+                    }
                 }
             }
 
