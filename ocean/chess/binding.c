@@ -7,8 +7,21 @@
 
 #define MY_VEC_INIT
 #define MY_VEC_CLOSE
+#define MY_USES_PERM
 #define Env Chess
 #include "vecenv.h"
+
+void my_setup_perm(StaticVec* vec, Env* env, int slot_base) {
+    size_t obs_elem_size = obs_element_size();
+    for (int s = 0; s < env->num_agents; s++) {
+        int phys = vec->agent_perm ? vec->agent_perm[slot_base + s] : (slot_base + s);
+        env->obs_ptr[s]         = (uint8_t*)vec->observations + (size_t)phys * OBS_SIZE * obs_elem_size;
+        env->action_mask_ptr[s] = vec->action_mask + (size_t)phys * MY_ACTION_MASK;
+        env->action_ptr[s]      = vec->actions + (size_t)phys * NUM_ATNS;
+        env->reward_ptr[s]      = vec->rewards + phys;
+        env->terminal_ptr[s]    = vec->terminals + phys;
+    }
+}
 
 #define DEFAULT_STARTING_FEN "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 #define FEN_CURRICULUM_PATH "resources/chess/fens.txt"
@@ -100,8 +113,16 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
         apply_kwargs(env, env_kwargs);
         env->num_agents = agents_per_env;
         env->rng = i;
-        // In selfplay, slot 0 is always WHITE and slot 1 is always BLACK; learner_color is unused.
+        // In selfplay, learner_color is unused; the slot↔color mapping is per-env
+        // randomized so policies in fixed slots see both colors equally.
         env->learner_color = (agents_per_env == 1) ? (i % 2) : CHESS_WHITE;
+        if (agents_per_env == 2 && (i & 1)) {
+            env->slot_for_color[CHESS_WHITE] = 1;
+            env->slot_for_color[CHESS_BLACK] = 0;
+        } else {
+            env->slot_for_color[CHESS_WHITE] = 0;
+            env->slot_for_color[CHESS_BLACK] = 1;
+        }
         env->fen_curriculum = SHARED_FEN_CURRICULUM;
         env->num_fens = SHARED_NUM_FENS;
         init_bitboards();
@@ -141,6 +162,8 @@ void my_init(Env* env, Dict* kwargs) {
     apply_kwargs(env, kwargs);
     env->num_agents = (env->mode == CHESS_MODE_SELFPLAY) ? 2 : 1;
     env->learner_color = (env->num_agents == 1) ? CHESS_WHITE : CHESS_WHITE;
+    env->slot_for_color[CHESS_WHITE] = 0;
+    env->slot_for_color[CHESS_BLACK] = 1;
     env->fen_curriculum = NULL;
     env->num_fens = 0;
     init_bitboards();
@@ -155,4 +178,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "episode_length", log->episode_length);
     dict_set(out, "episode_return", log->episode_return);
     dict_set(out, "invalid_action_rate", log->invalid_action_rate);
+    dict_set(out, "slot_0_score", log->slot_0_score);
+    dict_set(out, "slot_1_score", log->slot_1_score);
 }

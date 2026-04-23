@@ -94,6 +94,9 @@ typedef struct StaticVec {
     int num_atns;
     int action_mask_size;        // 0 unless env defines MY_ACTION_MASK
     int gpu;
+    // Optional permutation: agent_perm[slot] = physical agent index in global buffers.
+    // NULL = identity (current behavior). Only valid when env defines MY_USES_PERM.
+    int* agent_perm;
 } StaticVec;
 
 // Callback types
@@ -132,6 +135,11 @@ size_t get_obs_elem_size(void);
 void static_vec_step(StaticVec* vec);
 void gpu_vec_step(StaticVec* vec);
 void cpu_vec_step(StaticVec* vec);
+
+// Optional permutation. Sets agent_perm and re-populates env per-slot pointers
+// via my_setup_perm. Only defined when env opted in via MY_USES_PERM; otherwise
+// emits an error and leaves the perm unset.
+void static_vec_set_perm(StaticVec* vec, const int* perm);
 
 // Optional shared state functions
 void* my_shared(void* env, Dict* kwargs);
@@ -194,6 +202,13 @@ extern const char* cudaGetErrorString(cudaError_t);
 // Forward declare env-provided functions (defined in binding.c after this include)
 void my_init(Env* env, Dict* kwargs);
 void my_log(Log* log, Dict* out);
+
+#ifdef MY_USES_PERM
+// Env-provided: populate per-slot pointer arrays on env, given the global slot
+// base for slot 0. Reads vec->agent_perm (NULL = identity) to compute physical
+// indices into vec global buffers.
+void my_setup_perm(StaticVec* vec, Env* env, int slot_base);
+#endif
 
 
 struct StaticThreading {
@@ -462,11 +477,43 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
 #ifdef MY_ACTION_MASK
             env->action_mask = vec->action_mask + slot * MY_ACTION_MASK;
 #endif
+#ifdef MY_USES_PERM
+            // Populate per-slot pointer arrays. agent_perm is NULL here (identity),
+            // so slots map to the same adjacent layout as the base+stride pointers.
+            my_setup_perm(vec, env, slot);
+#endif
             buf_agent += env->num_agents;
         }
     }
 
     return vec;
+}
+
+void static_vec_set_perm(StaticVec* vec, const int* perm) {
+#ifndef MY_USES_PERM
+    (void)vec; (void)perm;
+    fprintf(stderr, "static_vec_set_perm: env did not opt in via MY_USES_PERM; ignoring.\n");
+    return;
+#else
+    int N = vec->total_agents;
+    if (vec->agent_perm == NULL) {
+        vec->agent_perm = (int*)malloc(N * sizeof(int));
+    }
+    memcpy(vec->agent_perm, perm, N * sizeof(int));
+
+    Env* envs = (Env*)vec->envs;
+    for (int buf = 0; buf < vec->buffers; buf++) {
+        int buf_start = buf * vec->agents_per_buffer;
+        int buf_agent = 0;
+        int env_start = vec->buffer_env_starts[buf];
+        int env_count = vec->buffer_env_counts[buf];
+        for (int e = 0; e < env_count; e++) {
+            Env* env = &envs[env_start + e];
+            my_setup_perm(vec, env, buf_start + buf_agent);
+            buf_agent += env->num_agents;
+        }
+    }
+#endif
 }
 
 void static_vec_reset(StaticVec* vec) {
@@ -566,6 +613,7 @@ void static_vec_close(StaticVec* vec) {
     }
 
     free(vec->streams);
+    if (vec->agent_perm != NULL) free(vec->agent_perm);
     free(vec);
 }
 

@@ -434,10 +434,87 @@ def eval(env_name, args=None, load_path=None):
 
     backend.close(pufferl)
 
+def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, verbose=True):
+    '''Head-to-head match between two trained policies in a 2-agent selfplay env.
+    Policy A plays slot 0 (e.g. white in chess), policy B plays slot 1 (black).
+    Both checkpoints must come from the same env / arch.
+    '''
+    args = args or load_config(env_name)
+    args['reset_state'] = False
+    args['train']['horizon'] = 1
+    backend = _resolve_backend(args)
+    if backend is not _C:
+        raise RuntimeError('match() requires the native CUDA backend')
+
+    def _resolve_latest(path):
+        if path != 'latest':
+            return path
+        pattern = os.path.join(args['checkpoint_dir'], args['env_name'], '**', '*.bin')
+        candidates = glob.glob(pattern, recursive=True)
+        if not candidates:
+            raise FileNotFoundError(f'No .bin checkpoints found in {args["checkpoint_dir"]}/{args["env_name"]}/')
+        return max(candidates, key=os.path.getctime)
+    policy_a_path = _resolve_latest(policy_a_path)
+    policy_b_path = _resolve_latest(policy_b_path)
+
+    total_agents = int(args['vec']['total_agents'])
+    num_buffers = int(args['vec']['num_buffers'])
+    agents_per_buffer = total_agents // num_buffers
+    half = agents_per_buffer // 2
+    if 2 * half != agents_per_buffer:
+        raise RuntimeError(f'agents_per_buffer ({agents_per_buffer}) must be even for 2-agent selfplay')
+
+    # Primary holds policy A (owns first half of each buffer); one frozen bank
+    # holds policy B (owns second half). Bank is created inside create_pufferl
+    # before cudagraph capture so the graph bakes in its pointers; weight loads
+    # later only update data.
+    args['vec']['num_frozen_banks'] = 1
+    args['vec']['frozen_bank_pct'] = 0.5
+
+    pufferl = backend.create_pufferl(args)
+
+    # Per-buffer perm: each env's slot 0 lands in primary's slice [0, half),
+    # slot 1 lands in frozen bank's slice [half, agents_per_buffer). The env
+    # side randomizes slot<->color per env, so A and B each play both colors.
+    perm = np.empty(total_agents, dtype=np.int32)
+    envs_per_buffer = half
+    for b in range(num_buffers):
+        off = b * agents_per_buffer
+        for i in range(envs_per_buffer):
+            perm[off + 2*i]     = off + i
+            perm[off + 2*i + 1] = off + half + i
+    backend.set_agent_perm(pufferl, perm)
+
+    backend.load_weights(pufferl, policy_a_path)
+    backend.load_frozen_bank(pufferl, 0, policy_b_path)
+
+    logs = {}
+    while True:
+        backend.rollouts(pufferl)
+        logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
+        n = int(logs.get('env/n', 0))
+        if verbose:
+            a = logs.get('env/slot_0_score', 0.0)
+            b = logs.get('env/slot_1_score', 0.0)
+            draws = logs.get('env/draw_rate', 0.0)
+            print(f'\rgames={n}/{num_games}  A={a:.3f}  B={b:.3f}  draw={draws:.3f}', end='')
+        if n >= num_games:
+            break
+
+    if verbose:
+        print()
+
+    backend.close(pufferl)
+    return logs
+
 def load_config(env_name):
     parser = argparse.ArgumentParser(formatter_class=RichHelpFormatter, add_help=False)
     parser.add_argument('--load-model-path', type=str, default=None,
         help='Path to a pretrained checkpoint')
+    parser.add_argument('--load-enemy-model-path', type=str, default=None,
+        help='Path to opponent checkpoint for `puffer match` (slot 1 / black in chess)')
+    parser.add_argument('--num-games', type=int, default=4096,
+        help='Number of games to play in `puffer match`')
     parser.add_argument('--load-id', type=str,
         default=None, help='Kickstart/eval from from a finished Wandbrun')
     parser.add_argument('--render-mode', type=str, default='auto',
@@ -503,7 +580,7 @@ def load_config(env_name):
     return dict(args)
 
 def main():
-    err = 'Usage: puffer [train, eval, sweep, paretosweep] [env_name] [optional args]. --help for more info'
+    err = 'Usage: puffer [train, eval, sweep, paretosweep, match] [env_name] [optional args]. --help for more info'
     if len(sys.argv) < 3:
         raise ValueError(err)
 
@@ -517,6 +594,13 @@ def main():
         eval(env_name=env_name, args=args)
     elif 'sweep' in mode:
         sweep(env_name=env_name, args=args, pareto='pareto' in mode)
+    elif 'match' in mode:
+        a_path = args.get('load_model_path')
+        b_path = args.get('load_enemy_model_path')
+        if not a_path or not b_path:
+            raise ValueError('puffer match requires --load-model-path and --load-enemy-model-path')
+        match(env_name=env_name, policy_a_path=a_path, policy_b_path=b_path,
+            num_games=args.get('num_games', 4096), args=args)
     else:
         raise ValueError(err)
 

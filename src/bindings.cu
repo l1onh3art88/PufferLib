@@ -2,6 +2,7 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
 #include "pufferlib.cu"
 
 #define _PUFFER_STRINGIFY(x) #x
@@ -134,10 +135,17 @@ void rollouts(pybind11::object pufferl_obj) {
     pybind11::gil_scoped_release no_gil;
     double t0 = wall_clock();
 
-    // Zero state buffers
+    // Zero state buffers (primary + every frozen bank, so all banks see fresh
+    // state symmetrically — otherwise frozen banks accumulate indefinitely while
+    // primary resets, giving primary an unfair in-distribution advantage).
     if (pufferl.hypers.reset_state) {
         for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
             puf_zero(&pufferl.buffer_states[i], pufferl.default_stream);
+        }
+        for (int b = 0; b < pufferl.num_frozen_banks; b++) {
+            for (int i = 0; i < pufferl.hypers.num_buffers; i++) {
+                puf_zero(&pufferl.frozen_banks[b].buffer_states[i], pufferl.default_stream);
+            }
         }
     }
 
@@ -205,6 +213,26 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
+}
+
+int py_add_frozen_bank(py::object pufferl_obj, int slice_size) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    return pufferl_add_frozen_bank(&pufferl, slice_size);
+}
+
+void py_load_frozen_bank(py::object pufferl_obj, int bank_idx, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    pufferl_load_frozen_bank(&pufferl, bank_idx, path.c_str());
+}
+
+void py_set_agent_perm(py::object pufferl_obj, py::array_t<int> perm) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto buf = perm.request();
+    if (buf.ndim != 1) throw std::runtime_error("agent_perm must be 1-D");
+    if ((int)buf.shape[0] != pufferl.vec->total_agents) {
+        throw std::runtime_error("agent_perm length must equal total_agents");
+    }
+    pufferl_set_agent_perm(&pufferl, (const int*)buf.ptr);
 }
 
 void py_puff_advantage(
@@ -465,6 +493,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("close", &puf_close);
     m.def("save_weights", &save_weights);
     m.def("load_weights", &load_weights);
+    m.def("add_frozen_bank", &py_add_frozen_bank);
+    m.def("load_frozen_bank", &py_load_frozen_bank);
+    m.def("set_agent_perm", &py_set_agent_perm);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
     py::class_<Policy>(m, "Policy");

@@ -306,6 +306,20 @@ typedef struct {
     int seed;
 } HypersT;
 
+// A frozen weight bank: same shape as the primary, but its own params buffer
+// (and per-buffer rollout states/activations). Used for match (eval) and league
+// (frozen historical opponents). Not trained; updated only via load.
+typedef struct {
+    PolicyWeights weights;
+    Allocator params_alloc;
+    Allocator acts_alloc;
+    PrecisionTensor param_puf;
+    FloatTensor master_weights;
+    PrecisionTensor* buffer_states;         // [num_buffers]
+    PolicyActivations* buffer_activations;  // [num_buffers]
+    int slice_size;  // # agents per buffer this bank owns; sets activation/state batch dim
+} WeightBank;
+
 typedef struct {
     Policy policy;
     PolicyWeights weights;       // current precision_t weights (structured)
@@ -349,6 +363,15 @@ typedef struct {
     bool train_captured;
     ulong seed;
     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
+    // Optional frozen weight banks for match / league.
+    WeightBank* frozen_banks;  // [num_frozen_banks]
+    int num_frozen_banks;
+    // Per-buffer-relative bank layout: bank_layout[b] = first agent within each
+    // buffer chunk owned by bank b. Length num_banks+1; ends at agents_per_buffer.
+    // Same shape applied to every buffer (each buffer hosts every bank), so each
+    // worker thread only writes inside its own physical chunk.
+    // Bank 0 = primary (learner). NULL = no layout set (primary owns full chunk).
+    int* bank_layout;
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -591,30 +614,63 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_n);
     }
 
-    // Policy forward pass for rollouts
-    PrecisionTensor state_puf = pufferl->buffer_states[buf];
-    PrecisionTensor dec_puf = policy_forward(&pufferl->policy, pufferl->weights, pufferl->buffer_activations[buf], obs_dst, state_puf, stream);
-
-    // Sample actions, logprobs, values into rollout buffer
-    PrecisionTensor act_slice = puf_slice(rollouts.actions, t, start, block_size);
-    PrecisionTensor lp_slice = puf_slice(rollouts.logprobs, t, start, block_size);
-    PrecisionTensor val_slice = puf_slice(rollouts.values, t, start, block_size);
-    PrecisionTensor p_logstd = {};
-    DecoderWeights* dw = (DecoderWeights*)pufferl->weights.decoder;
-    if (dw->continuous) {
-        p_logstd = dw->logstd;
-    }
-
-    sample_logits<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
-        dec_puf, p_logstd, pufferl->act_sizes_puf,
-        act_slice.data, lp_slice.data, val_slice.data,
-        pufferl->rng_states[buf],
-        mask_slice.data, mask_stride);
-
-    // Copy actions to env
+    // Per-bank policy forward + sampling. Each bank owns a contiguous sub-range
+    // [bank_layout[b], bank_layout[b+1]) within every buffer's chunk; layout is
+    // per-buffer-relative so each worker writes only inside its own chunk.
+    // Cudagraph capture absorbs the extra kernel launches.
+    int num_banks = 1 + pufferl->num_frozen_banks;
     long act_cols = env.actions.shape[1];
-    cast<<<grid_size(numel(act_slice.shape)), BLOCK_SIZE, 0, stream>>>(
-            env.actions.data + start * act_cols, act_slice.data, numel(act_slice.shape));
+    for (int b = 0; b < num_banks; b++) {
+        int bank_off = pufferl->bank_layout ? pufferl->bank_layout[b] : 0;
+        int bank_end = pufferl->bank_layout ? pufferl->bank_layout[b + 1] : block_size;
+        int bank_size = bank_end - bank_off;
+        if (bank_size == 0) continue;
+
+        PolicyWeights* w_bank;
+        PolicyActivations* a_bank;
+        PrecisionTensor* s_bank;
+        if (b == 0) {
+            w_bank = &pufferl->weights;
+            a_bank = &pufferl->buffer_activations[buf];
+            s_bank = &pufferl->buffer_states[buf];
+        } else {
+            WeightBank* fb = &pufferl->frozen_banks[b - 1];
+            w_bank = &fb->weights;
+            a_bank = &fb->buffer_activations[buf];
+            s_bank = &fb->buffer_states[buf];
+        }
+
+        int sub_start = start + bank_off;
+        PrecisionTensor obs_b   = puf_slice(rollouts.observations, t, sub_start, bank_size);
+        PrecisionTensor act_b   = puf_slice(rollouts.actions,      t, sub_start, bank_size);
+        PrecisionTensor lp_b    = puf_slice(rollouts.logprobs,     t, sub_start, bank_size);
+        PrecisionTensor val_b   = puf_slice(rollouts.values,       t, sub_start, bank_size);
+        PrecisionTensor mask_b  = {};
+        int mask_stride_b = 0;
+        if (rollouts.action_mask.data != nullptr) {
+            mask_b = puf_slice(rollouts.action_mask, t, sub_start, bank_size);
+            mask_stride_b = mask_stride;
+        }
+
+        PrecisionTensor dec_puf = policy_forward(&pufferl->policy, *w_bank, *a_bank, obs_b, *s_bank, stream);
+
+        PrecisionTensor p_logstd = {};
+        DecoderWeights* dw = (DecoderWeights*)w_bank->decoder;
+        if (dw->continuous) {
+            p_logstd = dw->logstd;
+        }
+
+        // Offset RNG by bank_off so banks don't collide on per-buffer rng slots.
+        sample_logits<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
+            dec_puf, p_logstd, pufferl->act_sizes_puf,
+            act_b.data, lp_b.data, val_b.data,
+            pufferl->rng_states[buf] + bank_off,
+            mask_b.data, mask_stride_b);
+
+        cast<<<grid_size(numel(act_b.shape)), BLOCK_SIZE, 0, stream>>>(
+                env.actions.data + (long)sub_start * act_cols,
+                act_b.data, numel(act_b.shape));
+    }
 
     if (capturing) {
         cudaGraph_t _graph;
@@ -1563,6 +1619,154 @@ void train_impl(PuffeRL& pufferl) {
 
 }
 
+// Allocate a fresh frozen WeightBank shaped like PuffeRL's primary (same Policy).
+// slice_size = how many agents per buffer this bank will own (sizes activations
+// and recurrent state). Weights are uninitialized — caller must load before use.
+static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl, int slice_size) {
+    int num_buffers = pufferl->hypers.num_buffers;
+    int hidden_size = pufferl->hypers.hidden_size;
+    int num_layers = pufferl->hypers.num_layers;
+
+    Allocator* params = &bank->params_alloc;
+    Allocator* acts = &bank->acts_alloc;
+
+    bank->slice_size = slice_size;
+    bank->weights = policy_weights_create(&pufferl->policy, params);
+    bank->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
+    bank->buffer_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
+    for (int i = 0; i < num_buffers; i++) {
+        bank->buffer_activations[i] = policy_reg_rollout(&pufferl->policy, bank->weights, acts, slice_size);
+        bank->buffer_states[i] = {.shape = {num_layers, slice_size, hidden_size}};
+        alloc_register(acts, &bank->buffer_states[i]);
+    }
+
+    alloc_create(params);
+    alloc_create(acts);
+
+    bank->param_puf = {.data = (precision_t*)params->mem, .shape = {params->total_elems}};
+    if (USE_BF16) {
+        bank->master_weights = {.shape = {params->total_elems}};
+        cudaMalloc(&bank->master_weights.data, params->total_elems * sizeof(float));
+    } else {
+        bank->master_weights = {.data = (float*)bank->param_puf.data, .shape = {params->total_elems}};
+    }
+}
+
+// Mirror of weight_bank_create_for_pufferl. Frees the bank's weights, per-buffer
+// activations, allocators, and master_weights (BF16 only). Does not free the
+// WeightBank struct itself — caller owns that.
+static void weight_bank_destroy(WeightBank* bank, PuffeRL* pufferl) {
+    int num_buffers = pufferl->hypers.num_buffers;
+    policy_weights_free(&pufferl->policy, &bank->weights);
+    if (bank->buffer_activations != NULL) {
+        for (int i = 0; i < num_buffers; i++) {
+            policy_activations_free(&pufferl->policy, bank->buffer_activations[i]);
+        }
+        free(bank->buffer_activations);
+    }
+    free(bank->buffer_states);
+    alloc_free(&bank->params_alloc);
+    alloc_free(&bank->acts_alloc);
+    if (USE_BF16 && bank->master_weights.data != NULL) {
+        cudaFree(bank->master_weights.data);
+    }
+}
+
+// Append a fresh frozen bank with the given per-buffer slice size; returns its
+// index. Rebuilds bank_layout sequentially (primary first, then frozen banks in
+// add order). Must be called BEFORE cudagraph capture (pointers get baked in).
+extern "C" int pufferl_add_frozen_bank(PuffeRL* pufferl, int slice_size) {
+    int idx = pufferl->num_frozen_banks;
+    pufferl->frozen_banks = (WeightBank*)realloc(
+        pufferl->frozen_banks, (idx + 1) * sizeof(WeightBank));
+    memset(&pufferl->frozen_banks[idx], 0, sizeof(WeightBank));
+    weight_bank_create_for_pufferl(&pufferl->frozen_banks[idx], pufferl, slice_size);
+    pufferl->num_frozen_banks++;
+
+    // Rebuild sequential layout from declared slice_sizes.
+    int agents_per_buffer = pufferl->vec->total_agents / pufferl->hypers.num_buffers;
+    int frozen_total = 0;
+    for (int b = 0; b < pufferl->num_frozen_banks; b++) {
+        frozen_total += pufferl->frozen_banks[b].slice_size;
+    }
+    if (frozen_total > agents_per_buffer) {
+        fprintf(stderr, "pufferl_add_frozen_bank: total frozen slice (%d) exceeds "
+            "agents_per_buffer (%d)\n", frozen_total, agents_per_buffer);
+    }
+    int num_banks = 1 + pufferl->num_frozen_banks;
+    pufferl->bank_layout = (int*)realloc(pufferl->bank_layout, (num_banks + 1) * sizeof(int));
+    pufferl->bank_layout[0] = 0;
+    pufferl->bank_layout[1] = agents_per_buffer - frozen_total;  // primary
+    int cumul = pufferl->bank_layout[1];
+    for (int b = 0; b < pufferl->num_frozen_banks; b++) {
+        cumul += pufferl->frozen_banks[b].slice_size;
+        pufferl->bank_layout[2 + b] = cumul;
+    }
+    return idx;
+}
+
+// Load a frozen bank's weights from a file (same format as save_weights — flat fp32).
+// Safe to call between rollouts (in-place cudaMemcpy; cudagraphs hold the pointer,
+// not a copy of the data).
+extern "C" void pufferl_load_frozen_bank(PuffeRL* pufferl, int bank_idx, const char* path) {
+    if (bank_idx < 0 || bank_idx >= pufferl->num_frozen_banks) {
+        fprintf(stderr, "pufferl_load_frozen_bank: bank_idx %d out of range\n", bank_idx);
+        return;
+    }
+    WeightBank* bank = &pufferl->frozen_banks[bank_idx];
+    int64_t nbytes = numel(bank->master_weights.shape) * sizeof(float);
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "pufferl_load_frozen_bank: failed to open %s\n", path);
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (file_size != nbytes) {
+        fprintf(stderr, "pufferl_load_frozen_bank: size mismatch (expected %lld, got %ld)\n",
+            (long long)nbytes, file_size);
+        fclose(f);
+        return;
+    }
+    std::vector<char> buf(nbytes);
+    size_t nread = fread(buf.data(), 1, nbytes, f);
+    fclose(f);
+    if ((int64_t)nread != nbytes) {
+        fprintf(stderr, "pufferl_load_frozen_bank: short read on %s\n", path);
+        return;
+    }
+    cudaMemcpy(bank->master_weights.data, buf.data(), nbytes, cudaMemcpyHostToDevice);
+    if (USE_BF16) {
+        int n = numel(bank->param_puf.shape);
+        cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl->default_stream>>>(
+            bank->param_puf.data, bank->master_weights.data, n);
+    }
+    cudaDeviceSynchronize();
+}
+
+// Set the agent permutation. Validates that the perm respects buffer boundaries:
+// each buffer's range [buf_start, buf_start+buf_size) must map onto itself (no
+// cross-buffer writes, since each worker only owns its physical chunk).
+extern "C" void pufferl_set_agent_perm(PuffeRL* pufferl, const int* perm) {
+    int total = pufferl->vec->total_agents;
+    int num_buffers = pufferl->hypers.num_buffers;
+    int buf_size = total / num_buffers;
+    for (int b = 0; b < num_buffers; b++) {
+        int lo = b * buf_size;
+        int hi = lo + buf_size;
+        for (int i = lo; i < hi; i++) {
+            if (perm[i] < lo || perm[i] >= hi) {
+                fprintf(stderr,
+                    "pufferl_set_agent_perm: perm[%d]=%d crosses buffer %d range [%d,%d)\n",
+                    i, perm[i], b, lo, hi);
+                return;
+            }
+        }
+    }
+    static_vec_set_perm(pufferl->vec, perm);
+}
+
 std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         const std::string& env_name, Dict* vec_kwargs, Dict* env_kwargs) {
     auto pufferl = std::make_unique<PuffeRL>();
@@ -1771,6 +1975,30 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
     muon_post_create(&pufferl->muon);
 
+    // Set up frozen banks declared in vec_kwargs (num_frozen_banks +
+    // frozen_bank_pct: each bank gets floor(agents_per_buffer * pct) agents).
+    // Must happen BEFORE cudagraph capture so the graph bakes in their pointers
+    // and per-bank loop iterations.
+    DictItem* nb_item = dict_get_unsafe(vec_kwargs, "num_frozen_banks");
+    DictItem* fbp_item = dict_get_unsafe(vec_kwargs, "frozen_bank_pct");
+    int num_frozen = nb_item ? (int)nb_item->value : 0;
+    float frozen_pct = fbp_item ? (float)fbp_item->value : 0.0f;
+    if (num_frozen > 0) {
+        int agents_per_buffer = total_agents / num_buffers;
+        int frozen_size = (int)((float)agents_per_buffer * frozen_pct);  // truncates = floor for positive
+        int frozen_total = num_frozen * frozen_size;
+        if (frozen_size <= 0 || frozen_total > agents_per_buffer) {
+            fprintf(stderr, "create_pufferl: invalid frozen bank config "
+                "(num=%d, pct=%.4f -> size=%d, total=%d, agents_per_buffer=%d)\n",
+                num_frozen, frozen_pct, frozen_size, frozen_total, agents_per_buffer);
+            return nullptr;
+        }
+        // add_frozen_bank auto-builds the sequential bank_layout.
+        for (int b = 0; b < num_frozen; b++) {
+            pufferl_add_frozen_bank(pufferl.get(), frozen_size);
+        }
+    }
+
     // Cudagraph rolluts and entire training step
     if (hypers.cudagraphs >= 0) {
         pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(horizon*num_buffers, sizeof(cudaGraphExec_t));
@@ -1912,6 +2140,12 @@ void close_impl(PuffeRL& pufferl) {
     free(pufferl.buffer_activations);
     free(pufferl.fused_rollout_cudagraphs);
     free(pufferl.streams);
+
+    for (int b = 0; b < pufferl.num_frozen_banks; b++) {
+        weight_bank_destroy(&pufferl.frozen_banks[b], &pufferl);
+    }
+    free(pufferl.frozen_banks);
+    free(pufferl.bank_layout);
 
     if (pufferl.nccl_comm != nullptr) {
         ncclCommDestroy(pufferl.nccl_comm);

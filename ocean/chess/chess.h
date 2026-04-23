@@ -345,6 +345,10 @@ typedef struct {
     float episode_length;
     float episode_return;
     float invalid_action_rate;
+    // Per-slot scores (selfplay only). In match: slot 0 = primary policy A,
+    // slot 1 = frozen policy B. In selfplay training both should average ~0.5.
+    float slot_0_score;
+    float slot_1_score;
     float n;
 } Log;
 
@@ -371,6 +375,15 @@ typedef struct {
     float* rewards;
     float* terminals;
     unsigned char* action_mask;   // (97,) — NULL unless MY_ACTION_MASK is defined
+
+    // Per-slot pointers used by the env body. Identity perm = same addresses as
+    // base+stride; non-identity perm = where this slot actually lives in vec
+    // global buffers. Populated by my_setup_perm.
+    uint8_t* obs_ptr[2];
+    unsigned char* action_mask_ptr[2];
+    float* action_ptr[2];
+    float* reward_ptr[2];
+    float* terminal_ptr[2];
 
     unsigned int rng;
     int num_agents;
@@ -416,6 +429,10 @@ typedef struct {
     int enable_threefold_repetition;
     
     int learner_color;
+    // Selfplay only: slot_for_color[c] = which slot (0 or 1) plays color c.
+    // Default (slot 0 = WHITE, slot 1 = BLACK); randomized per env to remove
+    // white-bias when running matched policies in different slots.
+    int slot_for_color[2];
     int human_color;
     float white_score;
     float black_score;
@@ -1483,16 +1500,15 @@ static void rebuild_legal_state(Chess* env) {
     env->valid_from_mask[side] = from_mask;
 }
 void populate_observations(Chess* env) {
-    uint8_t* obs = env->observations;
     Position* pos = &env->pos;
-    
+
     int num_players = env->mode == CHESS_MODE_SELFPLAY ? 2 : 1;
     for (int player_iter = 0; player_iter < num_players; player_iter++) {
         int player = env->mode == CHESS_MODE_SELFPLAY ? player_iter : env->learner_color;
-        // Selfplay: slot 0 = white, slot 1 = black.
+        // Selfplay: slot ↔ color mapping is randomized per env (slot_for_color).
         // Single-agent modes: only the learner has a slot (idx 0).
-        int buffer_idx = (env->mode == CHESS_MODE_SELFPLAY) ? player_iter : 0;
-        uint8_t* player_obs = obs + (buffer_idx * OBS_SIZE);
+        int buffer_idx = (env->mode == CHESS_MODE_SELFPLAY) ? env->slot_for_color[player] : 0;
+        uint8_t* player_obs = env->obs_ptr[buffer_idx];
         memset(player_obs, 0, OBS_SIZE);
         uint8_t* board_planes = player_obs + O_BOARD;
 
@@ -1502,10 +1518,10 @@ void populate_observations(Chess* env) {
         bool fill_mask = false;
         if (env->action_mask != NULL) {
             if (env->mode == CHESS_MODE_SELFPLAY) {
-                my_mask = env->action_mask + buffer_idx * NUM_ACTIONS;
+                my_mask = env->action_mask_ptr[buffer_idx];
                 fill_mask = true;
             } else if (player == env->learner_color) {
-                my_mask = env->action_mask;
+                my_mask = env->action_mask_ptr[0];
                 fill_mask = true;
             }
         }
@@ -2008,8 +2024,8 @@ void c_step(Chess* env) {
 
     if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
             && env->show_game_end_popup) {
-        env->rewards[0] = 0.0f;
-        env->terminals[0] = 0;
+        *env->reward_ptr[0] = 0.0f;
+        *env->terminal_ptr[0] = 0;
         return;
     }
 
@@ -2033,12 +2049,14 @@ void c_step(Chess* env) {
             move_completed = 1;
         }
     } else {
-        // Selfplay slot 0 = white, slot 1 = black, so the side to move indexes its own action slot.
-        int action = (env->mode == CHESS_MODE_SELFPLAY) ? env->actions[mover_idx] : env->actions[0];
+        // Selfplay: side-to-move's action lives in whichever slot plays that color.
+        int action = (env->mode == CHESS_MODE_SELFPLAY)
+            ? *env->action_ptr[env->slot_for_color[mover_idx]]
+            : *env->action_ptr[0];
         if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
                 && env->pos.sideToMove == env->human_color) {
             action = -1;
-            env->actions[0] = -1;
+            *env->action_ptr[0] = -1;
         }
 
         mover = env->pos.sideToMove;
@@ -2046,14 +2064,14 @@ void c_step(Chess* env) {
 
         // In selfplay both players train, so charge whichever slot moved.
         // In single-agent modes, only the learner's slot exists.
-        int penalty_slot = (env->mode == CHESS_MODE_SELFPLAY) ? mover_idx
+        int penalty_slot = (env->mode == CHESS_MODE_SELFPLAY) ? env->slot_for_color[mover_idx]
                          : (mover == env->learner_color) ? 0 : -1;
 
         if (env->legal_moves.count == 0) {
             clear_player_selection(env, mover_idx);
         } else if (action < 0 || action >= PASS_ACTION) {
             if (penalty_slot >= 0) {
-                env->rewards[penalty_slot] += (env->pick_phase[mover_idx] == 0)
+                *env->reward_ptr[penalty_slot] += (env->pick_phase[mover_idx] == 0)
                     ? env->reward_invalid_piece : env->reward_invalid_move;
                 env->invalid_actions_this_episode++;
             }
@@ -2096,7 +2114,7 @@ void c_step(Chess* env) {
                 }
 
                 if (!valid_pick && penalty_slot >= 0) {
-                    env->rewards[penalty_slot] += env->reward_invalid_piece;
+                    *env->reward_ptr[penalty_slot] += env->reward_invalid_piece;
                     env->invalid_actions_this_episode++;
                 }
             } else {
@@ -2138,7 +2156,7 @@ void c_step(Chess* env) {
 
                 if (chosen_move == MOVE_NONE) {
                     if (penalty_slot >= 0) {
-                        env->rewards[penalty_slot] += env->reward_invalid_move;
+                        *env->reward_ptr[penalty_slot] += env->reward_invalid_move;
                         env->invalid_actions_this_episode++;
                     }
                     clear_player_selection(env, mover_idx);
@@ -2147,7 +2165,7 @@ void c_step(Chess* env) {
                     if (env->reward_repetition != 0.0f
                             && penalty_slot >= 0
                             && env->repetition_matches >= 1) {
-                        env->rewards[penalty_slot] += env->reward_repetition;
+                        *env->reward_ptr[penalty_slot] += env->reward_repetition;
                     }
                     move_completed = 1;
                 }
@@ -2177,18 +2195,20 @@ void c_step(Chess* env) {
     }
 
     if (game_result != 0) {
-        env->terminals[0] = 1;
+        *env->terminal_ptr[0] = 1;
         if (env->mode == CHESS_MODE_SELFPLAY) {
-            env->terminals[1] = 1;
+            *env->terminal_ptr[1] = 1;
         }
         env->game_result = game_result;
         float win_value = 0.0f;
 
         switch (game_result) {
             case 3:
-                env->rewards[0] = env->reward_draw;
+                *env->reward_ptr[0] = env->reward_draw;
                 if (env->mode == CHESS_MODE_SELFPLAY) {
-                    env->rewards[1] = env->reward_draw;
+                    *env->reward_ptr[1] = env->reward_draw;
+                    env->log.slot_0_score += 0.5f;
+                    env->log.slot_1_score += 0.5f;
                 }
                 win_value = 0.5f;
                 env->log.draw_rate += 1.0f;
@@ -2203,14 +2223,16 @@ void c_step(Chess* env) {
             case 1:
                 env->black_score += 1.0f;
                 if (env->mode == CHESS_MODE_SELFPLAY) {
-                    env->rewards[0] = -1.0f;  // White loses
-                    env->rewards[1] = 1.0f;   // Black wins
-                    win_value = 0.5f;         // zero-sum: averaged across both slots
+                    *env->reward_ptr[env->slot_for_color[CHESS_WHITE]] = -1.0f;
+                    *env->reward_ptr[env->slot_for_color[CHESS_BLACK]] = 1.0f;
+                    if (env->slot_for_color[CHESS_BLACK] == 0) env->log.slot_0_score += 1.0f;
+                    else env->log.slot_1_score += 1.0f;
+                    win_value = 0.5f;             // zero-sum: averaged across both slots
                 } else if (env->learner_color == CHESS_WHITE) {
-                    env->rewards[0] = -1.0f;
+                    *env->reward_ptr[0] = -1.0f;
                     env->learner_losses += 1.0f;
                 } else {
-                    env->rewards[0] = 1.0f;
+                    *env->reward_ptr[0] = 1.0f;
                     win_value = 1.0f;
                     env->learner_wins += 1.0f;
                 }
@@ -2219,15 +2241,17 @@ void c_step(Chess* env) {
             case 2:
                 env->white_score += 1.0f;
                 if (env->mode == CHESS_MODE_SELFPLAY) {
-                    env->rewards[0] = 1.0f;   // White wins
-                    env->rewards[1] = -1.0f;  // Black loses
+                    *env->reward_ptr[env->slot_for_color[CHESS_WHITE]] = 1.0f;
+                    *env->reward_ptr[env->slot_for_color[CHESS_BLACK]] = -1.0f;
+                    if (env->slot_for_color[CHESS_WHITE] == 0) env->log.slot_0_score += 1.0f;
+                    else env->log.slot_1_score += 1.0f;
                     win_value = 0.5f;
                 } else if (env->learner_color == CHESS_WHITE) {
-                    env->rewards[0] = 1.0f;
+                    *env->reward_ptr[0] = 1.0f;
                     win_value = 1.0f;
                     env->learner_wins += 1.0f;
                 } else {
-                    env->rewards[0] = -1.0f;
+                    *env->reward_ptr[0] = -1.0f;
                     env->learner_losses += 1.0f;
                 }
                 strcpy(env->last_result, "White Wins");
@@ -2237,9 +2261,9 @@ void c_step(Chess* env) {
         }
 
         if (env->mode == CHESS_MODE_SELFPLAY) {
-            env->episode_reward += env->rewards[0] + env->rewards[1];
+            env->episode_reward += *env->reward_ptr[0] + *env->reward_ptr[1];
         } else {
-            env->episode_reward += env->rewards[0];
+            env->episode_reward += *env->reward_ptr[0];
         }
         env->log.episode_return += env->episode_reward;
         env->log.perf += win_value;
@@ -2262,9 +2286,9 @@ void c_step(Chess* env) {
         }
     } else {
         if (env->mode == CHESS_MODE_SELFPLAY) {
-            env->episode_reward += env->rewards[0] + env->rewards[1];
+            env->episode_reward += *env->reward_ptr[0] + *env->reward_ptr[1];
         } else {
-            env->episode_reward += env->rewards[0];
+            env->episode_reward += *env->reward_ptr[0];
         }
     }
 
@@ -2420,7 +2444,7 @@ void c_render(Chess* env) {
                 if (chosen != MOVE_NONE) {
                     int is_timeout = 0;
                     apply_move_to_env(env, chosen, &is_timeout);
-                    env->actions[0] = -1;
+                    *env->action_ptr[0] = -1;
                 }
                 selected_sq = -1;
             }
