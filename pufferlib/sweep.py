@@ -146,7 +146,9 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'metric_distribution', 'goal', 'downsample', 'use_gpu', 'prune_pareto',
-                    'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs'):
+                    'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs',
+                    'match_enemy_model_path', 'match_num_games',
+                    'match_enemy_hidden_size', 'match_enemy_num_layers'):
             continue
 
         assert isinstance(param, dict), f'Param {name} is not a dict'
@@ -543,7 +545,9 @@ class Protein:
         _prune_pareto = sweep_config['prune_pareto'] if 'prune_pareto' in sweep_config else prune_pareto
         _max_suggestion_cost = sweep_config['max_suggestion_cost'] if 'max_suggestion_cost' in sweep_config else max_suggestion_cost
 
-        self.device = torch.device("cuda:0" if _use_gpu and torch.cuda.is_available() else "cpu")
+        import platform
+        _is_wsl = 'microsoft' in platform.uname().release.lower()
+        self.device = torch.device("cuda:0" if _use_gpu and torch.cuda.is_available() and not _is_wsl else "cpu")
         self.hyperparameters = Hyperparameters(sweep_config)
         self.metric_distribution = sweep_config['metric_distribution']
         self.global_search_scale = global_search_scale
@@ -618,16 +622,6 @@ class Protein:
             self.gp_cost_buffer = torch.empty(self.gp_max_obs, device=self.device)
             self.infer_batch_buffer = torch.empty(self.infer_batch_size, self.hyperparameters.num, device=self.device)
 
-    def to(self, device):
-        self.device = torch.device(device)
-        for attr in ('gp_score', 'gp_cost', 'likelihood_score', 'likelihood_cost',
-                     'mll_score', 'mll_cost', 'gp_params_buffer', 'gp_score_buffer',
-                     'gp_cost_buffer', 'infer_batch_buffer'):
-            setattr(self, attr, getattr(self, attr).to(self.device))
-        for opt in (self.score_opt, self.cost_opt):
-            for state in opt.state.values():
-                state.update({k: v.to(self.device) for k, v in state.items() if isinstance(v, torch.Tensor)})
-        return self
 
     def _filter_near_duplicates(self, inputs, duplicate_threshold=EPSILON):
         if len(inputs) < 2:

@@ -215,9 +215,10 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
     }
 }
 
-int py_add_frozen_bank(py::object pufferl_obj, int slice_size) {
+int py_add_frozen_bank(py::object pufferl_obj, int slice_size,
+                       int hidden_size, int num_layers) {
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
-    return pufferl_add_frozen_bank(&pufferl, slice_size);
+    return pufferl_add_frozen_bank(&pufferl, slice_size, hidden_size, num_layers);
 }
 
 void py_load_frozen_bank(py::object pufferl_obj, int bank_idx, const std::string& path) {

@@ -310,6 +310,7 @@ typedef struct {
 // (and per-buffer rollout states/activations). Used for match (eval) and league
 // (frozen historical opponents). Not trained; updated only via load.
 typedef struct {
+    Policy policy;  // Bank-owned Policy; lets banks have different arch than primary.
     PolicyWeights weights;
     Allocator params_alloc;
     Allocator acts_alloc;
@@ -318,6 +319,8 @@ typedef struct {
     PrecisionTensor* buffer_states;         // [num_buffers]
     PolicyActivations* buffer_activations;  // [num_buffers]
     int slice_size;  // # agents per buffer this bank owns; sets activation/state batch dim
+    int hidden_size;
+    int num_layers;
 } WeightBank;
 
 typedef struct {
@@ -366,6 +369,7 @@ typedef struct {
     // Optional frozen weight banks for match / league.
     WeightBank* frozen_banks;  // [num_frozen_banks]
     int num_frozen_banks;
+    std::string env_name;  // Kept for post-init bank adds (needs create_custom_encoder).
     // Per-buffer-relative bank layout: bank_layout[b] = first agent within each
     // buffer chunk owned by bank b. Length num_banks+1; ends at agents_per_buffer.
     // Same shape applied to every buffer (each buffer hosts every bank), so each
@@ -626,15 +630,18 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         int bank_size = bank_end - bank_off;
         if (bank_size == 0) continue;
 
+        Policy* p_bank;
         PolicyWeights* w_bank;
         PolicyActivations* a_bank;
         PrecisionTensor* s_bank;
         if (b == 0) {
+            p_bank = &pufferl->policy;
             w_bank = &pufferl->weights;
             a_bank = &pufferl->buffer_activations[buf];
             s_bank = &pufferl->buffer_states[buf];
         } else {
             WeightBank* fb = &pufferl->frozen_banks[b - 1];
+            p_bank = &fb->policy;
             w_bank = &fb->weights;
             a_bank = &fb->buffer_activations[buf];
             s_bank = &fb->buffer_states[buf];
@@ -652,7 +659,7 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_stride_b = mask_stride;
         }
 
-        PrecisionTensor dec_puf = policy_forward(&pufferl->policy, *w_bank, *a_bank, obs_b, *s_bank, stream);
+        PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
 
         PrecisionTensor p_logstd = {};
         DecoderWeights* dw = (DecoderWeights*)w_bank->decoder;
@@ -1619,23 +1626,86 @@ void train_impl(PuffeRL& pufferl) {
 
 }
 
-// Allocate a fresh frozen WeightBank shaped like PuffeRL's primary (same Policy).
-// slice_size = how many agents per buffer this bank will own (sizes activations
-// and recurrent state). Weights are uninitialized — caller must load before use.
-static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl, int slice_size) {
+// Build a Policy value for a given env + arch. Encoder/decoder algorithms are
+// fixed by the env; hidden_size/num_layers/horizon parameterize shape. Policy
+// has no heap state so this returns by value; callers store it wherever.
+static Policy build_policy(const char* env_name, int input_size, int hidden_size,
+                           int num_layers, int decoder_output_size, int act_n,
+                           bool is_continuous, int horizon) {
+    Encoder encoder = {
+        .forward = encoder_forward,
+        .backward = encoder_backward,
+        .init_weights = encoder_init_weights,
+        .reg_params = encoder_reg_params,
+        .reg_train = encoder_reg_train,
+        .reg_rollout = encoder_reg_rollout,
+        .create_weights = encoder_create_weights,
+        .free_weights = encoder_free_weights,
+        .free_activations = encoder_free_activations,
+        .in_dim = input_size, .out_dim = hidden_size,
+        .activation_size = sizeof(EncoderActivations),
+    };
+    create_custom_encoder(env_name, &encoder);
+    Decoder decoder = {
+        .forward = decoder_forward,
+        .backward = decoder_backward,
+        .init_weights = decoder_init_weights,
+        .reg_params = decoder_reg_params,
+        .reg_train = decoder_reg_train,
+        .reg_rollout = decoder_reg_rollout,
+        .create_weights = decoder_create_weights,
+        .free_weights = decoder_free_weights,
+        .free_activations = decoder_free_activations,
+        .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
+    };
+    Network network = {
+        .forward = mingru_forward,
+        .forward_train = mingru_forward_train,
+        .backward = mingru_backward,
+        .init_weights = mingru_init_weights,
+        .reg_params = mingru_reg_params,
+        .reg_train = mingru_reg_train,
+        .reg_rollout = mingru_reg_rollout,
+        .create_weights = mingru_create_weights,
+        .free_weights = mingru_free_weights,
+        .free_activations = mingru_free_activations,
+        .hidden = hidden_size, .num_layers = num_layers, .horizon = horizon,
+    };
+    return Policy{
+        .encoder = encoder, .decoder = decoder, .network = network,
+        .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
+        .num_atns = act_n,
+    };
+}
+
+// Allocate a fresh frozen WeightBank with its own Policy (may differ in
+// hidden_size/num_layers from primary). slice_size = how many agents per buffer
+// this bank will own. Weights are uninitialized — caller must load before use.
+static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
+        int slice_size, int hidden_size, int num_layers) {
     int num_buffers = pufferl->hypers.num_buffers;
-    int hidden_size = pufferl->hypers.hidden_size;
-    int num_layers = pufferl->hypers.num_layers;
+
+    // Rebuild arch-varying Policy from env metadata already on pufferl.
+    int input_size = pufferl->env.obs.shape[1];
+    int num_action_heads = pufferl->env.actions.shape[1];
+    int* raw_act_sizes = get_act_sizes();
+    int act_n = 0;
+    for (int i = 0; i < num_action_heads; i++) act_n += raw_act_sizes[i];
+    int decoder_output_size = pufferl->is_continuous ? num_action_heads : act_n;
+    bank->policy = build_policy(pufferl->env_name.c_str(), input_size, hidden_size,
+        num_layers, decoder_output_size, act_n, pufferl->is_continuous, pufferl->hypers.horizon);
+    bank->hidden_size = hidden_size;
+    bank->num_layers = num_layers;
 
     Allocator* params = &bank->params_alloc;
     Allocator* acts = &bank->acts_alloc;
 
     bank->slice_size = slice_size;
-    bank->weights = policy_weights_create(&pufferl->policy, params);
+    bank->weights = policy_weights_create(&bank->policy, params);
     bank->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
     bank->buffer_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
     for (int i = 0; i < num_buffers; i++) {
-        bank->buffer_activations[i] = policy_reg_rollout(&pufferl->policy, bank->weights, acts, slice_size);
+        bank->buffer_activations[i] = policy_reg_rollout(&bank->policy, bank->weights, acts, slice_size);
         bank->buffer_states[i] = {.shape = {num_layers, slice_size, hidden_size}};
         alloc_register(acts, &bank->buffer_states[i]);
     }
@@ -1657,10 +1727,10 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl, i
 // WeightBank struct itself — caller owns that.
 static void weight_bank_destroy(WeightBank* bank, PuffeRL* pufferl) {
     int num_buffers = pufferl->hypers.num_buffers;
-    policy_weights_free(&pufferl->policy, &bank->weights);
+    policy_weights_free(&bank->policy, &bank->weights);
     if (bank->buffer_activations != NULL) {
         for (int i = 0; i < num_buffers; i++) {
-            policy_activations_free(&pufferl->policy, bank->buffer_activations[i]);
+            policy_activations_free(&bank->policy, bank->buffer_activations[i]);
         }
         free(bank->buffer_activations);
     }
@@ -1675,12 +1745,14 @@ static void weight_bank_destroy(WeightBank* bank, PuffeRL* pufferl) {
 // Append a fresh frozen bank with the given per-buffer slice size; returns its
 // index. Rebuilds bank_layout sequentially (primary first, then frozen banks in
 // add order). Must be called BEFORE cudagraph capture (pointers get baked in).
-extern "C" int pufferl_add_frozen_bank(PuffeRL* pufferl, int slice_size) {
+extern "C" int pufferl_add_frozen_bank(PuffeRL* pufferl, int slice_size,
+        int hidden_size, int num_layers) {
     int idx = pufferl->num_frozen_banks;
     pufferl->frozen_banks = (WeightBank*)realloc(
         pufferl->frozen_banks, (idx + 1) * sizeof(WeightBank));
     memset(&pufferl->frozen_banks[idx], 0, sizeof(WeightBank));
-    weight_bank_create_for_pufferl(&pufferl->frozen_banks[idx], pufferl, slice_size);
+    weight_bank_create_for_pufferl(&pufferl->frozen_banks[idx], pufferl,
+        slice_size, hidden_size, num_layers);
     pufferl->num_frozen_banks++;
 
     // Rebuild sequential layout from declared slice_sizes.
@@ -1773,6 +1845,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->hypers = hypers;
     pufferl->nccl_comm = nullptr;
     pufferl->default_stream = 0;
+    pufferl->env_name = env_name;
 
     cudaSetDevice(hypers.gpu_id);
 
@@ -1841,50 +1914,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     int batch = total_agents / hypers.num_buffers;
     int num_buffers = hypers.num_buffers;
 
-    Encoder encoder = {
-        .forward = encoder_forward,
-        .backward = encoder_backward,
-        .init_weights = encoder_init_weights,
-        .reg_params = encoder_reg_params,
-        .reg_train = encoder_reg_train,
-        .reg_rollout = encoder_reg_rollout,
-        .create_weights = encoder_create_weights,
-        .free_weights = encoder_free_weights,
-        .free_activations = encoder_free_activations,
-        .in_dim = input_size, .out_dim = hidden_size,
-        .activation_size = sizeof(EncoderActivations),
-    };
-    create_custom_encoder(env_name, &encoder);
-    Decoder decoder = {
-        .forward = decoder_forward,
-        .backward = decoder_backward,
-        .init_weights = decoder_init_weights,
-        .reg_params = decoder_reg_params,
-        .reg_train = decoder_reg_train,
-        .reg_rollout = decoder_reg_rollout,
-        .create_weights = decoder_create_weights,
-        .free_weights = decoder_free_weights,
-        .free_activations = decoder_free_activations,
-        .hidden_dim = hidden_size, .output_dim = decoder_output_size, .continuous = is_continuous,
-    };
-    Network network = {
-        .forward = mingru_forward,
-        .forward_train = mingru_forward_train,
-        .backward = mingru_backward,
-        .init_weights = mingru_init_weights,
-        .reg_params = mingru_reg_params,
-        .reg_train = mingru_reg_train,
-        .reg_rollout = mingru_reg_rollout,
-        .create_weights = mingru_create_weights,
-        .free_weights = mingru_free_weights,
-        .free_activations = mingru_free_activations,
-        .hidden = hidden_size, .num_layers = num_layers, .horizon = hypers.horizon,
-    };
-    pufferl->policy = Policy{
-        .encoder = encoder, .decoder = decoder, .network = network,
-        .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
-        .num_atns = act_n,
-    };
+    pufferl->policy = build_policy(env_name.c_str(), input_size, hidden_size,
+        num_layers, decoder_output_size, act_n, is_continuous, hypers.horizon);
 
     // Create and allocate params
     Allocator* params = &pufferl->params_alloc;
@@ -1981,8 +2012,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     // and per-bank loop iterations.
     DictItem* nb_item = dict_get_unsafe(vec_kwargs, "num_frozen_banks");
     DictItem* fbp_item = dict_get_unsafe(vec_kwargs, "frozen_bank_pct");
+    DictItem* fbh_item = dict_get_unsafe(vec_kwargs, "frozen_bank_hidden_size");
+    DictItem* fbl_item = dict_get_unsafe(vec_kwargs, "frozen_bank_num_layers");
     int num_frozen = nb_item ? (int)nb_item->value : 0;
     float frozen_pct = fbp_item ? (float)fbp_item->value : 0.0f;
+    int frozen_hidden = fbh_item ? (int)fbh_item->value : hidden_size;
+    int frozen_layers = fbl_item ? (int)fbl_item->value : num_layers;
     if (num_frozen > 0) {
         int agents_per_buffer = total_agents / num_buffers;
         int frozen_size = (int)((float)agents_per_buffer * frozen_pct);  // truncates = floor for positive
@@ -1995,7 +2030,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
         // add_frozen_bank auto-builds the sequential bank_layout.
         for (int b = 0; b < num_frozen; b++) {
-            pufferl_add_frozen_bank(pufferl.get(), frozen_size);
+            pufferl_add_frozen_bank(pufferl.get(), frozen_size, frozen_hidden, frozen_layers);
         }
     }
 
