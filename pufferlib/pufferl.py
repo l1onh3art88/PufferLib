@@ -275,6 +275,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
 
     print_dashboard(args, model_size, flat_logs)
+    # Match-mode trials may have early-stopped before the in-loop save fired;
+    # ensure we always have a checkpoint to feed match().
+    if match_mode and not model_path:
+        model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+        backend.save_weights(pufferl, model_path)
     backend.close(pufferl)
 
     if target_key not in flat_logs:
