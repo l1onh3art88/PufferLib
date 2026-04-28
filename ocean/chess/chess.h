@@ -336,6 +336,9 @@ enum {
     CHESS_MODE_HUMAN_RANDOM = 3
 };
 
+#define CHESS_TAG_SELFPLAY 0
+#define CHESS_TAG_HISTORICAL 1
+
 typedef struct {
     float perf;
     float score;
@@ -349,6 +352,11 @@ typedef struct {
     // slot 1 = frozen policy B. In selfplay training both should average ~0.5.
     float slot_0_score;
     float slot_1_score;
+    // Historical-pool tracking. Summed only on envs tagged TAG_HISTORICAL (slot 0 =
+    // primary, slot 1 = frozen). Recover winrate in Python as hist_score/hist_n
+    // (the framework's divide-by-total_n cancels in the ratio).
+    float hist_score;
+    float hist_n;
     float n;
 } Log;
 
@@ -429,6 +437,12 @@ typedef struct {
     int enable_threefold_repetition;
     
     int learner_color;
+    // Selfplay-pool tagging. tag = 0 selfplay, tag = 1 historical (slot 0 =
+    // primary, slot 1 = frozen). boundary_reached set on game-end so Python can
+    // detect when historical envs have all completed at least one game since
+    // the last swap arm.
+    int tag;
+    int boundary_reached;
     // Selfplay only: slot_for_color[c] = which slot (0 or 1) plays color c.
     // Default (slot 0 = WHITE, slot 1 = BLACK); randomized per env to remove
     // white-bias when running matched policies in different slots.
@@ -2274,6 +2288,20 @@ void c_step(Chess* env) {
             ? ((float)env->invalid_actions_this_episode / (float)env->tick) : 0.0f;
 
         env->log.n += 1.0f;
+
+        if (env->tag == CHESS_TAG_HISTORICAL) {
+            float primary_score;
+            if (game_result == 3) {
+                primary_score = 0.5f;
+            } else if (game_result == 2) {  // White wins
+                primary_score = (env->slot_for_color[CHESS_WHITE] == 0) ? 1.0f : 0.0f;
+            } else {  // Black wins
+                primary_score = (env->slot_for_color[CHESS_BLACK] == 0) ? 1.0f : 0.0f;
+            }
+            env->log.hist_score += primary_score;
+            env->log.hist_n += 1.0f;
+            env->boundary_reached = 1;
+        }
 
         if (env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM) {
             env->show_game_end_popup = 1;

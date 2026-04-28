@@ -25,6 +25,8 @@ try:
 except ImportError:
     raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
 
+from pufferlib import selfplay
+
 import rich
 import rich.traceback
 from rich.table import Table
@@ -228,6 +230,19 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
+    # Selfplay-pool curriculum (no-op unless selfplay_pool_enabled). Disabled
+    # under match-mode sweeps since match() owns its own perm/frozen bank.
+    pool_state = None
+    if not match_mode:
+        try:
+            pool_state = selfplay.setup(pufferl, backend, args, run_id)
+        except RuntimeError as e:
+            print(f'WARNING: {e}, skipping')
+            backend.close(pufferl)
+            if result_queue is not None:
+                result_queue.put((args['gpu_id'], [], [], []))
+            return
+
     model_path = ''
     flat_logs = {}
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
@@ -253,6 +268,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
         logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
         flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+
+        if epoch < train_epochs:
+            selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
@@ -331,9 +349,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     # Match-mode: single observation at final-training cost. Protein's curve
     # fit collapses to one point — we only trust the match winrate, not any
-    # training-time proxy.
+    # training-time proxy. Replicate the scalar across all downsample bins so
+    # the JSON log shape matches every other metric (cache_data.py rejects
+    # length-mismatched metrics as "bad data").
     if match_mode:
-        metrics['env/match_score'] = [match_score]
+        metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
 
     # Save own log: config + downsampled results
     log_dir = os.path.join(args['log_dir'], args['env_name'])
@@ -352,7 +372,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if result_queue is not None:
         if match_mode:
             # One observation: final hypers -> match winrate, at total training cost.
-            result_queue.put((args['gpu_id'], metrics['env/match_score'],
+            result_queue.put((args['gpu_id'], [match_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
             result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))

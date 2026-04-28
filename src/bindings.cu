@@ -236,6 +236,27 @@ void py_set_agent_perm(py::object pufferl_obj, py::array_t<int> perm) {
     pufferl_set_agent_perm(&pufferl, (const int*)buf.ptr);
 }
 
+void py_set_env_tags(py::object pufferl_obj, py::array_t<int> tags) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    auto buf = tags.request();
+    if (buf.ndim != 1) throw std::runtime_error("env_tags must be 1-D");
+    int num_envs = pufferl_num_envs(&pufferl);
+    if ((int)buf.shape[0] != num_envs) {
+        throw std::runtime_error("env_tags length must equal num_envs");
+    }
+    pufferl_set_env_tags(&pufferl, (const int*)buf.ptr);
+}
+
+int py_count_aligned(py::object pufferl_obj, int tag_value, int reset_flags) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    return pufferl_count_aligned(&pufferl, tag_value, reset_flags);
+}
+
+int py_num_envs(py::object pufferl_obj) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    return pufferl_num_envs(&pufferl);
+}
+
 void py_puff_advantage(
         long long values_ptr, long long rewards_ptr,
         long long dones_ptr,  long long importance_ptr,
@@ -497,6 +518,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("add_frozen_bank", &py_add_frozen_bank);
     m.def("load_frozen_bank", &py_load_frozen_bank);
     m.def("set_agent_perm", &py_set_agent_perm);
+    m.def("set_env_tags", &py_set_env_tags);
+    m.def("count_aligned", &py_count_aligned);
+    m.def("num_envs", &py_num_envs);
     m.def("python_vec_recv", &python_vec_recv);
     m.def("python_vec_send", &python_vec_send);
     py::class_<Policy>(m, "Policy");

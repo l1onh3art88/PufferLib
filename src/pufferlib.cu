@@ -1357,6 +1357,30 @@ void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
         advantages.data, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
+// Zero advantages on frozen-bank rows so prio_replay never samples them. Frozen
+// rollout rows hold actions/logprobs from the frozen policy — training the
+// primary's PPO on them produces garbage ratios and poisoned gradients.
+__global__ void zero_frozen_advantages_kernel(precision_t* advantages,
+        int agents_per_buffer, int primary_per_buffer, int total_rows, int horizon) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = total_rows * horizon;
+    if (idx >= total) return;
+    int row = idx / horizon;
+    int rel = row % agents_per_buffer;
+    if (rel >= primary_per_buffer) {
+        advantages[idx] = from_float(0.0f);
+    }
+}
+
+void zero_frozen_advantages_cuda(PrecisionTensor& advantages,
+        int agents_per_buffer, int primary_per_buffer, cudaStream_t stream) {
+    int total_rows = advantages.shape[0];
+    int horizon = advantages.shape[1];
+    int total = total_rows * horizon;
+    zero_frozen_advantages_kernel<<<grid_size(total), BLOCK_SIZE, 0, stream>>>(
+        advantages.data, agents_per_buffer, primary_per_buffer, total_rows, horizon);
+}
+
 // Minor copy bandwidth optimizations
 __global__ void index_copy(char* __restrict__ dst, const int* __restrict__ idx,
         const char* __restrict__ src, int num_idx, int row_bytes) {
@@ -1514,6 +1538,11 @@ void train_impl(PuffeRL& pufferl) {
         puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
             rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
             hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
+        if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL) {
+            int apb = hypers.total_agents / hypers.num_buffers;
+            zero_frozen_advantages_cuda(advantages_puf, apb,
+                pufferl.bank_layout[1], train_stream);
+        }
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
@@ -1837,6 +1866,22 @@ extern "C" void pufferl_set_agent_perm(PuffeRL* pufferl, const int* perm) {
         }
     }
     static_vec_set_perm(pufferl->vec, perm);
+}
+
+// Set per-env tags (e.g. selfplay vs historical). tags array length must equal
+// pufferl_num_envs(). Also clears each env's boundary_reached flag.
+extern "C" void pufferl_set_env_tags(PuffeRL* pufferl, const int* tags) {
+    static_vec_set_env_tags(pufferl->vec, tags);
+}
+
+// Returns count of envs with tag == tag_value AND boundary_reached. If
+// reset_flags != 0, clears boundary_reached on all envs after counting.
+extern "C" int pufferl_count_aligned(PuffeRL* pufferl, int tag_value, int reset_flags) {
+    return static_vec_count_aligned(pufferl->vec, tag_value, reset_flags);
+}
+
+extern "C" int pufferl_num_envs(PuffeRL* pufferl) {
+    return pufferl->vec->size;
 }
 
 std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,

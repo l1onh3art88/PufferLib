@@ -8,6 +8,7 @@
 #define MY_VEC_INIT
 #define MY_VEC_CLOSE
 #define MY_USES_PERM
+#define MY_USES_TAGS
 #define Env Chess
 #include "vecenv.h"
 
@@ -180,4 +181,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "invalid_action_rate", log->invalid_action_rate);
     dict_set(out, "slot_0_score", log->slot_0_score);
     dict_set(out, "slot_1_score", log->slot_1_score);
+    dict_set(out, "hist_score", log->hist_score);
+    dict_set(out, "hist_n", log->hist_n);
 }

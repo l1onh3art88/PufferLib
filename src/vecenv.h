@@ -141,6 +141,12 @@ void cpu_vec_step(StaticVec* vec);
 // emits an error and leaves the perm unset.
 void static_vec_set_perm(StaticVec* vec, const int* perm);
 
+// Optional per-env tagging + boundary tracking for selfplay-pool curricula.
+// Env must opt in via MY_USES_TAGS and provide `int tag` and
+// `int boundary_reached` fields on its Env struct.
+void static_vec_set_env_tags(StaticVec* vec, const int* tags);
+int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags);
+
 // Optional shared state functions
 void* my_shared(void* env, Dict* kwargs);
 void my_shared_close(void* env);
@@ -450,11 +456,9 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
         vec->action_mask = (unsigned char*)calloc(total_agents * MY_ACTION_MASK, sizeof(unsigned char));
         vec->gpu_action_mask = vec->action_mask;
     }
-#else
-    vec->action_mask = NULL;
-    vec->gpu_action_mask = NULL;
-    vec->action_mask_size = 0;
 #endif
+    // No #else: action_mask, gpu_action_mask, action_mask_size are already 0/NULL
+    // from calloc(1, sizeof(StaticVec)) above.
 
     // Streams allocated here, created in create_static_threads
     vec->streams = (cudaStream_t*)calloc(num_buffers, sizeof(cudaStream_t));
@@ -515,6 +519,41 @@ void static_vec_set_perm(StaticVec* vec, const int* perm) {
     }
 #endif
 }
+
+#ifdef MY_USES_TAGS
+void static_vec_set_env_tags(StaticVec* vec, const int* tags) {
+    Env* envs = (Env*)vec->envs;
+    for (int i = 0; i < vec->size; i++) {
+        envs[i].tag = tags[i];
+        envs[i].boundary_reached = 0;
+    }
+}
+
+int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
+    Env* envs = (Env*)vec->envs;
+    int count = 0;
+    for (int i = 0; i < vec->size; i++) {
+        if (envs[i].tag == tag_value && envs[i].boundary_reached) {
+            count++;
+        }
+    }
+    if (reset_flags) {
+        for (int i = 0; i < vec->size; i++) {
+            envs[i].boundary_reached = 0;
+        }
+    }
+    return count;
+}
+#else
+void static_vec_set_env_tags(StaticVec* vec, const int* tags) {
+    (void)vec; (void)tags;
+    fprintf(stderr, "static_vec_set_env_tags: env did not opt in via MY_USES_TAGS; ignoring.\n");
+}
+int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
+    (void)vec; (void)tag_value; (void)reset_flags;
+    return 0;
+}
+#endif
 
 void static_vec_reset(StaticVec* vec) {
     Env* envs = (Env*)vec->envs;
