@@ -467,6 +467,9 @@ typedef struct {
     int white_captured[6];
     int black_captured[6];
     int render_paused;
+    int has_last_move_highlight;
+    Square last_move_from;
+    Square last_move_to;
 } Chess;
 
 static inline Bitboard sq_bb(Square s) {
@@ -1903,7 +1906,10 @@ static void generate_random_fen(Chess* env, char* fen_out) {
 
 static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
     env->chess_moves++;
-    
+    env->last_move_from = from_sq(chosen);
+    env->last_move_to = to_sq(chosen);
+    env->has_last_move_highlight = 1;
+
     if ((env->mode == CHESS_MODE_HUMAN
             || env->mode == CHESS_MODE_HUMAN_RANDOM
             || env->log_pgn) && env->pgn_move_count < MAX_GAME_PLIES) {
@@ -1968,7 +1974,6 @@ static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
         game_result = 3;
     }
 
-    //populate_observations(env);
     return game_result;
 }
 
@@ -1982,6 +1987,7 @@ void c_reset(Chess* env) {
     env->episode_reward = 0.0f;
     env->pgn_move_count = 0;
     env->show_game_end_popup = 0;
+    env->has_last_move_highlight = 0;
     clear_player_selection(env, 0);
     clear_player_selection(env, 1);
     env->valid_from_mask[0] = 0;
@@ -2584,6 +2590,16 @@ void c_render(Chess* env) {
                 int draw_x = draw_file * cell_size;
                 int draw_y = (7 - draw_rank) * cell_size;
                 DrawRectangle(draw_x, draw_y, cell_size, cell_size, sq_color);
+
+                if (env->has_last_move_highlight) {
+                    Square lf = env->last_move_from;
+                    Square lt = env->last_move_to;
+                    if ((file == (int)file_of(lf) && rank == (int)rank_of(lf))
+                            || (file == (int)file_of(lt) && rank == (int)rank_of(lt))) {
+                        Color last_mv = (Color){247, 247, 105, 255};
+                        DrawRectangle(draw_x, draw_y, cell_size, cell_size, Fade(last_mv, 0.52f));
+                    }
+                }
 
                 if (selected_sq != -1 && selected_file == file && selected_rank == rank) {
                     DrawRectangleLines(draw_x, draw_y, cell_size, cell_size, (Color){255, 215, 0, 255});
