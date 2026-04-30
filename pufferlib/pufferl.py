@@ -537,11 +537,14 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
     # later only update data.
     args['vec']['num_frozen_banks'] = 1
     args['vec']['frozen_bank_pct'] = 0.5
-    enemy_hidden = args.get('enemy_hidden_size')
-    enemy_layers = args.get('enemy_num_layers')
-    if enemy_hidden is not None:
+    # CLI flags take precedence; fall back to [sweep].match_enemy_* so the same
+    # config drives sweep-time and CLI-time matches. 0 / None means "use primary".
+    sweep_cfg = args.get('sweep', {})
+    enemy_hidden = args.get('enemy_hidden_size') or sweep_cfg.get('match_enemy_hidden_size')
+    enemy_layers = args.get('enemy_num_layers')  or sweep_cfg.get('match_enemy_num_layers')
+    if enemy_hidden:
         args['vec']['frozen_bank_hidden_size'] = int(enemy_hidden)
-    if enemy_layers is not None:
+    if enemy_layers:
         args['vec']['frozen_bank_num_layers'] = int(enemy_layers)
 
     pufferl = backend.create_pufferl(args)
