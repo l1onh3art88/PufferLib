@@ -1,7 +1,7 @@
 """Selfplay-pool training: a fraction of envs play primary vs a frozen historical
 snapshot, the rest are pure selfplay. The current opponent is advanced from a
 disk-backed pool when primary beats it at >= swap_winrate over min_games. Used
-by `_train` in pufferl.py — gated on `selfplay_pool_enabled`.
+by `_train` in pufferl.py — gated on `selfplay.enabled` (config section).
 
 Pool storage is disk-only (paths held in memory; weights only on GPU when
 loaded as the frozen bank). Stride-eviction preserves temporal coverage when
@@ -85,7 +85,8 @@ def setup(pufferl, backend, args, run_id):
     '''Wire up agent_perm/tags and bootstrap the frozen bank with the current
     weights so historical envs have an opponent from rollout 1. Returns a
     pool_state dict (or None if disabled).'''
-    if not args.get('selfplay_pool_enabled', 0):
+    sp = args.get('selfplay', {})
+    if not sp.get('enabled', 0):
         return None
     if backend is not _C:
         raise RuntimeError('selfplay_pool requires the native CUDA backend')
@@ -107,7 +108,7 @@ def setup(pufferl, backend, args, run_id):
     # Align to whole teams so each historical env contributes exactly team_size frozen slots.
     frozen_size -= frozen_size % team_size
     if frozen_size <= 0:
-        raise RuntimeError('selfplay_pool_enabled but frozen_bank_pct rounds to 0 slots '
+        raise RuntimeError('selfplay.enabled but frozen_bank_pct rounds to 0 slots '
                            f'after team-size ({team_size}) alignment')
     if frozen_size >= agents_per_buffer // 2:
         raise RuntimeError(f'frozen_size {frozen_size} >= apb/2 {agents_per_buffer//2}')
@@ -123,17 +124,17 @@ def setup(pufferl, backend, args, run_id):
     backend.save_weights(pufferl, bootstrap_path)
     backend.load_frozen_bank(pufferl, 0, bootstrap_path)
 
-    elo_init = float(args.get('selfplay_pool_elo_init', 0.0))
-    elo_k    = float(args.get('selfplay_pool_elo_k',    16.0))
-    rng = np.random.default_rng(int(args.get('selfplay_pool_seed', 0)))
+    elo_init = float(sp.get('elo_init', 0.0))
+    elo_k    = float(sp.get('elo_k',    16.0))
+    rng = np.random.default_rng(int(sp.get('seed', 0)))
 
     return {
         'pool_dir': pool_dir,
         'pool': [{'path': bootstrap_path, 'elo': elo_init}],
         'rng': rng,
-        'max_size': int(args['selfplay_pool_max_size']),
-        'min_games': int(args['selfplay_pool_min_games']),
-        'swap_winrate': float(args['selfplay_pool_swap_winrate']),
+        'max_size': int(sp['max_size']),
+        'min_games': int(sp['min_games']),
+        'swap_winrate': float(sp['swap_winrate']),
         'num_hist_envs': num_hist_envs,
         'hist_score': 0.0,
         'hist_n': 0.0,

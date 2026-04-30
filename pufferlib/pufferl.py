@@ -230,7 +230,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         flat_logs = dict(unroll_nested_dict(backend.log(pufferl)))
         print_dashboard(args, model_size, flat_logs, clear=True)
 
-    # Selfplay-pool curriculum (no-op unless selfplay_pool_enabled). Disabled
+    # Selfplay-pool curriculum (no-op unless selfplay.enabled). Disabled
     # under match-mode sweeps since match() owns its own perm/frozen bank.
     pool_state = None
     if not match_mode:
@@ -398,15 +398,11 @@ def train(env_name, args=None, gpus=None, **kwargs):
         if rank == 0 and not subprocess:
             _train(env_name, worker_args, verbose=True)
         else:
-            # Spawn pickling uses CUDA IPC, unsupported on WSL2. Move to CPU first.
-            sweep_obj = kwargs.get('sweep_obj')
-            device = getattr(sweep_obj, 'device', None)
-            if device and device.type != 'cpu':
-                sweep_obj.to('cpu')
+            # Protein's GP models live on cuda:0 on non-WSL setups; spawn-pickling
+            # them works fine via CUDA IPC. On WSL, sweep.py forces device='cpu'
+            # at construction so there's nothing to move.
             ctx.Process(target=_train, args=(env_name, worker_args),
                 kwargs=kwargs).start()
-            if device and device.type != 'cpu':
-                sweep_obj.to(device)
 
 def sweep(env_name, args=None, pareto=False):
     '''Train entry point. Handles single-GPU, multi-GPU DDP, and sweeps.'''
