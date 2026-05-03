@@ -3,6 +3,7 @@
 #include <nvtx3/nvToolsExt.h>
 #include <nvml.h>
 #include <nccl.h>
+#include <vector>
 
 #include <time.h>
 #include "models.cu"

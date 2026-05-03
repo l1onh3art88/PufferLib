@@ -1,5 +1,7 @@
 #include "chess.h"
-#define OBS_SIZE 1082
+// Before embedding approach
+// #define OBS_SIZE 1082
+#define OBS_SIZE 167
 #define NUM_ATNS 1
 #define ACT_SIZES {97}
 #define OBS_TENSOR_T ByteTensor

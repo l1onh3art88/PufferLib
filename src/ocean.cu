@@ -570,6 +570,293 @@ static void* nmmo3_encoder_create_weights(void* self) {
 static void nmmo3_encoder_free_weights(void* weights) { free(weights); }
 static void nmmo3_encoder_free_activations(void* activations) { free(activations); }
 
+// ---- Chess constants ----
+// Chess uses learnable piece-square and action-context embeddings. The encoder
+// reads compact obs bytes, sums the matching rows from board_w/move_context_w
+// into hidden space, adds a learned projection of rule metadata, then applies ReLU.
+
+static constexpr int CH_BOARD = 0;
+static constexpr int CH_SIDE = 64;
+static constexpr int CH_CASTLE = 65;
+static constexpr int CH_EP = 69;
+static constexpr int CH_RULE50 = 78;
+static constexpr int CH_REPETITION = 79;
+static constexpr int CH_SELF_CHECK = 80;
+static constexpr int CH_OPP_CHECK = 81;
+static constexpr int CH_PICK_PHASE = 82;
+static constexpr int CH_SELECTED = 83;
+static constexpr int CH_VALID_FROM_COUNT = 84;
+static constexpr int CH_VALID_FROM = 85;
+static constexpr int CH_VALID_TO_COUNT = 101;
+static constexpr int CH_VALID_TO = 102;
+static constexpr int CH_VALID_PROMOS = 134;
+static constexpr int CH_PASS_VALID = 166;
+static constexpr int CH_OBS_SIZE = 167;
+static constexpr int CH_BOARD_SQUARES = 64;
+static constexpr int CH_PIECE_TYPES = 12;
+static constexpr int CH_BOARD_FEATURES = CH_BOARD_SQUARES * CH_PIECE_TYPES;
+static constexpr int CH_MAX_VALID_FROM = 16;
+static constexpr int CH_MAX_VALID_TO = 32;
+static constexpr int CH_NULL_SQ = 64;
+static constexpr int CH_MOVE_CONTEXT_SELECTED = 0;
+static constexpr int CH_MOVE_CONTEXT_VALID_FROM = 64;
+static constexpr int CH_MOVE_CONTEXT_VALID_TO = 128;
+static constexpr int CH_MOVE_CONTEXT_PHASE = 192;
+static constexpr int CH_MOVE_CONTEXT_FEATURES = 194;
+static constexpr int CH_META = 51;  // side/castle/ep/clocks/checks/promos/pass
+
+// ---- Chess kernels ----
+
+__global__ void chess_meta_kernel(
+        precision_t* __restrict__ meta,
+        const precision_t* __restrict__ obs,
+        int B, int obs_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * CH_META) return;
+    int b = idx / CH_META;
+    int m = idx % CH_META;
+    int src = CH_PASS_VALID;
+    if (m == 0) {
+        src = CH_SIDE;
+    } else if (m < 5) {
+        src = CH_CASTLE + (m - 1);
+    } else if (m < 14) {
+        src = CH_EP + (m - 5);
+    } else if (m == 14) {
+        src = CH_RULE50;
+    } else if (m == 15) {
+        src = CH_REPETITION;
+    } else if (m == 16) {
+        src = CH_SELF_CHECK;
+    } else if (m == 17) {
+        src = CH_OPP_CHECK;
+    } else if (m < 50) {
+        src = CH_VALID_PROMOS + (m - 18);
+    }
+    float x = to_float(obs[b * obs_size + src]);
+    if (x > 1.0f) x *= (1.0f / 255.0f);
+    meta[idx] = from_float(x);
+}
+
+__global__ void chess_embed_forward_kernel(
+        precision_t* __restrict__ out,
+        const precision_t* __restrict__ obs,
+        const precision_t* __restrict__ board_w,
+        const precision_t* __restrict__ move_context_w,
+        const precision_t* __restrict__ bias,
+        int B, int hidden, int obs_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * hidden) return;
+    int b = idx / hidden;
+    int h = idx % hidden;
+
+    const precision_t* obs_row = obs + b * obs_size;
+    float acc = to_float(out[idx]) + to_float(bias[h]);
+
+    #pragma unroll 8
+    for (int sq = 0; sq < CH_BOARD_SQUARES; sq++) {
+        int piece = (int)to_float(obs_row[CH_BOARD + sq]);
+        if (piece > 0) {
+            int feat = (piece - 1) * CH_BOARD_SQUARES + sq;
+            acc += to_float(board_w[feat * hidden + h]);
+        }
+    }
+
+    int phase = (int)to_float(obs_row[CH_PICK_PHASE]) > 0 ? 1 : 0;
+    acc += to_float(move_context_w[(CH_MOVE_CONTEXT_PHASE + phase) * hidden + h]);
+
+    int selected = (int)to_float(obs_row[CH_SELECTED]);
+    if (selected < CH_BOARD_SQUARES) {
+        acc += to_float(move_context_w[(CH_MOVE_CONTEXT_SELECTED + selected) * hidden + h]);
+    }
+
+    int from_count = (int)to_float(obs_row[CH_VALID_FROM_COUNT]);
+    for (int k = 0; k < from_count; k++) {
+        int sq = (int)to_float(obs_row[CH_VALID_FROM + k]);
+        acc += to_float(move_context_w[(CH_MOVE_CONTEXT_VALID_FROM + sq) * hidden + h]);
+    }
+
+    int to_count = (int)to_float(obs_row[CH_VALID_TO_COUNT]);
+    for (int k = 0; k < to_count; k++) {
+        int sq = (int)to_float(obs_row[CH_VALID_TO + k]);
+        acc += to_float(move_context_w[(CH_MOVE_CONTEXT_VALID_TO + sq) * hidden + h]);
+    }
+
+    out[idx] = from_float(fmaxf(0.0f, acc));
+}
+
+__global__ void chess_embed_backward_kernel(
+        float* __restrict__ board_wgrad_f,
+        float* __restrict__ move_context_wgrad_f,
+        const precision_t* __restrict__ grad,
+        const precision_t* __restrict__ obs,
+        int B, int hidden, int obs_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * hidden) return;
+    int b = idx / hidden;
+    int h = idx % hidden;
+    float g = to_float(grad[idx]);
+    if (g == 0.0f) return;
+
+    const precision_t* obs_row = obs + b * obs_size;
+
+    #pragma unroll 8
+    for (int sq = 0; sq < CH_BOARD_SQUARES; sq++) {
+        int piece = (int)to_float(obs_row[CH_BOARD + sq]);
+        if (piece > 0) {
+            int feat = (piece - 1) * CH_BOARD_SQUARES + sq;
+            atomicAdd(&board_wgrad_f[feat * hidden + h], g);
+        }
+    }
+
+    int phase = (int)to_float(obs_row[CH_PICK_PHASE]) > 0 ? 1 : 0;
+    atomicAdd(&move_context_wgrad_f[(CH_MOVE_CONTEXT_PHASE + phase) * hidden + h], g);
+
+    int selected = (int)to_float(obs_row[CH_SELECTED]);
+    if (selected < CH_BOARD_SQUARES) {
+        atomicAdd(&move_context_wgrad_f[(CH_MOVE_CONTEXT_SELECTED + selected) * hidden + h], g);
+    }
+
+    int from_count = (int)to_float(obs_row[CH_VALID_FROM_COUNT]);
+    for (int k = 0; k < from_count; k++) {
+        int sq = (int)to_float(obs_row[CH_VALID_FROM + k]);
+        atomicAdd(&move_context_wgrad_f[(CH_MOVE_CONTEXT_VALID_FROM + sq) * hidden + h], g);
+    }
+
+    int to_count = (int)to_float(obs_row[CH_VALID_TO_COUNT]);
+    for (int k = 0; k < to_count; k++) {
+        int sq = (int)to_float(obs_row[CH_VALID_TO + k]);
+        atomicAdd(&move_context_wgrad_f[(CH_MOVE_CONTEXT_VALID_TO + sq) * hidden + h], g);
+    }
+}
+
+// ---- Chess encoder structs ----
+
+struct ChessEmbedEncoderWeights {
+    PrecisionTensor board_w, move_context_w, meta_w, bias;
+    int obs_size, hidden;
+};
+
+struct ChessEmbedEncoderActivations {
+    PrecisionTensor meta, out, saved_obs;
+    PrecisionTensor board_wgrad, move_context_wgrad, meta_wgrad, bgrad;
+    FloatTensor board_wgrad_f, move_context_wgrad_f;
+};
+
+// ---- Chess encoder interface ----
+
+static ChessEmbedEncoderWeights* chess_embed_encoder_create(int obs_size, int hidden) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)calloc(1, sizeof(ChessEmbedEncoderWeights));
+    ew->obs_size = obs_size;
+    ew->hidden = hidden;
+    return ew;
+}
+
+static PrecisionTensor chess_embed_encoder_forward(void* w, void* activations,
+        PrecisionTensor input, cudaStream_t stream) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    ChessEmbedEncoderActivations* a = (ChessEmbedEncoderActivations*)activations;
+    int B = input.shape[0];
+
+    if (a->saved_obs.data) puf_copy(&a->saved_obs, &input, stream);
+    chess_meta_kernel<<<grid_size(B * CH_META), BLOCK_SIZE, 0, stream>>>(
+        a->meta.data, input.data, B, ew->obs_size);
+    puf_mm(&a->meta, &ew->meta_w, &a->out, stream);
+    chess_embed_forward_kernel<<<grid_size(B * ew->hidden), BLOCK_SIZE, 0, stream>>>(
+        a->out.data, input.data, ew->board_w.data, ew->move_context_w.data, ew->bias.data,
+        B, ew->hidden, ew->obs_size);
+    return a->out;
+}
+
+static void chess_embed_encoder_backward(void* w, void* activations,
+        PrecisionTensor grad, cudaStream_t stream) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    ChessEmbedEncoderActivations* a = (ChessEmbedEncoderActivations*)activations;
+    int B = grad.shape[0];
+    int H = ew->hidden;
+
+    n3_relu_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+        grad.data, a->out.data, B * H);
+    bias_grad_kernel<<<H, 256, 0, stream>>>(a->bgrad.data, grad.data, B, H);
+    puf_mm_tn(&grad, &a->meta, &a->meta_wgrad, stream);
+
+    int board_n = CH_BOARD_FEATURES * H;
+    int move_context_n = CH_MOVE_CONTEXT_FEATURES * H;
+    cudaMemsetAsync(a->board_wgrad_f.data, 0, board_n * sizeof(float), stream);
+    cudaMemsetAsync(a->move_context_wgrad_f.data, 0, move_context_n * sizeof(float), stream);
+    chess_embed_backward_kernel<<<grid_size(B * H), BLOCK_SIZE, 0, stream>>>(
+        a->board_wgrad_f.data, a->move_context_wgrad_f.data, grad.data, a->saved_obs.data,
+        B, H, ew->obs_size);
+    n3_float_to_precision_kernel<<<grid_size(board_n), BLOCK_SIZE, 0, stream>>>(
+        a->board_wgrad.data, a->board_wgrad_f.data, board_n);
+    n3_float_to_precision_kernel<<<grid_size(move_context_n), BLOCK_SIZE, 0, stream>>>(
+        a->move_context_wgrad.data, a->move_context_wgrad_f.data, move_context_n);
+}
+
+static void chess_embed_encoder_init_weights(void* w, uint64_t* seed, cudaStream_t stream) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    puf_normal_init(&ew->board_w, 0.02f, (*seed)++, stream);
+    puf_normal_init(&ew->move_context_w, 0.02f, (*seed)++, stream);
+    PrecisionTensor wt = {.data = ew->meta_w.data, .shape = {ew->hidden, CH_META}};
+    puf_kaiming_init(&wt, 1.0f, (*seed)++, stream);
+    cudaMemsetAsync(ew->bias.data, 0, numel(ew->bias.shape) * sizeof(precision_t), stream);
+}
+
+static void chess_embed_encoder_reg_params(void* w, Allocator* alloc) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    ew->board_w = {.shape = {CH_BOARD_FEATURES, ew->hidden}};
+    ew->move_context_w = {.shape = {CH_MOVE_CONTEXT_FEATURES, ew->hidden}};
+    ew->meta_w = {.shape = {ew->hidden, CH_META}};
+    ew->bias = {.shape = {ew->hidden}};
+    alloc_register(alloc, &ew->board_w);
+    alloc_register(alloc, &ew->move_context_w);
+    alloc_register(alloc, &ew->meta_w);
+    alloc_register(alloc, &ew->bias);
+}
+
+static void chess_embed_encoder_reg_train(void* w, void* activations,
+        Allocator* acts, Allocator* grads, int B_TT) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    ChessEmbedEncoderActivations* a = (ChessEmbedEncoderActivations*)activations;
+    *a = {};
+    a->meta = {.shape = {B_TT, CH_META}};
+    a->out = {.shape = {B_TT, ew->hidden}};
+    a->saved_obs = {.shape = {B_TT, ew->obs_size}};
+    alloc_register(acts, &a->meta);
+    alloc_register(acts, &a->out);
+    alloc_register(acts, &a->saved_obs);
+
+    a->board_wgrad = {.shape = {CH_BOARD_FEATURES, ew->hidden}};
+    a->move_context_wgrad = {.shape = {CH_MOVE_CONTEXT_FEATURES, ew->hidden}};
+    a->meta_wgrad = {.shape = {ew->hidden, CH_META}};
+    a->bgrad = {.shape = {ew->hidden}};
+    a->board_wgrad_f = {.shape = {CH_BOARD_FEATURES, ew->hidden}};
+    a->move_context_wgrad_f = {.shape = {CH_MOVE_CONTEXT_FEATURES, ew->hidden}};
+    alloc_register(grads, &a->board_wgrad);
+    alloc_register(grads, &a->move_context_wgrad);
+    alloc_register(grads, &a->meta_wgrad);
+    alloc_register(grads, &a->bgrad);
+    alloc_register(acts, &a->board_wgrad_f);
+    alloc_register(acts, &a->move_context_wgrad_f);
+}
+
+static void chess_embed_encoder_reg_rollout(void* w, void* activations,
+        Allocator* alloc, int B) {
+    ChessEmbedEncoderWeights* ew = (ChessEmbedEncoderWeights*)w;
+    ChessEmbedEncoderActivations* a = (ChessEmbedEncoderActivations*)activations;
+    a->meta = {.shape = {B, CH_META}};
+    a->out = {.shape = {B, ew->hidden}};
+    alloc_register(alloc, &a->meta);
+    alloc_register(alloc, &a->out);
+}
+
+static void* chess_embed_encoder_create_weights(void* self) {
+    Encoder* e = (Encoder*)self;
+    return chess_embed_encoder_create(e->in_dim, e->out_dim);
+}
+static void chess_embed_encoder_free_weights(void* weights) { free(weights); }
+static void chess_embed_encoder_free_activations(void* activations) { free(activations); }
+
 // Override encoder vtable for known ocean environments. No-op for unknown envs.
 static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
     if (env_name == "nmmo3") {
@@ -585,6 +872,20 @@ static void create_custom_encoder(const std::string& env_name, Encoder* enc) {
             .free_activations = nmmo3_encoder_free_activations,
             .in_dim = enc->in_dim, .out_dim = enc->out_dim,
             .activation_size = sizeof(NMMO3EncoderActivations),
+        };
+    } else if (env_name == "chess") {
+        *enc = Encoder{
+            .forward = chess_embed_encoder_forward,
+            .backward = chess_embed_encoder_backward,
+            .init_weights = chess_embed_encoder_init_weights,
+            .reg_params = chess_embed_encoder_reg_params,
+            .reg_train = chess_embed_encoder_reg_train,
+            .reg_rollout = chess_embed_encoder_reg_rollout,
+            .create_weights = chess_embed_encoder_create_weights,
+            .free_weights = chess_embed_encoder_free_weights,
+            .free_activations = chess_embed_encoder_free_activations,
+            .in_dim = enc->in_dim, .out_dim = enc->out_dim,
+            .activation_size = sizeof(ChessEmbedEncoderActivations),
         };
     }
 }
