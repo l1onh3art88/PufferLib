@@ -93,6 +93,9 @@ def setup(pufferl, backend, args, run_id):
 
     total_agents = int(args['vec']['total_agents'])
     num_buffers = int(args['vec']['num_buffers'])
+    if total_agents % num_buffers != 0:
+        raise RuntimeError(f'total_agents ({total_agents}) must be divisible by '
+                           f'num_buffers ({num_buffers})')
     agents_per_buffer = total_agents // num_buffers
 
     num_envs = backend.num_envs(pufferl)

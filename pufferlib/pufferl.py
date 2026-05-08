@@ -233,15 +233,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     # Selfplay-pool curriculum (no-op unless selfplay.enabled). Disabled
     # under match-mode sweeps since match() owns its own perm/frozen bank.
     pool_state = None
-    if not match_mode:
-        try:
-            pool_state = selfplay.setup(pufferl, backend, args, run_id)
-        except RuntimeError as e:
-            print(f'WARNING: {e}, skipping')
-            backend.close(pufferl)
-            if result_queue is not None:
-                result_queue.put((args['gpu_id'], [], [], []))
-            return
+    try:
+        pool_state = selfplay.setup(pufferl, backend, args, run_id)
+    except RuntimeError as e:
+        print(f'WARNING: {e}, skipping')
+        backend.close(pufferl)
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], [], [], []))
+        return
 
     model_path = ''
     flat_logs = {}
