@@ -1,7 +1,17 @@
 """Selfplay-pool training: a fraction of envs play primary vs a frozen historical
-snapshot, the rest are pure selfplay. The current opponent is advanced from a
-disk-backed pool when primary beats it at >= swap_winrate over min_games. Used
-by `_train` in pufferl.py — gated on `selfplay.enabled` (config section).
+snapshot, the rest are pure selfplay. Used by `_train` in pufferl.py — gated on
+`selfplay.enabled` (config section).
+
+Pool grows on two triggers:
+  - snapshot_interval: every N global steps, save primary weights as a new
+    pool entry regardless of winrate. Provides a steady cadence.
+  - winrate-driven swap: when primary beats the current opponent at >=
+    swap_winrate over >= min_games, also save primary as a pool entry, then
+    swap to a new opponent. Marks progress checkpoints in the curriculum.
+
+Swap (without a snapshot) also fires when opp_timeout_steps have elapsed
+since the current opponent was finalized. Timeout prevents stalemates from
+pinning the curriculum to a single opponent indefinitely.
 
 Pool storage is disk-only (paths held in memory; weights only on GPU when
 loaded as the frozen bank). Stride-eviction preserves temporal coverage when
@@ -138,6 +148,8 @@ def setup(pufferl, backend, args, run_id):
         'max_size': int(sp['max_size']),
         'min_games': int(sp['min_games']),
         'swap_winrate': float(sp['swap_winrate']),
+        'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
+        'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
         'num_hist_envs': num_hist_envs,
         'hist_score': 0.0,
         'hist_n': 0.0,
@@ -150,6 +162,8 @@ def setup(pufferl, backend, args, run_id):
         'elo_k': elo_k,
         'last_winrate_at_swap': 0.0,
         'last_epochs_to_align': 0,
+        'last_snapshot_step': int(pufferl.global_step),
+        'opp_started_step': int(pufferl.global_step),
     }
 
 
@@ -178,6 +192,29 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
     winrate = (pool_state['hist_score'] / pool_state['hist_n']
                    if pool_state['hist_n'] > 0 else None)
 
+    # Snapshot cadence is independent of swap. Anchored to setup-time global_step
+    # so the bootstrap entry counts as snapshot 0 and the interval starts there.
+    # Set snapshot_interval to 0 to disable interval-based snapshotting.
+    if (pool_state['snapshot_interval'] > 0
+            and pufferl.global_step - pool_state['last_snapshot_step']
+                >= pool_state['snapshot_interval']):
+        snap_path = os.path.join(pool_state['pool_dir'],
+            f'{pufferl.global_step:016d}.bin')
+        backend.save_weights(pufferl, snap_path)
+        pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+        pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
+        pool_state['last_snapshot_step'] = int(pufferl.global_step)
+
+    # Swap trigger: winrate breach OR opp_timeout_steps elapsed since the
+    # current opponent was finalized. Timeout prevents permanent stalemate on
+    # a single opponent. Set opp_timeout_steps to 0 to disable the timeout.
+    winrate_met = (winrate is not None
+        and pool_state['hist_n'] >= pool_state['min_games']
+        and winrate >= pool_state['swap_winrate'])
+    timed_out = (pool_state['opp_timeout_steps'] > 0
+        and pufferl.global_step - pool_state['opp_started_step']
+            >= pool_state['opp_timeout_steps'])
+
     if pool_state['pending_opp_path'] is not None:
         if backend.count_aligned(pufferl, 1, 0) >= pool_state['num_hist_envs']:
             backend.load_frozen_bank(pufferl, 0, pool_state['pending_opp_path'])
@@ -188,20 +225,26 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
             pool_state['pending_opp_elo'] = None
             pool_state['hist_score'] = 0.0
             pool_state['hist_n'] = 0.0
+            pool_state['opp_started_step'] = int(pufferl.global_step)
             pool_state['last_epochs_to_align'] = epoch - pool_state['epoch_armed']
-    elif winrate is not None and (
-            pool_state['hist_n'] >= pool_state['min_games']
-            and winrate >= pool_state['swap_winrate']):
-        snap_path = os.path.join(pool_state['pool_dir'],
-            f'{pufferl.global_step:016d}.bin')
-        backend.save_weights(pufferl, snap_path)
-        pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
-        pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
+    elif winrate_met or timed_out:
+        # Beating the current opponent past swap_winrate adds primary to the
+        # pool only while the pool is still small (<  10).
+        # After that, only the interval cadence grows the pool — prevents
+        # late-training instant-solve cycles from bloating it with duplicates.
+        # Timeout-driven swaps never snapshot (stalemate, not progress).
+        if winrate_met and len(pool_state['pool']) < 10:
+            snap_path = os.path.join(pool_state['pool_dir'],
+                f'{pufferl.global_step:016d}.bin')
+            backend.save_weights(pufferl, snap_path)
+            pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+            pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
+            pool_state['last_snapshot_step'] = int(pufferl.global_step)
         opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
         pool_state['pending_opp_path'] = opp_entry['path']
         pool_state['pending_opp_elo'] = opp_entry['elo']
         pool_state['epoch_armed'] = epoch
-        pool_state['last_winrate_at_swap'] = winrate
+        pool_state['last_winrate_at_swap'] = winrate if winrate is not None else 0.0
 
     # Emit at end so dashboard sees the latest values from any updates above.
     # env/* prefix surfaces in dashboard; only learning policy's Elo is reported.
