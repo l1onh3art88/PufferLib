@@ -380,7 +380,9 @@ typedef struct {
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
-    Dict* out = create_dict(32);
+    // Capacity raised from 32 to 64 to accommodate chess's per-bank
+    // hist_score_bank_<b> / hist_n_bank_<b> entries (16 keys for 8 banks).
+    Dict* out = create_dict(64);
     static_vec_log(pufferl.vec, out);
     return out;
 }

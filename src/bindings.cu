@@ -107,7 +107,9 @@ pybind11::dict puf_eval_log(pybind11::object pufferl_obj) {
     pufferl.last_log_step = pufferl.global_step;
  
     pybind11::dict env_dict;
-    Dict* env_out = create_dict(32);
+    // Capacity 64 to fit chess's per-bank hist_score_bank/hist_n_bank entries
+    // (16 keys across 8 banks) on top of base env-log fields.
+    Dict* env_out = create_dict(64);
     static_vec_eval_log(pufferl.vec, env_out);
     for (int i = 0; i < env_out->size; i++) {
         env_dict[env_out->items[i].key] = env_out->items[i].value;
