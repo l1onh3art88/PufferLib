@@ -26,7 +26,7 @@ from pufferlib import _C
 
 def sample_opponent(pool, rng):
     candidates = pool if len(pool) < 6 else pool[:-5]
-    weights = np.array([(i + 1) ** 2 for i in range(len(candidates))], dtype=np.float64)
+    weights = np.array([(i + 1) ** 0.5 for i in range(len(candidates))], dtype=np.float64)
     weights /= weights.sum()
     idx = int(rng.choice(len(candidates), p=weights))
     return candidates[idx]
@@ -47,34 +47,48 @@ def evict(pool, max_size):
     return pool[:half:2] + pool[half:]
 
 
-def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_size, num_envs):
-    '''Build env-slot -> rollout-row routing and per-env historical tag.
+def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_sizes, num_envs):
+    '''Build env-slot -> rollout-row routing and per-env bank tag.
 
-    Generalizes to any NvN competitive env. Each env has agents_per_env slots
-    split into two equal teams of size team_size = agents_per_env // 2:
-    slots [0, team_size) are "team A" (always primary); slots [team_size,
-    agents_per_env) are "team B" (frozen on historical envs, primary on selfplay).
+    Multi-bank generalization. `frozen_sizes` is a list of per-bank agent counts
+    (per buffer). With one bank this reduces to the legacy single-bank layout.
 
-    Per-buffer physical-row layout (apb = agents_per_buffer):
-        [0, apb-2*frozen_size)         primary — selfplay envs (all slots)
-        [apb-2*frozen_size, apb-frozen_size) primary — historical envs' team A
-        [apb-frozen_size, apb)         frozen  — historical envs' team B
+    Per-buffer physical-row layout (apb = agents_per_buffer, F = sum(frozen_sizes)):
+        [0,           apb - 2F)                       primary — selfplay envs (all slots)
+        [apb - 2F,    apb - F)                        primary — historical envs' team A
+        [apb - F,     apb - F + frozen_sizes[0])      bank 0  — historical envs' team B
+        [apb - F + frozen_sizes[0], ... + ...[1])     bank 1  — ... etc.
 
     Env order within a buffer: selfplay envs first (tag=0), then historical
-    envs (tag=1). frozen_size counts agent slots (= hist_envs * team_size).
-    Primary region [0, apb-frozen_size) matches bank_layout[1] regardless of
-    team_size or env order. Returns (perm, tags, num_historical_envs_total).'''
+    envs assigned to banks in block order — the first `frozen_sizes[0]/team_size`
+    historical envs play bank 0 (tag=1), next block plays bank 1 (tag=2), etc.
+
+    The C-side bank_layout (pufferlib.cu:1798-1806) lays banks out sequentially
+    after primary, so our routing matches: bank b's slice is
+    [apb - F + sum(frozen_sizes[:b]),  apb - F + sum(frozen_sizes[:b+1])).
+
+    Returns (perm, tags, num_hist_envs_per_bank) — last is a list of per-bank
+    historical-env counts across all buffers, used by selfplay.step to know how
+    many env alignments to wait for per bank during swaps.'''
     team_size = agents_per_env // 2
     envs_per_buffer = agents_per_buffer // agents_per_env
-    hist_envs_per_buffer = frozen_size // team_size
-    selfplay_envs = envs_per_buffer - hist_envs_per_buffer
+    num_banks = len(frozen_sizes)
+    total_frozen = sum(frozen_sizes)
+    hist_envs_per_bank_per_buffer = [fs // team_size for fs in frozen_sizes]
+    total_hist_envs_per_buffer = sum(hist_envs_per_bank_per_buffer)
+    selfplay_envs = envs_per_buffer - total_hist_envs_per_buffer
     perm = np.empty(num_buffers * agents_per_buffer, dtype=np.int32)
     tags = np.zeros(num_envs, dtype=np.int32)
     env_idx = 0
-    for b in range(num_buffers):
-        buf_start          = b * agents_per_buffer
-        hist_primary_start = buf_start + agents_per_buffer - 2 * frozen_size
-        frozen_start       = buf_start + agents_per_buffer - frozen_size
+    for b_buf in range(num_buffers):
+        buf_start          = b_buf * agents_per_buffer
+        hist_primary_start = buf_start + agents_per_buffer - 2 * total_frozen
+        bank_starts = []
+        offset = buf_start + agents_per_buffer - total_frozen
+        for bank in range(num_banks):
+            bank_starts.append(offset)
+            offset += frozen_sizes[bank]
+        h_within_buffer = 0
         for e in range(envs_per_buffer):
             slot_base = buf_start + e * agents_per_env
             if e < selfplay_envs:
@@ -82,13 +96,24 @@ def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_size,
                     perm[slot_base + s] = slot_base + s
                 tags[env_idx] = 0
             else:
-                h = e - selfplay_envs
+                # Block assignment: walk cumulative bank capacity to find which
+                # bank this historical env belongs to.
+                bank_idx = 0
+                cum = hist_envs_per_bank_per_buffer[0]
+                while h_within_buffer >= cum and bank_idx < num_banks - 1:
+                    bank_idx += 1
+                    cum += hist_envs_per_bank_per_buffer[bank_idx]
+                h_in_bank = h_within_buffer - (cum - hist_envs_per_bank_per_buffer[bank_idx])
+                team_a_offset = hist_primary_start + h_within_buffer * team_size
+                team_b_offset = bank_starts[bank_idx] + h_in_bank * team_size
                 for s in range(team_size):
-                    perm[slot_base + s] = hist_primary_start + h * team_size + s
-                    perm[slot_base + team_size + s] = frozen_start + h * team_size + s
-                tags[env_idx] = 1
+                    perm[slot_base + s] = team_a_offset + s
+                    perm[slot_base + team_size + s] = team_b_offset + s
+                tags[env_idx] = bank_idx + 1
+                h_within_buffer += 1
             env_idx += 1
-    return perm, tags, hist_envs_per_buffer * num_buffers
+    num_hist_envs_per_bank = [n * num_buffers for n in hist_envs_per_bank_per_buffer]
+    return perm, tags, num_hist_envs_per_bank
 
 
 def setup(pufferl, backend, args, run_id):
@@ -117,17 +142,27 @@ def setup(pufferl, backend, args, run_id):
                            f'agents_per_env ({agents_per_env})')
     team_size = agents_per_env // 2
 
+    num_banks = int(args['vec'].get('num_frozen_banks', 1))
+    if num_banks <= 0:
+        raise RuntimeError('selfplay.enabled requires num_frozen_banks >= 1')
+    if num_banks > 8:
+        raise RuntimeError(f'num_frozen_banks {num_banks} exceeds chess.h CHESS_MAX_BANKS=8')
+
+    # frozen_bank_pct is per-bank (matches C-side: pufferlib.cu:2069). Each bank
+    # gets floor(apb * pct) agents, total historical = num_banks * frozen_size.
     frozen_size = int(agents_per_buffer * float(args['vec']['frozen_bank_pct']))
-    # Align to whole teams so each historical env contributes exactly team_size frozen slots.
     frozen_size -= frozen_size % team_size
     if frozen_size <= 0:
         raise RuntimeError('selfplay.enabled but frozen_bank_pct rounds to 0 slots '
                            f'after team-size ({team_size}) alignment')
-    if frozen_size >= agents_per_buffer // 2:
-        raise RuntimeError(f'frozen_size {frozen_size} >= apb/2 {agents_per_buffer//2}')
+    total_frozen = frozen_size * num_banks
+    if total_frozen >= agents_per_buffer // 2:
+        raise RuntimeError(f'total_frozen {total_frozen} (= num_banks {num_banks} '
+                           f'* per_bank {frozen_size}) >= apb/2 {agents_per_buffer//2}')
 
-    perm, tags, num_hist_envs = build_perm_tags(
-        num_buffers, agents_per_buffer, agents_per_env, frozen_size, num_envs)
+    frozen_sizes = [frozen_size] * num_banks
+    perm, tags, num_hist_envs_per_bank = build_perm_tags(
+        num_buffers, agents_per_buffer, agents_per_env, frozen_sizes, num_envs)
     backend.set_agent_perm(pufferl, perm)
     backend.set_env_tags(pufferl, tags)
 
@@ -135,11 +170,29 @@ def setup(pufferl, backend, args, run_id):
     os.makedirs(pool_dir, exist_ok=True)
     bootstrap_path = os.path.join(pool_dir, f'{pufferl.global_step:016d}.bin')
     backend.save_weights(pufferl, bootstrap_path)
-    backend.load_frozen_bank(pufferl, 0, bootstrap_path)
+    # Load bootstrap into every bank — they'll diverge as each bank's swap fires.
+    for b in range(num_banks):
+        backend.load_frozen_bank(pufferl, b, bootstrap_path)
 
     elo_init = float(sp.get('elo_init', 0.0))
     elo_k    = float(sp.get('elo_k',    16.0))
     rng = np.random.default_rng(int(sp.get('seed', 0)))
+
+    banks_state = []
+    for b in range(num_banks):
+        banks_state.append({
+            'cur_opp_path': bootstrap_path,
+            'cur_opp_elo': elo_init,
+            'hist_score': 0.0,
+            'hist_n': 0.0,
+            'pending_opp_path': None,
+            'pending_opp_elo': None,
+            'epoch_armed': 0,
+            'opp_started_step': int(pufferl.global_step),
+            'num_hist_envs': num_hist_envs_per_bank[b],
+            'last_winrate_at_swap': 0.0,
+            'last_epochs_to_align': 0,
+        })
 
     return {
         'pool_dir': pool_dir,
@@ -150,20 +203,11 @@ def setup(pufferl, backend, args, run_id):
         'swap_winrate': float(sp['swap_winrate']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
-        'num_hist_envs': num_hist_envs,
-        'hist_score': 0.0,
-        'hist_n': 0.0,
-        'cur_opp_path': bootstrap_path,
-        'cur_opp_elo': elo_init,
-        'pending_opp_path': None,
-        'pending_opp_elo': None,
-        'epoch_armed': 0,
+        'num_banks': num_banks,
+        'banks': banks_state,
         'primary_elo': elo_init,
         'elo_k': elo_k,
-        'last_winrate_at_swap': 0.0,
-        'last_epochs_to_align': 0,
         'last_snapshot_step': int(pufferl.global_step),
-        'opp_started_step': int(pufferl.global_step),
     }
 
 
@@ -171,30 +215,31 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
     if pool_state is None:
         return
 
-    # Recover raw counts: aggregator divides Log fields by total n_window.
     n_window = float(flat_logs.get('env/n', 0.0))
-    hist_score_window = float(flat_logs.get('env/hist_score', 0.0)) * n_window
-    hist_n_window     = float(flat_logs.get('env/hist_n',     0.0)) * n_window
+    num_banks = pool_state['num_banks']
 
-    if hist_n_window > 0.0:
-        pool_state['hist_score'] += hist_score_window
-        pool_state['hist_n']     += hist_n_window
-        score_rate = hist_score_window / hist_n_window
-        new_p, new_o = update_elo(pool_state['primary_elo'],
-            pool_state['cur_opp_elo'], score_rate, pool_state['elo_k'])
-        pool_state['primary_elo'] = new_p
-        pool_state['cur_opp_elo'] = new_o
-        for entry in pool_state['pool']:
-            if entry['path'] == pool_state['cur_opp_path']:
-                entry['elo'] = new_o
-                break
+    # 1. Per-bank Elo update from the most recent rollout window.
+    for b in range(num_banks):
+        bank = pool_state['banks'][b]
+        hist_score_w = float(flat_logs.get(f'env/hist_score_bank_{b}', 0.0)) * n_window
+        hist_n_w     = float(flat_logs.get(f'env/hist_n_bank_{b}',     0.0)) * n_window
+        if hist_n_w > 0.0:
+            bank['hist_score'] += hist_score_w
+            bank['hist_n']     += hist_n_w
+            score_rate = hist_score_w / hist_n_w
+            new_p, new_o = update_elo(pool_state['primary_elo'],
+                bank['cur_opp_elo'], score_rate, pool_state['elo_k'])
+            # All banks update the shared primary Elo. Multiple banks updating
+            # primary in one step is fine — Elo is symmetric, just a few more
+            # tiny adjustments per rollout window.
+            pool_state['primary_elo'] = new_p
+            bank['cur_opp_elo'] = new_o
+            for entry in pool_state['pool']:
+                if entry['path'] == bank['cur_opp_path']:
+                    entry['elo'] = new_o
+                    break
 
-    winrate = (pool_state['hist_score'] / pool_state['hist_n']
-                   if pool_state['hist_n'] > 0 else None)
-
-    # Snapshot cadence is independent of swap. Anchored to setup-time global_step
-    # so the bootstrap entry counts as snapshot 0 and the interval starts there.
-    # Set snapshot_interval to 0 to disable interval-based snapshotting.
+    # 2. Global snapshot cadence (shared across banks).
     if (pool_state['snapshot_interval'] > 0
             and pufferl.global_step - pool_state['last_snapshot_step']
                 >= pool_state['snapshot_interval']):
@@ -205,53 +250,68 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
         pool_state['last_snapshot_step'] = int(pufferl.global_step)
 
-    # Swap trigger: winrate breach OR opp_timeout_steps elapsed since the
-    # current opponent was finalized. Timeout prevents permanent stalemate on
-    # a single opponent. Set opp_timeout_steps to 0 to disable the timeout.
-    winrate_met = (winrate is not None
-        and pool_state['hist_n'] >= pool_state['min_games']
-        and winrate >= pool_state['swap_winrate'])
-    timed_out = (pool_state['opp_timeout_steps'] > 0
-        and pufferl.global_step - pool_state['opp_started_step']
-            >= pool_state['opp_timeout_steps'])
+    # 3. Per-bank swap logic. Each bank decides independently based on its own
+    # winrate. Tags 1..num_banks correspond to bank 0..num_banks-1.
+    for b in range(num_banks):
+        bank = pool_state['banks'][b]
+        winrate = (bank['hist_score'] / bank['hist_n']
+                       if bank['hist_n'] > 0 else None)
+        winrate_met = (winrate is not None
+            and bank['hist_n'] >= pool_state['min_games']
+            and winrate >= pool_state['swap_winrate'])
+        timed_out = (pool_state['opp_timeout_steps'] > 0
+            and pufferl.global_step - bank['opp_started_step']
+                >= pool_state['opp_timeout_steps'])
+        tag_value = b + 1
 
-    if pool_state['pending_opp_path'] is not None:
-        if backend.count_aligned(pufferl, 1, 0) >= pool_state['num_hist_envs']:
-            backend.load_frozen_bank(pufferl, 0, pool_state['pending_opp_path'])
-            backend.count_aligned(pufferl, 1, 1)
-            pool_state['cur_opp_path'] = pool_state['pending_opp_path']
-            pool_state['cur_opp_elo'] = pool_state['pending_opp_elo']
-            pool_state['pending_opp_path'] = None
-            pool_state['pending_opp_elo'] = None
-            pool_state['hist_score'] = 0.0
-            pool_state['hist_n'] = 0.0
-            pool_state['opp_started_step'] = int(pufferl.global_step)
-            pool_state['last_epochs_to_align'] = epoch - pool_state['epoch_armed']
-    elif winrate_met or timed_out:
-        # Beating the current opponent past swap_winrate adds primary to the
-        # pool only while the pool is still small (<  10).
-        # After that, only the interval cadence grows the pool — prevents
-        # late-training instant-solve cycles from bloating it with duplicates.
-        # Timeout-driven swaps never snapshot (stalemate, not progress).
-        if winrate_met and len(pool_state['pool']) < 10:
-            snap_path = os.path.join(pool_state['pool_dir'],
-                f'{pufferl.global_step:016d}.bin')
-            backend.save_weights(pufferl, snap_path)
-            pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
-            pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
-            pool_state['last_snapshot_step'] = int(pufferl.global_step)
-        opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
-        pool_state['pending_opp_path'] = opp_entry['path']
-        pool_state['pending_opp_elo'] = opp_entry['elo']
-        pool_state['epoch_armed'] = epoch
-        pool_state['last_winrate_at_swap'] = winrate if winrate is not None else 0.0
+        if bank['pending_opp_path'] is not None:
+            if backend.count_aligned(pufferl, tag_value, 0) >= bank['num_hist_envs']:
+                backend.load_frozen_bank(pufferl, b, bank['pending_opp_path'])
+                backend.count_aligned(pufferl, tag_value, 1)
+                bank['cur_opp_path'] = bank['pending_opp_path']
+                bank['cur_opp_elo'] = bank['pending_opp_elo']
+                bank['pending_opp_path'] = None
+                bank['pending_opp_elo'] = None
+                bank['hist_score'] = 0.0
+                bank['hist_n'] = 0.0
+                bank['opp_started_step'] = int(pufferl.global_step)
+                bank['last_epochs_to_align'] = epoch - bank['epoch_armed']
+        elif winrate_met or timed_out:
+            # Winrate-driven snapshot kept while pool is small (< 10). After
+            # that, only the global interval cadence grows the pool. Timeout
+            # swaps never snapshot (stalemate, not progress).
+            if winrate_met and len(pool_state['pool']) < 10:
+                snap_path = os.path.join(pool_state['pool_dir'],
+                    f'{pufferl.global_step:016d}.bin')
+                backend.save_weights(pufferl, snap_path)
+                pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+                pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
+                pool_state['last_snapshot_step'] = int(pufferl.global_step)
+            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
+            bank['pending_opp_path'] = opp_entry['path']
+            bank['pending_opp_elo'] = opp_entry['elo']
+            bank['epoch_armed'] = epoch
+            bank['last_winrate_at_swap'] = winrate if winrate is not None else 0.0
 
-    # Emit at end so dashboard sees the latest values from any updates above.
-    # env/* prefix surfaces in dashboard; only learning policy's Elo is reported.
-    flat_logs['pool/size']            = len(pool_state['pool'])
-    flat_logs['env/elo']              = pool_state['primary_elo']
-    flat_logs['pool/winrate_at_swap'] = pool_state['last_winrate_at_swap']
-    flat_logs['pool/epochs_to_align'] = pool_state['last_epochs_to_align']
-    if winrate is not None:
-        flat_logs['pool/winrate']           = winrate
-        flat_logs['env/historical_winrate'] = winrate
+    # 4. Emit logs — per-bank and aggregate.
+    flat_logs['pool/size']     = len(pool_state['pool'])
+    flat_logs['env/elo']       = pool_state['primary_elo']
+    flat_logs['pool/num_banks'] = num_banks
+    total_score = 0.0
+    total_n     = 0.0
+    for b in range(num_banks):
+        bank = pool_state['banks'][b]
+        wr = (bank['hist_score'] / bank['hist_n']
+              if bank['hist_n'] > 0 else None)
+        flat_logs[f'pool/winrate_at_swap_bank_{b}'] = bank['last_winrate_at_swap']
+        flat_logs[f'pool/epochs_to_align_bank_{b}'] = bank['last_epochs_to_align']
+        if wr is not None:
+            flat_logs[f'pool/winrate_bank_{b}']           = wr
+            flat_logs[f'env/historical_winrate_bank_{b}'] = wr
+        total_score += bank['hist_score']
+        total_n     += bank['hist_n']
+    # Aggregate winrate across all banks (legacy compat with old dashboards).
+    if total_n > 0:
+        agg = total_score / total_n
+        flat_logs['pool/winrate']           = agg
+        flat_logs['env/historical_winrate'] = agg

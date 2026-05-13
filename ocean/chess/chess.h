@@ -360,11 +360,16 @@ enum {
     CHESS_MODE_RANDOM = 0,
     CHESS_MODE_SELFPLAY = 1,
     CHESS_MODE_HUMAN = 2,
-    CHESS_MODE_HUMAN_RANDOM = 3
+    CHESS_MODE_HUMAN_RANDOM = 3,
+    CHESS_MODE_MAIA = 4
 };
 
 #define CHESS_TAG_SELFPLAY 0
 #define CHESS_TAG_HISTORICAL 1
+// Multi-bank selfplay: env tags are 1..CHESS_MAX_BANKS, one tag value per
+// frozen bank. tag = 0 means pure selfplay env (no historical opponent).
+// Backward compat: with num_frozen_banks=1, tag=1 still means "play bank 0".
+#define CHESS_MAX_BANKS 8
 
 typedef struct {
     float perf;
@@ -379,12 +384,26 @@ typedef struct {
     // slot 1 = frozen policy B. In selfplay training both should average ~0.5.
     float slot_0_score;
     float slot_1_score;
-    // Historical-pool tracking. Summed only on envs tagged TAG_HISTORICAL (slot 0 =
-    // primary, slot 1 = frozen). Recover winrate in Python as hist_score/hist_n
-    // (the framework's divide-by-total_n cancels in the ratio).
+    // Per-bank historical tracking. hist_score_bank[b] sums primary's score
+    // (1.0 win / 0.5 draw / 0 loss) on historical envs tagged b+1; hist_n_bank
+    // counts those games. Python recovers per-bank winrate as score/n. The
+    // legacy aggregates hist_score / hist_n sum across all banks for backward
+    // compat with single-bank dashboards.
     float hist_score;
     float hist_n;
+    float hist_score_bank[CHESS_MAX_BANKS];
+    float hist_n_bank[CHESS_MAX_BANKS];
     float n;
+    // Eval diagnostics (non-selfplay modes). Per-color score/games let Python
+    // compute per-color win rate and surface obs-flip / perspective bugs as
+    // lopsided splits. maia_failures counts how often maia_get_move returned
+    // MOVE_NONE and we fell back to a random legal move — non-zero means part
+    // of the eval is degraded.
+    float wins_as_white;
+    float wins_as_black;
+    float games_as_white;
+    float games_as_black;
+    float maia_failures;
 } Log;
 
 typedef struct {
@@ -497,6 +516,18 @@ typedef struct {
     int has_last_move_highlight;
     Square last_move_from;
     Square last_move_to;
+
+    // CHESS_MODE_MAIA: per-env lc0 subprocess pipes. Initialized lazily on the
+    // first opponent move. -1 / 0 means "not yet spawned".
+    int maia_pid;
+    int maia_stdin_fd;
+    int maia_stdout_fd;
+    // Maia commits its move in one UCI round-trip, but selfplay training shows
+    // the learner a 2-step opponent wait (pick + place phases). Splitting
+    // Maia's move into 2 c_steps (no-op + commit) keeps the learner's LSTM in
+    // the training distribution. 0 = next c_step is the no-op phase, 1 = the
+    // commit phase.
+    int maia_phase;
 } Chess;
 
 static inline Bitboard sq_bb(Square s) {
@@ -2022,6 +2053,242 @@ static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
     return game_result;
 }
 
+// ---- CHESS_MODE_MAIA: external lc0/Maia UCI engine ----
+// Each env owns one lc0 child process. Communication is line-based UCI:
+//   parent → child: "position fen <FEN>\ngo nodes <N>\n"
+//   child  → parent: ... "info ..." ... "bestmove <uci>\n"
+// Configured via env vars: MAIA_LC0_PATH, MAIA_WEIGHTS_PATH, MAIA_NODES,
+// MAIA_BACKEND. MAIA_NODES=1 ≈ weakest Maia setting; raise for stronger play.
+
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+
+static void position_to_fen(const Position* pos, char* out) {
+    char* p = out;
+    // Indexed by Piece enum: W_* are 1..6, B_* are 9..14. Gap at 7..8.
+    static const char pchars[16] = ".PNBRQK??pnbrqk?";
+    for (int rank = 7; rank >= 0; rank--) {
+        int empty = 0;
+        for (int file = 0; file < 8; file++) {
+            Piece pc = piece_on(pos, make_square(file, rank));
+            if (pc == NO_PIECE) {
+                empty++;
+            } else {
+                if (empty > 0) { *p++ = '0' + empty; empty = 0; }
+                *p++ = pchars[pc];
+            }
+        }
+        if (empty > 0) *p++ = '0' + empty;
+        if (rank > 0) *p++ = '/';
+    }
+    *p++ = ' ';
+    *p++ = (pos->sideToMove == CHESS_WHITE) ? 'w' : 'b';
+    *p++ = ' ';
+    int wrote_castle = 0;
+    if (pos->castlingRights & 1) { *p++ = 'K'; wrote_castle = 1; }
+    if (pos->castlingRights & 2) { *p++ = 'Q'; wrote_castle = 1; }
+    if (pos->castlingRights & 4) { *p++ = 'k'; wrote_castle = 1; }
+    if (pos->castlingRights & 8) { *p++ = 'q'; wrote_castle = 1; }
+    if (!wrote_castle) *p++ = '-';
+    *p++ = ' ';
+    if (pos->epSquare != SQ_NONE && (int)pos->epSquare < 64) {
+        *p++ = 'a' + (int)file_of(pos->epSquare);
+        *p++ = '1' + (int)rank_of(pos->epSquare);
+    } else {
+        *p++ = '-';
+    }
+    *p++ = ' ';
+    // Fullmove number isn't tracked on Position; hardcode 1. Halfmove (rule50)
+    // matters for the 50-move rule and is passed through.
+    p += sprintf(p, "%d 1", pos->rule50);
+    *p = '\0';
+}
+
+// Parse a UCI move like "e2e4" or "g7g8q" against the env's current legal list.
+// Returns MOVE_NONE if not found.
+static Move uci_to_move(const char* uci, const MoveList* legal) {
+    if (uci[0] < 'a' || uci[0] > 'h' || uci[2] < 'a' || uci[2] > 'h') return MOVE_NONE;
+    int from_file = uci[0] - 'a';
+    int from_rank = uci[1] - '1';
+    int to_file   = uci[2] - 'a';
+    int to_rank   = uci[3] - '1';
+    if (from_rank < 0 || from_rank > 7 || to_rank < 0 || to_rank > 7) return MOVE_NONE;
+    Square from = make_square(from_file, from_rank);
+    Square to   = make_square(to_file,   to_rank);
+    int promo_pt = -1;
+    if (uci[4] == 'q') promo_pt = QUEEN;
+    else if (uci[4] == 'r') promo_pt = ROOK;
+    else if (uci[4] == 'b') promo_pt = BISHOP;
+    else if (uci[4] == 'n') promo_pt = KNIGHT;
+    for (int i = 0; i < legal->count; i++) {
+        Move m = legal->moves[i].move;
+        if (from_sq(m) != from || to_sq(m) != to) continue;
+        if (promo_pt >= 0) {
+            if (type_of_m(m) != PROMOTION) continue;
+            if ((int)promotion_type(m) != promo_pt) continue;
+        }
+        return m;
+    }
+    return MOVE_NONE;
+}
+
+static int maia_write_all(int fd, const char* buf, int len) {
+    int n = 0;
+    while (n < len) {
+        int w = (int)write(fd, buf + n, (size_t)(len - n));
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        n += w;
+    }
+    return 0;
+}
+
+// Read one line (up to '\n' or buf-1 chars). Returns # bytes (excluding NUL) or
+// -1 on error / EOF. Blocks until a line is available.
+static int maia_read_line(int fd, char* buf, int bufsz) {
+    int n = 0;
+    while (n < bufsz - 1) {
+        char c;
+        int r = (int)read(fd, &c, 1);
+        if (r == 0) return -1;  // EOF
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (c == '\n') break;
+        buf[n++] = c;
+    }
+    buf[n] = '\0';
+    return n;
+}
+
+static void maia_close(Chess* env);
+
+static void maia_init(Chess* env) {
+    if (env->maia_pid > 0) return;  // already spawned
+
+    const char* lc0_path     = getenv("MAIA_LC0_PATH");
+    const char* weights_path = getenv("MAIA_WEIGHTS_PATH");
+    const char* backend_arg  = getenv("MAIA_BACKEND");
+    if (lc0_path == NULL)     lc0_path     = "./lc0";
+    if (weights_path == NULL) weights_path = "lc0/maia-1100.pb.gz";
+
+    int in_pipe[2], out_pipe[2];
+    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0) {
+        fprintf(stderr, "maia_init: pipe() failed\n");
+        env->maia_pid = -1;
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        fprintf(stderr, "maia_init: fork() failed\n");
+        env->maia_pid = -1;
+        return;
+    }
+    if (pid == 0) {
+        // Child: stdin←in_pipe[0], stdout→out_pipe[1].
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        // Redirect stderr to /dev/null so info logs don't spam the parent.
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        close(in_pipe[0]);  close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        char weights_arg[512];
+        snprintf(weights_arg, sizeof(weights_arg), "--weights=%s", weights_path);
+        if (backend_arg) {
+            char backend_buf[128];
+            snprintf(backend_buf, sizeof(backend_buf), "--backend=%s", backend_arg);
+            execlp(lc0_path, "lc0", weights_arg, backend_buf, (char*)NULL);
+        } else {
+            execlp(lc0_path, "lc0", weights_arg, (char*)NULL);
+        }
+        _exit(127);
+    }
+    // Parent.
+    close(in_pipe[0]);  // we write to in_pipe[1]
+    close(out_pipe[1]); // we read from out_pipe[0]
+    env->maia_pid       = (int)pid;
+    env->maia_stdin_fd  = in_pipe[1];
+    env->maia_stdout_fd = out_pipe[0];
+
+    // UCI handshake: send "uci", drain until "uciok"; then "isready", drain
+    // until "readyok". Engine init also loads weights so this can take a few
+    // seconds the first time.
+    char line[1024];
+    if (maia_write_all(env->maia_stdin_fd, "uci\n", 4) < 0) { maia_close(env); return; }
+    while (maia_read_line(env->maia_stdout_fd, line, sizeof(line)) >= 0) {
+        if (strncmp(line, "uciok", 5) == 0) break;
+    }
+    if (maia_write_all(env->maia_stdin_fd, "isready\n", 8) < 0) { maia_close(env); return; }
+    while (maia_read_line(env->maia_stdout_fd, line, sizeof(line)) >= 0) {
+        if (strncmp(line, "readyok", 7) == 0) break;
+    }
+}
+
+static void maia_close(Chess* env) {
+    if (env->maia_pid > 0) {
+        if (env->maia_stdin_fd >= 0) {
+            (void)maia_write_all(env->maia_stdin_fd, "quit\n", 5);
+            close(env->maia_stdin_fd);
+            env->maia_stdin_fd = -1;
+        }
+        if (env->maia_stdout_fd >= 0) {
+            close(env->maia_stdout_fd);
+            env->maia_stdout_fd = -1;
+        }
+        int status;
+        if (waitpid((pid_t)env->maia_pid, &status, WNOHANG) == 0) {
+            kill((pid_t)env->maia_pid, SIGTERM);
+            waitpid((pid_t)env->maia_pid, &status, 0);
+        }
+    }
+    env->maia_pid = 0;
+}
+
+// Ask Maia for the best move at the current env position. Returns a Move that
+// is guaranteed to be in env->legal_moves (or MOVE_NONE on engine failure).
+static Move maia_get_move(Chess* env) {
+    if (env->maia_pid <= 0) {
+        maia_init(env);
+        if (env->maia_pid <= 0) return MOVE_NONE;
+    }
+
+    int nodes = 1;
+    const char* nodes_str = getenv("MAIA_NODES");
+    if (nodes_str) nodes = atoi(nodes_str);
+    if (nodes < 1) nodes = 1;
+
+    char fen[128];
+    position_to_fen(&env->pos, fen);
+    char cmd[256];
+    int n = snprintf(cmd, sizeof(cmd), "position fen %s\ngo nodes %d\n", fen, nodes);
+    if (maia_write_all(env->maia_stdin_fd, cmd, n) < 0) {
+        maia_close(env);
+        return MOVE_NONE;
+    }
+
+    char line[1024];
+    while (1) {
+        int len = maia_read_line(env->maia_stdout_fd, line, sizeof(line));
+        if (len < 0) { maia_close(env); return MOVE_NONE; }
+        if (strncmp(line, "bestmove ", 9) != 0) continue;
+        char uci[8] = {0};
+        int j = 9, k = 0;
+        while (line[j] && line[j] != ' ' && line[j] != '\n' && line[j] != '\r' && k < 7) {
+            uci[k++] = line[j++];
+        }
+        return uci_to_move(uci, &env->legal_moves);
+    }
+}
+
 void c_reset(Chess* env) {
     env->tick = 0;
     env->chess_moves = 0;
@@ -2046,6 +2313,7 @@ void c_reset(Chess* env) {
     } else if (env->mode != CHESS_MODE_SELFPLAY) {
         env->learner_color = 1 - env->learner_color;
     }
+    env->maia_phase = 0;
     
     if (env->fen_curriculum != NULL && env->num_fens > 0) {
         float randvalue = (float)rand_r(&env->rng) / (float)(RAND_MAX);
@@ -2112,6 +2380,30 @@ void c_step(Chess* env) {
             clear_player_selection(env, mover_idx);
             game_result = apply_move_to_env(env, env->legal_moves.moves[idx].move, &is_timeout);
             move_completed = 1;
+        }
+    } else if (env->mode == CHESS_MODE_MAIA && env->pos.sideToMove != env->learner_color) {
+        if (env->legal_moves.count > 0) {
+            if (env->maia_phase == 0) {
+                // First c_step of Maia's "move": no-op so the learner's LSTM
+                // sees a 2-step opponent wait (matches selfplay's pick+place
+                // cadence the policy was trained on).
+                env->maia_phase = 1;
+                move_completed = 1;
+            } else {
+                Move maia_mv = maia_get_move(env);
+                if (maia_mv == MOVE_NONE) {
+                    // Engine failure / unparseable bestmove: fall back to random
+                    // so the trial completes. Logged via log.maia_failures so
+                    // Python can flag a degraded eval.
+                    env->log.maia_failures += 1.0f;
+                    int idx = rand_r(&env->rng) % env->legal_moves.count;
+                    maia_mv = env->legal_moves.moves[idx].move;
+                }
+                clear_player_selection(env, mover_idx);
+                game_result = apply_move_to_env(env, maia_mv, &is_timeout);
+                env->maia_phase = 0;
+                move_completed = 1;
+            }
         }
     } else {
         // Selfplay: side-to-move's action lives in whichever slot plays that color.
@@ -2340,7 +2632,26 @@ void c_step(Chess* env) {
 
         env->log.n += 1.0f;
 
-        if (env->tag == CHESS_TAG_HISTORICAL) {
+        // Per-color split for non-selfplay eval. learner_color is the color the
+        // learner just played; win_value already accounts for whether it won.
+        // A lopsided split (e.g. high white win rate, near-zero black) is the
+        // signature of a broken obs flip / wrong perspective for one color.
+        if (env->mode != CHESS_MODE_SELFPLAY) {
+            if (env->learner_color == CHESS_WHITE) {
+                env->log.wins_as_white += win_value;
+                env->log.games_as_white += 1.0f;
+            } else {
+                env->log.wins_as_black += win_value;
+                env->log.games_as_black += 1.0f;
+            }
+        }
+
+        // Per-bank historical tracking. Tag = 1..CHESS_MAX_BANKS picks the bank
+        // index (tag-1) this env was assigned to play. Tag = 0 is pure selfplay
+        // (skip historical accounting). Backward compat: tag=1 with single bank
+        // still routes into hist_score_bank[0] / hist_n_bank[0].
+        if (env->tag > 0 && env->tag <= CHESS_MAX_BANKS) {
+            int bank_idx = env->tag - 1;
             float primary_score;
             if (game_result == 3) {
                 primary_score = 0.5f;
@@ -2349,6 +2660,9 @@ void c_step(Chess* env) {
             } else {  // Black wins
                 primary_score = (env->slot_for_color[CHESS_BLACK] == 0) ? 1.0f : 0.0f;
             }
+            env->log.hist_score_bank[bank_idx] += primary_score;
+            env->log.hist_n_bank[bank_idx] += 1.0f;
+            // Legacy aggregate fields — sum across all banks.
             env->log.hist_score += primary_score;
             env->log.hist_n += 1.0f;
             env->boundary_reached = 1;
@@ -2477,7 +2791,8 @@ void c_render(Chess* env) {
     if (env->client == NULL) {
         init_chess_client(env, cell_size);
     }
-    
+
+human_wait_retry:
     if (IsKeyDown(KEY_ESCAPE) || WindowShouldClose()) { CloseWindow(); exit(0); }
     
     int flip_board = ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
@@ -2812,6 +3127,27 @@ void c_render(Chess* env) {
     }
     
     EndDrawing();
+
+    // Human-mode only: stay in c_render (on the window-owning thread) until
+    // the human commits a move via mouse clicks. Re-poll input + redraw each
+    // iteration. Non-human modes fall through to a single c_render call as
+    // before. Refresh obs after the commit so the next rollout inference sees
+    // the post-human-move state instead of the stale "human's turn" obs.
+    if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->human_color != -1
+            && env->pos.sideToMove == env->human_color
+            && !env->show_game_end_popup
+            && !env->render_paused
+            && !WindowShouldClose()) {
+        goto human_wait_retry;
+    }
+    if ((env->mode == CHESS_MODE_HUMAN || env->mode == CHESS_MODE_HUMAN_RANDOM)
+            && env->human_color != -1
+            && env->pos.sideToMove != env->human_color
+            && !env->show_game_end_popup) {
+        if (env->legal_dirty) rebuild_legal_state(env);
+        populate_observations(env);
+    }
 }
 
 void c_close(Chess* env) {
@@ -2825,6 +3161,7 @@ void c_close(Chess* env) {
         free(env->client);
         env->client = NULL;
     }
+    maia_close(env);
     env->fen_curriculum = NULL;
     env->num_fens = 0;
 }

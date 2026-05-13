@@ -89,6 +89,10 @@ static void apply_kwargs(Env* env, Dict* kwargs) {
     env->log_pgn_choice_made = 1;
     env->pgn_filename[0] = '\0';
     env->pgn_game_number = 0;
+    env->maia_pid = 0;
+    env->maia_stdin_fd = -1;
+    env->maia_stdout_fd = -1;
+    env->maia_phase = 0;
     strcpy(env->starting_fen, DEFAULT_STARTING_FEN);
     strcpy(env->last_result, "Game starting...");
 }
@@ -185,4 +189,18 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "slot_1_score", log->slot_1_score);
     dict_set(out, "hist_score", log->hist_score);
     dict_set(out, "hist_n", log->hist_n);
+    // Per-bank historical stats for multi-bank selfplay. selfplay.py reads
+    // hist_score_bank_<b> / hist_n_bank_<b> to drive each bank's swap decision.
+    for (int b = 0; b < CHESS_MAX_BANKS; b++) {
+        char key[64];
+        snprintf(key, sizeof(key), "hist_score_bank_%d", b);
+        dict_set(out, key, log->hist_score_bank[b]);
+        snprintf(key, sizeof(key), "hist_n_bank_%d", b);
+        dict_set(out, key, log->hist_n_bank[b]);
+    }
+    dict_set(out, "wins_as_white", log->wins_as_white);
+    dict_set(out, "wins_as_black", log->wins_as_black);
+    dict_set(out, "games_as_white", log->games_as_white);
+    dict_set(out, "games_as_black", log->games_as_black);
+    dict_set(out, "maia_failures", log->maia_failures);
 }

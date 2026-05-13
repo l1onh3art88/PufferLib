@@ -537,9 +537,15 @@ int static_vec_count_aligned(StaticVec* vec, int tag_value, int reset_flags) {
             count++;
         }
     }
+    // Only reset matching-tag envs. Multi-bank: each bank's swap finalizes
+    // by calling count_aligned(tag=bank+1, reset=1); we must not touch
+    // boundary_reached on envs playing other banks or their alignment data
+    // would be lost.
     if (reset_flags) {
         for (int i = 0; i < vec->size; i++) {
-            envs[i].boundary_reached = 0;
+            if (envs[i].tag == tag_value) {
+                envs[i].boundary_reached = 0;
+            }
         }
     }
     return count;

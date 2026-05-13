@@ -1876,7 +1876,8 @@ extern "C" void pufferl_set_env_tags(PuffeRL* pufferl, const int* tags) {
 }
 
 // Returns count of envs with tag == tag_value AND boundary_reached. If
-// reset_flags != 0, clears boundary_reached on all envs after counting.
+// reset_flags != 0, clears boundary_reached only on envs whose tag matches
+// tag_value (so multi-bank swaps don't trample each other's alignment).
 extern "C" int pufferl_count_aligned(PuffeRL* pufferl, int tag_value, int reset_flags) {
     return static_vec_count_aligned(pufferl->vec, tag_value, reset_flags);
 }
