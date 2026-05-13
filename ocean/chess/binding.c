@@ -191,13 +191,25 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "hist_n", log->hist_n);
     // Per-bank historical stats for multi-bank selfplay. selfplay.py reads
     // hist_score_bank_<b> / hist_n_bank_<b> to drive each bank's swap decision.
-    for (int b = 0; b < CHESS_MAX_BANKS; b++) {
-        char key[64];
-        snprintf(key, sizeof(key), "hist_score_bank_%d", b);
-        dict_set(out, key, log->hist_score_bank[b]);
-        snprintf(key, sizeof(key), "hist_n_bank_%d", b);
-        dict_set(out, key, log->hist_n_bank[b]);
-    }
+    // dict_set stores the key pointer (vecenv.h:61), not a copy, so we MUST
+    // use string literals here — a stack buffer in a loop aliases and collapses
+    // all 16 entries into one. Sized to CHESS_MAX_BANKS = 8.
+    dict_set(out, "hist_score_bank_0", log->hist_score_bank[0]);
+    dict_set(out, "hist_score_bank_1", log->hist_score_bank[1]);
+    dict_set(out, "hist_score_bank_2", log->hist_score_bank[2]);
+    dict_set(out, "hist_score_bank_3", log->hist_score_bank[3]);
+    dict_set(out, "hist_score_bank_4", log->hist_score_bank[4]);
+    dict_set(out, "hist_score_bank_5", log->hist_score_bank[5]);
+    dict_set(out, "hist_score_bank_6", log->hist_score_bank[6]);
+    dict_set(out, "hist_score_bank_7", log->hist_score_bank[7]);
+    dict_set(out, "hist_n_bank_0", log->hist_n_bank[0]);
+    dict_set(out, "hist_n_bank_1", log->hist_n_bank[1]);
+    dict_set(out, "hist_n_bank_2", log->hist_n_bank[2]);
+    dict_set(out, "hist_n_bank_3", log->hist_n_bank[3]);
+    dict_set(out, "hist_n_bank_4", log->hist_n_bank[4]);
+    dict_set(out, "hist_n_bank_5", log->hist_n_bank[5]);
+    dict_set(out, "hist_n_bank_6", log->hist_n_bank[6]);
+    dict_set(out, "hist_n_bank_7", log->hist_n_bank[7]);
     dict_set(out, "wins_as_white", log->wins_as_white);
     dict_set(out, "wins_as_black", log->wins_as_black);
     dict_set(out, "games_as_white", log->games_as_white);
