@@ -419,6 +419,8 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     hypers.vf_clip_coef = get_config(train_kwargs, "vf_clip_coef");
     hypers.vf_coef = get_config(train_kwargs, "vf_coef");
     hypers.ent_coef = get_config(train_kwargs, "ent_coef");
+    hypers.min_ent_coef_ratio = get_config(train_kwargs, "min_ent_coef_ratio");
+    hypers.anneal_ent_coef = get_config(train_kwargs, "anneal_ent_coef");
     // GAE
     hypers.gamma = get_config(train_kwargs, "gamma");
     hypers.gae_lambda = get_config(train_kwargs, "gae_lambda");
@@ -551,6 +553,8 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("vf_clip_coef", &HypersT::vf_clip_coef)
         .def_readwrite("vf_coef", &HypersT::vf_coef)
         .def_readwrite("ent_coef", &HypersT::ent_coef)
+        .def_readwrite("min_ent_coef_ratio", &HypersT::min_ent_coef_ratio)
+        .def_readwrite("anneal_ent_coef", &HypersT::anneal_ent_coef)
         .def_readwrite("gamma", &HypersT::gamma)
         .def_readwrite("gae_lambda", &HypersT::gae_lambda)
         .def_readwrite("vtrace_rho_clip", &HypersT::vtrace_rho_clip)

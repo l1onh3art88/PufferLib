@@ -284,6 +284,11 @@ typedef struct {
     float vf_clip_coef;
     float vf_coef;
     float ent_coef;
+    // Entropy coefficient anneal — mirrors lr annealing. When anneal_ent_coef
+    // is set, ent_coef cosine-decays from its base value to
+    // min_ent_coef_ratio * ent_coef over total_timesteps.
+    float min_ent_coef_ratio;
+    bool anneal_ent_coef;
     // GAE
     float gamma;
     float gae_lambda;
@@ -1527,6 +1532,17 @@ void train_impl(PuffeRL& pufferl) {
         cudaMemcpy(muon->lr_ptr, &lr, sizeof(float), cudaMemcpyHostToDevice);
     }
 
+    // Annealed entropy coefficient — same cosine shape as lr. With PG signal
+    // alive, the entropy bonus that kept early-training exploratory becomes
+    // load-bearing dead weight late in training; cosine-decay frees the policy
+    // to commit harder on what it has already learned.
+    float current_ent_coef = hypers.ent_coef;
+    if (hypers.anneal_ent_coef) {
+        float ent_min = hypers.min_ent_coef_ratio * hypers.ent_coef;
+        current_ent_coef = cosine_annealing(hypers.ent_coef, ent_min,
+                                            current_epoch, total_epochs);
+    }
+
     // Annealed priority exponent
     float anneal_beta = prio_beta0 + (1.0f - prio_beta0) * prio_alpha * (float)current_epoch/(float)total_epochs;
     TrainGraph& graph = pufferl.train_buf;
@@ -1592,7 +1608,7 @@ void train_impl(PuffeRL& pufferl) {
 
             ppo_loss_fwd_bwd(dec_puf, p_logstd, graph,
                 pufferl.act_sizes_puf, pufferl.losses_puf,
-                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, hypers.ent_coef,
+                hypers.clip_coef, hypers.vf_clip_coef, hypers.vf_coef, current_ent_coef,
                 pufferl.ppo_bufs_puf, pufferl.is_continuous, stream);
 
             FloatTensor grad_logits_puf = pufferl.ppo_bufs_puf.grad_logits;
