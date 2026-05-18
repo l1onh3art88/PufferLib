@@ -148,7 +148,10 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
         if name in ('method', 'metric', 'metric_distribution', 'goal', 'downsample', 'use_gpu', 'prune_pareto',
                     'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs',
                     'match_enemy_model_path', 'match_num_games',
-                    'match_enemy_hidden_size', 'match_enemy_num_layers'):
+                    'match_enemy_hidden_size', 'match_enemy_num_layers',
+                    'maia_weights_path', 'maia_lc0_path', 'maia_backend',
+                    'maia_nodes', 'maia_num_games', 'maia_total_agents',
+                    'maia_num_threads'):
             continue
 
         assert isinstance(param, dict), f'Param {name} is not a dict'

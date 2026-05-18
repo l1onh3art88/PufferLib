@@ -478,6 +478,11 @@ typedef struct {
     float reward_invalid_piece;
     float reward_invalid_move;
     float reward_repetition;
+    // Bidirectional material delta shaping (PBRS): on each capture, capturer
+    // gets +reward_material × piece_value, captured side gets -reward_material
+    // × piece_value. Zero-sum per event, telescopes over a game to the net
+    // material outcome — abuse-safe against bad trades. Selfplay mode only.
+    float reward_material;
     
     int enable_50_move_rule;
     int enable_threefold_repetition;
@@ -2523,6 +2528,34 @@ void c_step(Chess* env) {
                             && penalty_slot >= 0
                             && env->repetition_matches >= 1) {
                         *env->reward_ptr[penalty_slot] += env->reward_repetition;
+                    }
+                    // Bidirectional material delta shaping (PBRS for two-agent
+                    // alternating moves). Capturer gets +reward_material ×
+                    // piece_value, captured side gets the symmetric -value.
+                    // Total over a game telescopes to net material outcome, so
+                    // the policy can't farm capture rewards via bad trades.
+                    if (env->mode == CHESS_MODE_SELFPLAY
+                            && env->reward_material != 0.0f
+                            && env->undo_stack_ptr > 0) {
+                        Piece cap = env->undo_stack[env->undo_stack_ptr - 1].captured;
+                        if (cap == NO_PIECE && (int)type_of_m(chosen_move) == ENPASSANT) {
+                            // En passant: stored captured = NO_PIECE but a pawn
+                            // was taken. The captured pawn is the opposing color.
+                            cap = (mover == CHESS_WHITE) ? B_PAWN : W_PAWN;
+                        }
+                        if (cap != NO_PIECE) {
+                            static const float PIECE_VALUES[6] =
+                                {1.0f, 3.0f, 3.0f, 5.0f, 9.0f, 0.0f};
+                            int pt = (int)type_of_p(cap) - 1;
+                            if (pt >= 0 && pt < 5) {
+                                float v = env->reward_material * PIECE_VALUES[pt];
+                                ChessColor cap_color = color_of(cap);
+                                int captured_slot = env->slot_for_color[cap_color];
+                                int capturer_slot  = env->slot_for_color[1 - (int)cap_color];
+                                *env->reward_ptr[capturer_slot]  += v;
+                                *env->reward_ptr[captured_slot]  -= v;
+                            }
+                        }
                     }
                     move_completed = 1;
                 }

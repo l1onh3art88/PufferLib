@@ -192,7 +192,10 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     backend = _resolve_backend(args)
     rank = args['rank']
     run_id = str(int(1000*time.time()))
-    if args['wandb']:
+    # Multi-GPU sweep: only rank-0 of each trial owns wandb / json / queue / eval.
+    # Within a single-GPU trial every process is rank-0 of its own trial, so the
+    # gate is benign there. See pufferl.py:train() where rank = enumerate index.
+    if args['wandb'] and rank == 0:
         import wandb
         run_id = wandb.util.generate_id()
         wandb.init(id=run_id, config=args,
@@ -205,10 +208,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     total_timesteps = args['train']['total_timesteps']
     all_logs = []
 
-    # When sweeping, optionally score each trial by winrate vs a fixed enemy
-    # checkpoint (match mode) instead of the training-time self-play metric.
-    match_mode = (sweep_obj is not None
-        and bool(args.get('sweep', {}).get('match_enemy_model_path')))
+    # External-eval sweep scoring. maia_mode plays the final checkpoint vs Maia
+    # (via lc0 subprocess). match_mode plays vs a fixed enemy checkpoint. Maia
+    # takes precedence if both are configured. Falls back to training-time
+    # env/score when neither is set.
+    sweep_cfg = args.get('sweep', {}) if sweep_obj is not None else {}
+    maia_mode = bool(sweep_cfg.get('maia_weights_path'))
+    match_mode = (not maia_mode) and bool(sweep_cfg.get('match_enemy_model_path'))
+    needs_final_ckpt = maia_mode or match_mode
 
     checkpoint_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -220,7 +227,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         pufferl = backend.create_pufferl(args)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
-        if result_queue is not None:
+        if result_queue is not None and rank == 0:
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
@@ -238,7 +245,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
         backend.close(pufferl)
-        if result_queue is not None:
+        if result_queue is not None and rank == 0:
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
@@ -252,11 +259,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if epoch < train_epochs:
             backend.train(pufferl)
 
-        # In match-sweep mode we need the final checkpoint to feed into match().
+        # External eval (maia/match) needs the final checkpoint on disk to load.
         is_final = epoch == train_epochs - 1
         should_save = (sweep_obj is None
             and (epoch % args['checkpoint_interval'] == 0 or is_final)
-        ) or (match_mode and is_final)
+        ) or (needs_final_ckpt and is_final)
         if should_save:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
@@ -277,7 +284,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if target_key not in flat_logs:
             continue
 
-        if args['wandb']:
+        if args['wandb'] and rank == 0:
             wandb.log(flat_logs, step=flat_logs['agent_steps'])
 
         if epoch < train_epochs:
@@ -292,25 +299,69 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
 
     print_dashboard(args, model_size, flat_logs)
-    # Match-mode trials may have early-stopped before the in-loop save fired;
-    # ensure we always have a checkpoint to feed match().
-    if match_mode and not model_path:
+    # External-eval trials may have early-stopped before the in-loop save
+    # fired; ensure we always have a checkpoint to feed maia_eval / match.
+    if needs_final_ckpt and not model_path:
         model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, model_path)
     backend.close(pufferl)
 
     if target_key not in flat_logs:
-        if result_queue is not None:
+        if result_queue is not None and rank == 0:
             result_queue.put((args['gpu_id'], None, None, None))
         return
 
-    # Match-mode scoring: primary = trained policy (model_path); frozen bank =
-    # fixed enemy. Score is slot 0's average winrate. Creates its own pufferl
-    # so must run after the training instance is closed. Single observation per
-    # trial (mid-training curve doesn't predict final match score).
-    match_score = None
-    if match_mode:
-        sweep_cfg = args['sweep']
+    # External-eval scoring (rank-0 only — DDP-synced weights mean every rank's
+    # checkpoint is identical, so one eval per trial is sufficient and avoids
+    # 6 redundant lc0 swarms / queue races). Creates its own pufferl so must
+    # run after the training instance is closed.
+    eval_score = None
+    eval_metric_key = None
+    if maia_mode and rank == 0:
+        # Run the eval in a fresh spawn-subprocess so lc0 forks from a Python
+        # parent that hasn't initialized CUDA. Otherwise lc0 children inherit
+        # a poisoned CUDA state from training and hang in the UCI handshake.
+        env_vars = {
+            'MAIA_LC0_PATH':     sweep_cfg.get('maia_lc0_path') or './lc0',
+            'MAIA_WEIGHTS_PATH': sweep_cfg['maia_weights_path'],
+            'MAIA_NODES':        int(sweep_cfg.get('maia_nodes', 1)),
+            'MAIA_BACKEND':      sweep_cfg.get('maia_backend') or None,
+        }
+        eval_num_games = int(sweep_cfg.get('maia_num_games', 1024))
+        eval_total_agents = int(sweep_cfg.get('maia_total_agents', 8))
+        eval_num_threads = int(sweep_cfg.get('maia_num_threads', 8))
+        print(f'[maia eval] model={model_path} games={eval_num_games} '
+              f'agents={eval_total_agents} threads={eval_num_threads} '
+              f'weights={env_vars["MAIA_WEIGHTS_PATH"]} '
+              f'nodes={env_vars["MAIA_NODES"]} '
+              f'backend={env_vars["MAIA_BACKEND"]}', flush=True)
+        eval_ctx = mp.get_context('spawn')
+        eval_q = eval_ctx.Queue()
+        # Pass deepcopy of trial args so eval uses the same arch (Protein
+        # sweeps policy.hidden_size & policy.num_layers — without this the eval
+        # pufferl is built with chess.ini defaults and rejects the checkpoint).
+        eval_proc = eval_ctx.Process(target=_maia_eval_worker, args=(
+            env_name, model_path, eval_num_games, eval_total_agents,
+            eval_num_threads, env_vars, deepcopy(args), eval_q))
+        eval_proc.start()
+        eval_proc.join()
+        if eval_proc.exitcode != 0 or eval_q.empty():
+            print(f'[maia eval] WARNING: eval subprocess exit={eval_proc.exitcode} '
+                  f'queue_empty={eval_q.empty()} — reporting 0.0', flush=True)
+            maia_logs = {'env/score': 0.0, 'env/n': 0.0, 'env/draw_rate': 0.0,
+                         'env/maia_failures': 0.0}
+        else:
+            maia_logs = eval_q.get()
+        eval_score = float(maia_logs.get('env/score', 0.0))
+        eval_metric_key = 'env/maia_score'
+        n_games = int(maia_logs.get('env/n', 0))
+        draw_rate = float(maia_logs.get('env/draw_rate', 0.0))
+        failures = float(maia_logs.get('env/maia_failures', 0.0)) * max(n_games, 1)
+        print(f'[maia eval] score={eval_score:.4f}  draw_rate={draw_rate:.3f}  '
+              f'games={n_games}  failures={int(round(failures))}', flush=True)
+        if args['wandb']:
+            wandb.log({eval_metric_key: eval_score}, step=flat_logs['agent_steps'])
+    elif match_mode and rank == 0:
         match_args = deepcopy(args)
         match_args['enemy_hidden_size'] = int(sweep_cfg['match_enemy_hidden_size'])
         match_args['enemy_num_layers'] = int(sweep_cfg['match_enemy_num_layers'])
@@ -319,9 +370,16 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             policy_b_path=sweep_cfg['match_enemy_model_path'],
             num_games=int(sweep_cfg['match_num_games']),
             args=match_args, verbose=verbose)
-        match_score = float(match_logs['env/slot_0_score'])
+        eval_score = float(match_logs['env/slot_0_score'])
+        eval_metric_key = 'env/match_score'
+        print(f'[match eval] score={eval_score:.4f}', flush=True)
         if args['wandb']:
-            wandb.log({'env/match_score': match_score}, step=flat_logs['agent_steps'])
+            wandb.log({eval_metric_key: eval_score}, step=flat_logs['agent_steps'])
+
+    # Non-rank-0 in a multi-GPU trial: skip JSON / queue / wandb finish. The
+    # trial's rank-0 process is the spokesperson; other ranks exit silently.
+    if rank != 0:
+        return
 
     # This version has the training perf logs and eval env logs
     all_logs.append(flat_logs)
@@ -346,13 +404,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     for k in metrics:
         metrics[k][-1] = all_logs[-1][k]
 
-    # Match-mode: single observation at final-training cost. Protein's curve
-    # fit collapses to one point — we only trust the match winrate, not any
-    # training-time proxy. Replicate the scalar across all downsample bins so
-    # the JSON log shape matches every other metric (cache_data.py rejects
-    # length-mismatched metrics as "bad data").
-    if match_mode:
-        metrics['env/match_score'] = [match_score] * len(metrics['agent_steps'])
+    # External-eval: single observation at final-training cost. Replicate the
+    # scalar across all downsample bins so the JSON log shape matches every
+    # other metric (cache_data.py rejects length-mismatched metrics).
+    if eval_metric_key is not None:
+        metrics[eval_metric_key] = [eval_score] * len(metrics['agent_steps'])
 
     # Save own log: config + downsampled results
     log_dir = os.path.join(args['log_dir'], args['env_name'])
@@ -369,9 +425,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.run.finish()
 
     if result_queue is not None:
-        if match_mode:
-            # One observation: final hypers -> match winrate, at total training cost.
-            result_queue.put((args['gpu_id'], [match_score],
+        if eval_metric_key is not None:
+            # One observation: final hypers -> external-eval score, at total training cost.
+            result_queue.put((args['gpu_id'], [eval_score],
                 [metrics['uptime'][-1]], [metrics['agent_steps'][-1]]))
         else:
             result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
@@ -576,6 +632,84 @@ def match(env_name, policy_a_path, policy_b_path, num_games=4096, args=None, ver
         if n >= num_games:
             break
 
+    if verbose:
+        print()
+
+    backend.close(pufferl)
+    return logs
+
+def _maia_eval_worker(env_name, model_path, num_games, total_agents,
+                      num_threads, env_vars, trial_args, result_q):
+    '''Subprocess entry: re-imports module clean (spawn ctx), sets MAIA_* env
+    vars, runs maia_eval, posts the resulting eval_log dict to result_q. Run in
+    a fresh process so lc0 forks happen from a Python parent that hasn't yet
+    initialized CUDA — mirrors the standalone maia_eval.py setup that works.
+
+    trial_args carries the trial's actual args (with Protein-sampled
+    hidden_size / num_layers / etc.) so the eval pufferl is built with the
+    same arch as the saved checkpoint. Without this, load_config defaults
+    diverge from the checkpoint and weight loading fails on size mismatch.'''
+    import os as _os
+    for k, v in env_vars.items():
+        if v is not None:
+            _os.environ[k] = str(v)
+    from pufferlib.pufferl import maia_eval as _eval_fn
+    logs = _eval_fn(env_name, model_path=model_path, num_games=num_games,
+                    total_agents=total_agents, num_threads=num_threads,
+                    args=trial_args, verbose=True)
+    # Strip non-pickleable values (numpy/torch types) — keep only scalars we use.
+    result_q.put({
+        'env/score':         float(logs.get('env/score', 0.0)),
+        'env/n':             float(logs.get('env/n', 0.0)),
+        'env/draw_rate':     float(logs.get('env/draw_rate', 0.0)),
+        'env/maia_failures': float(logs.get('env/maia_failures', 0.0)),
+    })
+
+def maia_eval(env_name, model_path, num_games=1024, total_agents=64,
+              num_threads=1, args=None, verbose=True):
+    '''Evaluate a chess policy vs Maia (lc0 subprocess opponent). Returns the
+    eval_log dict; caller pulls env/score (= wins + 0.5*draws) for scoring.
+    Single-GPU. Caller must have MAIA_LC0_PATH / MAIA_WEIGHTS_PATH / MAIA_NODES /
+    MAIA_BACKEND set in os.environ before calling — chess.h:maia_init reads them
+    at fork time.'''
+    args = args or load_config(env_name)
+    args = deepcopy(args)
+    args.setdefault('nccl_id', b'')
+    args['env']['mode'] = 4  # CHESS_MODE_MAIA
+    # Disable opening curriculum & random FENs so every game starts from the
+    # standard position — matches Maia's calibration (human games from move 1).
+    args['env']['fen_curric_pct'] = 0.0
+    args['env']['random_fen'] = 0
+    args['vec']['total_agents'] = int(total_agents)
+    args['vec']['num_buffers'] = 1
+    args['vec']['num_threads'] = int(num_threads)
+    args['vec']['num_frozen_banks'] = 0
+    args['vec']['frozen_bank_pct'] = 0.0
+    args['selfplay']['enabled'] = 0
+    args['train']['horizon'] = 1
+    args['train']['minibatch_size'] = 1
+    args['reset_state'] = False
+    args['world_size'] = 1
+    args['rank'] = 0
+    args['gpu_id'] = args.get('gpu_id', 0)
+
+    backend = _resolve_backend(args)
+    if backend is not _C:
+        raise RuntimeError('maia_eval() requires the native CUDA backend')
+
+    pufferl = backend.create_pufferl(args)
+    backend.load_weights(pufferl, model_path)
+
+    logs = {}
+    while True:
+        backend.rollouts(pufferl)
+        logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
+        n = int(logs.get('env/n', 0))
+        if verbose:
+            score = logs.get('env/score', 0.0)
+            print(f'\rmaia: games={n}/{num_games}  score={score:.3f}', end='')
+        if n >= num_games:
+            break
     if verbose:
         print()
 

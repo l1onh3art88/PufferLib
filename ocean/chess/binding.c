@@ -75,6 +75,10 @@ static void apply_kwargs(Env* env, Dict* kwargs) {
     env->reward_invalid_piece = (float)dict_get(kwargs, "reward_invalid_piece")->value;
     env->reward_invalid_move = (float)dict_get(kwargs, "reward_invalid_move")->value;
     env->reward_repetition = (float)dict_get(kwargs, "reward_repetition")->value;
+    // Defensive: defaults to 0 (no shaping) if reward_material isn't in the
+    // ini — keeps backward compat with older chess.ini files.
+    DictItem* rm_item = dict_get_unsafe(kwargs, "reward_material");
+    env->reward_material = rm_item ? (float)rm_item->value : 0.0f;
     env->render_fps = (int)dict_get(kwargs, "render_fps")->value;
     env->mode = (int)dict_get(kwargs, "mode")->value;
     env->enable_50_move_rule = (int)dict_get(kwargs, "enable_50_move_rule")->value;
