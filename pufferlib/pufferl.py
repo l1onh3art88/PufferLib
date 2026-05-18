@@ -432,6 +432,15 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         else:
             result_queue.put((args['gpu_id'], metrics['env/score'], metrics['uptime'], metrics['agent_steps']))
 
+    # Sweeps accumulate selfplay pool snapshots per trial (checkpoint_dir/pool/
+    # *.bin) — these can grow to many GB across 1200 trials but the trial's
+    # final .bin in checkpoint_dir/ is preserved for post-sweep inspection.
+    if sweep_obj is not None:
+        pool_subdir = os.path.join(checkpoint_dir, 'pool')
+        if os.path.isdir(pool_subdir):
+            import shutil
+            shutil.rmtree(pool_subdir, ignore_errors=True)
+
 def train(env_name, args=None, gpus=None, **kwargs):
     args = args or load_config(env_name)
     validate_config(args)
