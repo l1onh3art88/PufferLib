@@ -642,6 +642,85 @@ __global__ void chess_meta_kernel(
     meta[idx] = from_float(x);
 }
 
+__global__ void chess_embed_forward_kernel_opt(
+        precision_t* __restrict__ out,
+        const precision_t* __restrict__ obs,
+        const precision_t* __restrict__ board_w,
+        const precision_t* __restrict__ move_context_w,
+        const precision_t* __restrict__ bias,
+        int B, int hidden, int obs_size) {
+    __shared__ int board_features[CH_BOARD_SQUARES]; // 64
+    __shared__ int move_context_features[CH_MAX_MOVE_CONTEXT_ACTIVE]; // 50
+    __shared__ int move_context_count;
+
+    int b = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const precision_t* obs_row = obs + b * obs_size;
+
+    int lane = threadIdx.x % 32;
+    int board_count = 0;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        int sq = i * 32 + lane;
+        int piece = (int)to_float(obs_row[CH_BOARD + sq]);
+        unsigned mask = __ballot_sync(0xffffffff, piece > 0);
+        int lane_offset = __popc(mask & ((1u << lane) - 1));
+        if (piece > 0) {
+            board_features[board_count + lane_offset] = (piece - 1) * CH_BOARD_SQUARES + sq;
+        }
+        board_count += __popc(mask); // count bits set to 1
+    }
+
+    // retrieve and broadcast across warp
+    int phase_val = 0, selected_val = 0, from_count = 0, to_count = 0;
+    if (lane == 0) phase_val = (int)to_float(obs_row[CH_PICK_PHASE]) > 0 ? 1 : 0;
+    if (lane == 1) selected_val = (int)to_float(obs_row[CH_SELECTED]);
+    if (lane == 2) from_count = (int)to_float(obs_row[CH_VALID_FROM_COUNT]);
+    if (lane == 3) to_count   = (int)to_float(obs_row[CH_VALID_TO_COUNT]);
+    phase_val = __shfl_sync(0xffffffff, phase_val, 0);
+    selected_val = __shfl_sync(0xffffffff, selected_val, 1);
+    from_count = __shfl_sync(0xffffffff, from_count, 2);
+    to_count = __shfl_sync(0xffffffff, to_count, 3);
+
+    int n = 0;
+    if (lane == 0) move_context_features[n] = CH_MOVE_CONTEXT_PHASE + phase_val;
+    n = 1;
+    if (selected_val < CH_BOARD_SQUARES) {
+        if (lane == 0) move_context_features[n] = CH_MOVE_CONTEXT_SELECTED + selected_val;
+        n++;
+    }
+
+    if (lane < from_count) {
+        int sq = (int)to_float(obs_row[CH_VALID_FROM + lane]);
+        move_context_features[n + lane] = CH_MOVE_CONTEXT_VALID_FROM + sq;
+    }
+    n += from_count;
+
+    if (lane < to_count) {
+        int sq = (int)to_float(obs_row[CH_VALID_TO + lane]);
+        move_context_features[n + lane] = CH_MOVE_CONTEXT_VALID_TO + sq;
+    }
+    n += to_count;
+    if (lane == 0) move_context_count = n;
+
+    __syncthreads();
+    if (h >= hidden) return;
+
+    int out_idx = b * hidden + h;
+    float acc = to_float(out[out_idx]) + to_float(bias[h]);
+
+    for (int i = 0; i < board_count; i++) {
+        acc += to_float(board_w[board_features[i] * hidden + h]);
+    }
+
+    for (int i = 0; i < move_context_count; i++) {
+        acc += to_float(move_context_w[move_context_features[i] * hidden + h]);
+    }
+
+    out[out_idx] = from_float(fmaxf(0.0f, acc));
+
+}
+
 __global__ void chess_embed_forward_kernel(
         precision_t* __restrict__ out,
         const precision_t* __restrict__ obs,
