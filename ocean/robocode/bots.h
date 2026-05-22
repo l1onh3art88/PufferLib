@@ -204,7 +204,10 @@ static void bot_on_hit_by_bullet(Robocode* env, int bot_idx,
 // ---- Main entry -------------------------------------------------------------
 static void bot_step(Robocode* env, int bot_idx) {
     Robot* bot = &env->robots[bot_idx];
-    if (bot->energy <= 0) return;
+    // Dead bots are skipped entirely; disabled bots (energy=0) are frozen
+    // but the env still ticks. Same as agent rule in c_step.
+    if (bot->energy < 0) return;
+    if (bot->energy == 0) { bot->v = 0; return; }
     if (bot->gun_heat > 0) bot->gun_heat -= 0.1f;
     if (env->bot_policy == BOT_STATIONARY) return;
 

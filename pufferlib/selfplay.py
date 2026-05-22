@@ -24,12 +24,48 @@ import numpy as np
 from pufferlib import _C
 
 
-def sample_opponent(pool, rng):
-    candidates = pool if len(pool) < 6 else pool[:-5]
-    weights = np.array([(i + 1) ** 0.5 for i in range(len(candidates))], dtype=np.float64)
-    weights /= weights.sum()
-    idx = int(rng.choice(len(candidates), p=weights))
-    return candidates[idx]
+def sample_opponent(pool, rng, mode='sqrt'):
+    '''Pick a historical opponent from the pool. Mode selects the weighting:
+
+      'sqrt'      — sqrt-recency-weighted. Bias toward newer entries via
+                    weight ∝ sqrt(index+1). Legacy default. No state required.
+      'uniform'   — uniform random over the entire pool. Pure diversity baseline.
+      'pfsp_hard' — Prioritized Fictitious Self-Play, hard variant from
+                    AlphaStar. Weight ∝ (1 - winrate)^2 — focuses sampling
+                    on opponents the primary doesn't yet crush. Requires
+                    per-entry 'winrate' to be tracked (default 0.5 = neutral
+                    prior for new entries with no game data yet).
+      'pfsp_var'  — PFSP variance variant. Weight ∝ winrate * (1 - winrate),
+                    peaks at 50/50. Focuses on highest-information peer
+                    matchups (high outcome variance = high gradient signal).
+
+    Pool entries that have never been played get winrate=0.5 (full sampling
+    weight under PFSP). A 0.01 floor on the weight prevents zero-probability
+    lockout — crushed opponents still get tiny revisits in case of regression.
+    '''
+    n = len(pool)
+    if n == 0:
+        return None
+    if mode == 'uniform':
+        idx = int(rng.integers(n))
+    elif mode == 'pfsp_hard':
+        weights = np.array(
+            [max((1.0 - e.get('winrate', 0.5)) ** 2, 0.01) for e in pool],
+            dtype=np.float64)
+        weights /= weights.sum()
+        idx = int(rng.choice(n, p=weights))
+    elif mode == 'pfsp_var':
+        weights = np.array(
+            [max(e.get('winrate', 0.5) * (1.0 - e.get('winrate', 0.5)), 0.01)
+             for e in pool],
+            dtype=np.float64)
+        weights /= weights.sum()
+        idx = int(rng.choice(n, p=weights))
+    else:  # 'sqrt' (default, backward compat)
+        weights = np.array([(i + 1) ** 0.5 for i in range(n)], dtype=np.float64)
+        weights /= weights.sum()
+        idx = int(rng.choice(n, p=weights))
+    return pool[idx]
 
 
 def update_elo(primary_elo, opp_elo, score_rate, k):
@@ -196,13 +232,17 @@ def setup(pufferl, backend, args, run_id):
 
     return {
         'pool_dir': pool_dir,
-        'pool': [{'path': bootstrap_path, 'elo': elo_init}],
+        'pool': [{'path': bootstrap_path, 'elo': elo_init,
+                  'winrate': 0.5, 'n_games': 0}],
         'rng': rng,
         'max_size': int(sp['max_size']),
         'min_games': int(sp['min_games']),
         'swap_winrate': float(sp['swap_winrate']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
+        # Opponent-sampling strategy. 'sqrt' is the legacy default. Other
+        # options: 'uniform', 'pfsp_hard', 'pfsp_var'. See sample_opponent().
+        'sampling': str(sp.get('sampling', 'sqrt')),
         'num_banks': num_banks,
         'banks': banks_state,
         'primary_elo': elo_init,
@@ -246,7 +286,9 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         snap_path = os.path.join(pool_state['pool_dir'],
             f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, snap_path)
-        pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+        pool_state['pool'].append({'path': snap_path,
+            'elo': pool_state['primary_elo'],
+            'winrate': 0.5, 'n_games': 0})  # neutral prior for PFSP modes
         pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
         pool_state['last_snapshot_step'] = int(pufferl.global_step)
 
@@ -277,6 +319,19 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 bank['opp_started_step'] = int(pufferl.global_step)
                 bank['last_epochs_to_align'] = epoch - bank['epoch_armed']
         elif winrate_met or timed_out:
+            # Record the just-finished opponent's winrate into its pool entry
+            # so PFSP-mode sampling sees it next time. EMA so multi-visit
+            # estimates blend instead of fully overwriting. New entries with
+            # n_games == 0 take the fresh winrate verbatim (alpha = 1).
+            if winrate is not None and bank['hist_n'] > 0:
+                for entry in pool_state['pool']:
+                    if entry['path'] == bank['cur_opp_path']:
+                        prev_n = entry.get('n_games', 0)
+                        alpha = 1.0 if prev_n == 0 else 0.3
+                        entry['winrate'] = ((1 - alpha) * entry.get('winrate', 0.5)
+                                            + alpha * winrate)
+                        entry['n_games'] = prev_n + int(bank['hist_n'])
+                        break
             # Winrate-driven snapshot kept while pool is small (< 10). After
             # that, only the global interval cadence grows the pool. Timeout
             # swaps never snapshot (stalemate, not progress).
@@ -284,10 +339,13 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 snap_path = os.path.join(pool_state['pool_dir'],
                     f'{pufferl.global_step:016d}.bin')
                 backend.save_weights(pufferl, snap_path)
-                pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+                pool_state['pool'].append({'path': snap_path,
+                    'elo': pool_state['primary_elo'],
+                    'winrate': 0.5, 'n_games': 0})
                 pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
                 pool_state['last_snapshot_step'] = int(pufferl.global_step)
-            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
+            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'],
+                mode=pool_state.get('sampling', 'sqrt'))
             bank['pending_opp_path'] = opp_entry['path']
             bank['pending_opp_elo'] = opp_entry['elo']
             bank['epoch_armed'] = epoch

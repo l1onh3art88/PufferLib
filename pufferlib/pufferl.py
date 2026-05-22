@@ -365,6 +365,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         match_args = deepcopy(args)
         match_args['enemy_hidden_size'] = int(sweep_cfg['match_enemy_hidden_size'])
         match_args['enemy_num_layers'] = int(sweep_cfg['match_enemy_num_layers'])
+        # Optional env-config override for match. Lets envs use a short timeout
+        # during training and a long one during the final scoring match so games
+        # actually resolve instead of timing out as draws.
+        if 'match_max_ticks' in sweep_cfg:
+            match_args['env']['max_ticks'] = int(sweep_cfg['match_max_ticks'])
         match_logs = match(env_name,
             policy_a_path=model_path,
             policy_b_path=sweep_cfg['match_enemy_model_path'],
