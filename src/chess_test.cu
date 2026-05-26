@@ -13,8 +13,8 @@
 #include "models.cu"
 #include "ocean.cu"
 
-static const int WARMUP_ITERS = 200;
-static const int TIMING_ITERS = 2000;
+static const int WARMUP_ITERS = 5;
+static const int TIMING_ITERS = 10;
 
 static inline float randf() { return (float)rand() / RAND_MAX; }
 
@@ -69,6 +69,11 @@ static void fill_random_obs(float* host_obs, int B, int obs_size) {
 struct ChessEmbedTest {
     precision_t *d_obs, *d_board_w, *d_move_context_w, *d_bias;
     precision_t *d_out_ref, *d_out_opt;
+    precision_t *d_grad;
+    int *d_board_active_idx, *d_board_active_cnt;
+    int *d_mc_active_idx, *d_mc_active_cnt;
+    float *d_board_wgrad_ref, *d_board_wgrad_opt;
+    float *d_mc_wgrad_ref, *d_mc_wgrad_opt;
     float *h_obs;
     int B, hidden, obs_size;
 };
@@ -93,6 +98,15 @@ static ChessEmbedTest* create_test(int B, int hidden) {
     cudaMalloc(&t->d_bias, hidden * sizeof(precision_t));
     cudaMalloc(&t->d_out_ref, out_total * sizeof(precision_t));
     cudaMalloc(&t->d_out_opt, out_total * sizeof(precision_t));
+    cudaMalloc(&t->d_grad, out_total * sizeof(precision_t));
+    cudaMalloc(&t->d_board_active_idx, B * CH_BOARD_SQUARES * sizeof(int));
+    cudaMalloc(&t->d_board_active_cnt, B * sizeof(int));
+    cudaMalloc(&t->d_mc_active_idx, B * CH_MAX_MOVE_CONTEXT_ACTIVE * sizeof(int));
+    cudaMalloc(&t->d_mc_active_cnt, B * sizeof(int));
+    cudaMalloc(&t->d_board_wgrad_ref, board_total * sizeof(float));
+    cudaMalloc(&t->d_board_wgrad_opt, board_total * sizeof(float));
+    cudaMalloc(&t->d_mc_wgrad_ref, mc_total * sizeof(float));
+    cudaMalloc(&t->d_mc_wgrad_opt, mc_total * sizeof(float));
 
     // Upload obs
     precision_t* tmp = (precision_t*)malloc(obs_total * sizeof(precision_t));
@@ -113,6 +127,7 @@ static ChessEmbedTest* create_test(int B, int hidden) {
     fill_rand(t->d_board_w, board_total);
     fill_rand(t->d_move_context_w, mc_total);
     fill_rand(t->d_bias, hidden);
+    fill_rand(t->d_grad, out_total);
 
     return t;
 }
@@ -124,6 +139,15 @@ static void destroy_test(ChessEmbedTest* t) {
     cudaFree(t->d_bias);
     cudaFree(t->d_out_ref);
     cudaFree(t->d_out_opt);
+    cudaFree(t->d_grad);
+    cudaFree(t->d_board_active_idx);
+    cudaFree(t->d_board_active_cnt);
+    cudaFree(t->d_mc_active_idx);
+    cudaFree(t->d_mc_active_cnt);
+    cudaFree(t->d_board_wgrad_ref);
+    cudaFree(t->d_board_wgrad_opt);
+    cudaFree(t->d_mc_wgrad_ref);
+    cudaFree(t->d_mc_wgrad_opt);
     free(t->h_obs);
     free(t);
 }
@@ -158,6 +182,7 @@ static bool test_correctness(int B, int hidden) {
 
     chess_embed_forward_kernel_opt<<<grid, BLOCK_SIZE>>>(
         t->d_out_opt, t->d_obs, t->d_board_w, t->d_move_context_w, t->d_bias,
+        nullptr, nullptr, nullptr, nullptr,
         B, hidden, CH_OBS_SIZE);
 
     cudaDeviceSynchronize();
@@ -210,6 +235,8 @@ static void run_kernel(BenchArgs* args) {
     if (args->use_opt) {
         chess_embed_forward_kernel_opt<<<grid, BLOCK_SIZE>>>(
             out, t->d_obs, t->d_board_w, t->d_move_context_w, t->d_bias,
+            t->d_board_active_idx, t->d_board_active_cnt,
+            t->d_mc_active_idx, t->d_mc_active_cnt,
             t->B, t->hidden, CH_OBS_SIZE);
     } else {
         chess_embed_forward_kernel<<<grid, BLOCK_SIZE>>>(
@@ -247,8 +274,163 @@ static float bench_kernel(ChessEmbedTest* t, bool use_opt) {
     return ms / TIMING_ITERS;
 }
 
+// ---- Backward tests ----
+
+static bool test_backward_correctness(int B, int hidden) {
+    printf("=== Backward correctness test (B=%d, hidden=%d) ===\n", B, hidden);
+    auto* t = create_test(B, hidden);
+    int board_total = CH_BOARD_FEATURES * hidden;
+    int mc_total = CH_MOVE_CONTEXT_FEATURES * hidden;
+
+    cudaMemset(t->d_board_wgrad_ref, 0, board_total * sizeof(float));
+    cudaMemset(t->d_board_wgrad_opt, 0, board_total * sizeof(float));
+    cudaMemset(t->d_mc_wgrad_ref, 0, mc_total * sizeof(float));
+    cudaMemset(t->d_mc_wgrad_opt, 0, mc_total * sizeof(float));
+
+    dim3 grid(grid_size(hidden), B);
+
+    chess_embed_backward_kernel<<<grid, BLOCK_SIZE>>>(
+        t->d_board_wgrad_ref, t->d_mc_wgrad_ref, t->d_grad, t->d_obs,
+        B, hidden, CH_OBS_SIZE);
+
+    chess_embed_forward_kernel_opt<<<grid, BLOCK_SIZE>>>(
+        t->d_out_opt, t->d_obs, t->d_board_w, t->d_move_context_w, t->d_bias,
+        t->d_board_active_idx, t->d_board_active_cnt,
+        t->d_mc_active_idx, t->d_mc_active_cnt,
+        B, hidden, CH_OBS_SIZE);
+
+    chess_embed_backward_kernel_opt<<<grid, BLOCK_SIZE>>>(
+        t->d_board_wgrad_opt, t->d_mc_wgrad_opt, t->d_grad,
+        t->d_board_active_idx, t->d_board_active_cnt,
+        t->d_mc_active_idx, t->d_mc_active_cnt,
+        B, hidden);
+
+    cudaDeviceSynchronize();
+
+    auto compare = [](const char* name, float* d_ref, float* d_opt, int n, int hidden) -> bool {
+        float* h_ref = (float*)malloc(n * sizeof(float));
+        float* h_opt = (float*)malloc(n * sizeof(float));
+        cudaMemcpy(h_ref, d_ref, n * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_opt, d_opt, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+        float max_abs_err = 0, max_rel_err = 0;
+        int mismatches = 0;
+        for (int i = 0; i < n; i++) {
+            float ref = h_ref[i], opt = h_opt[i];
+            float abs_err = fabsf(ref - opt);
+            float rel_err = (fabsf(ref) > 1e-6f) ? abs_err / fabsf(ref) : abs_err;
+            if (abs_err > max_abs_err) max_abs_err = abs_err;
+            if (rel_err > max_rel_err) max_rel_err = rel_err;
+            if (abs_err > 1e-4f) {
+                if (mismatches < 10) {
+                    int feat = i / hidden, h = i % hidden;
+                    printf("  %s MISMATCH [feat=%d, h=%d]: ref=%.6f opt=%.6f diff=%.6f\n",
+                           name, feat, h, ref, opt, abs_err);
+                }
+                mismatches++;
+            }
+        }
+        printf("  %s: max_abs_err = %.6e, max_rel_err = %.6e\n", name, max_abs_err, max_rel_err);
+        free(h_ref);
+        free(h_opt);
+        return mismatches == 0;
+    };
+
+    bool pass = true;
+    pass &= compare("board_wgrad", t->d_board_wgrad_ref, t->d_board_wgrad_opt, board_total, hidden);
+    pass &= compare("mc_wgrad", t->d_mc_wgrad_ref, t->d_mc_wgrad_opt, mc_total, hidden);
+
+    if (pass)
+        printf("  PASSED\n\n");
+    else
+        printf("  FAILED\n\n");
+
+    destroy_test(t);
+    return pass;
+}
+
+struct BackwardBenchArgs {
+    ChessEmbedTest* t;
+    bool use_opt;
+};
+
+static void fill_embed_cache(ChessEmbedTest* t) {
+    dim3 grid(grid_size(t->hidden), t->B);
+    chess_embed_forward_kernel_opt<<<grid, BLOCK_SIZE>>>(
+        t->d_out_opt, t->d_obs, t->d_board_w, t->d_move_context_w, t->d_bias,
+        t->d_board_active_idx, t->d_board_active_cnt,
+        t->d_mc_active_idx, t->d_mc_active_cnt,
+        t->B, t->hidden, CH_OBS_SIZE);
+}
+
+static void run_backward_kernel(BackwardBenchArgs* args) {
+    auto* t = args->t;
+    dim3 grid(grid_size(t->hidden), t->B);
+    int board_total = CH_BOARD_FEATURES * t->hidden;
+    int mc_total = CH_MOVE_CONTEXT_FEATURES * t->hidden;
+    float* bwg = args->use_opt ? t->d_board_wgrad_opt : t->d_board_wgrad_ref;
+    float* mcwg = args->use_opt ? t->d_mc_wgrad_opt : t->d_mc_wgrad_ref;
+    cudaMemsetAsync(bwg, 0, board_total * sizeof(float));
+    cudaMemsetAsync(mcwg, 0, mc_total * sizeof(float));
+    if (args->use_opt) {
+        chess_embed_backward_kernel_opt<<<grid, BLOCK_SIZE>>>(
+            bwg, mcwg, t->d_grad,
+            t->d_board_active_idx, t->d_board_active_cnt,
+            t->d_mc_active_idx, t->d_mc_active_cnt,
+            t->B, t->hidden);
+    } else {
+        chess_embed_backward_kernel<<<grid, BLOCK_SIZE>>>(
+            bwg, mcwg, t->d_grad, t->d_obs, t->B, t->hidden, CH_OBS_SIZE);
+    }
+}
+
+static float bench_backward_kernel(ChessEmbedTest* t, bool use_opt) {
+    BackwardBenchArgs args = {t, use_opt};
+
+    if (use_opt)
+        fill_embed_cache(t);
+
+    for (int i = 0; i < WARMUP_ITERS; i++)
+        run_backward_kernel(&args);
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i = 0; i < TIMING_ITERS; i++)
+        run_backward_kernel(&args);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return ms / TIMING_ITERS;
+}
+
+static void test_backward_speed(int B, int hidden) {
+    printf("=== Backward speed test (B=%d, hidden=%d) ===\n", B, hidden);
+    auto* t = create_test(B, hidden);
+
+    float ref_ms = bench_backward_kernel(t, false);
+    float opt_ms = bench_backward_kernel(t, true);
+
+    printf("  reference:  %8.2f us\n", ref_ms * 1000);
+    printf("  optimized:  %8.2f us\n", opt_ms * 1000);
+    if (opt_ms > 0 && ref_ms > 0)
+        printf("  speedup:    %.2fx\n", ref_ms / opt_ms);
+    printf("\n");
+
+    destroy_test(t);
+}
+
+// ---- Forward speed test ----
+
 static void test_speed(int B, int hidden) {
-    printf("=== Speed test (B=%d, hidden=%d) ===\n", B, hidden);
+    printf("=== Forward speed test (B=%d, hidden=%d) ===\n", B, hidden);
     auto* t = create_test(B, hidden);
 
     float ref_ms = bench_kernel(t, false);
@@ -264,8 +446,8 @@ static void test_speed(int B, int hidden) {
 }
 
 int main(int argc, char** argv) {
-    int B = 1024;
-    int hidden = 256;
+    int B = 32768;
+    int hidden = 512;
     bool run_correctness = true;
     bool run_speed = true;
 
@@ -281,7 +463,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("chess_embed_forward_kernel test\n");
+    printf("chess_embed kernel test\n");
     printf("  B=%d, hidden=%d, obs_size=%d\n", B, hidden, CH_OBS_SIZE);
     printf("  board_features=%d, move_context_features=%d\n\n",
            CH_BOARD_FEATURES, CH_MOVE_CONTEXT_FEATURES);
@@ -300,12 +482,18 @@ int main(int argc, char** argv) {
         pass &= test_correctness(B, hidden);
         pass &= test_correctness(1, hidden);
         pass &= test_correctness(B, 128);
+        pass &= test_backward_correctness(B, hidden);
+        pass &= test_backward_correctness(1, hidden);
+        pass &= test_backward_correctness(B, 128);
     }
 
     if (run_speed) {
         test_speed(B, hidden);
         test_speed(4096, hidden);
-        test_speed(B, 512);
+        test_speed(B, 256);
+        test_backward_speed(B, hidden);
+        test_backward_speed(4096, hidden);
+        test_backward_speed(B, 256);
     }
 
     return pass ? 0 : 1;
