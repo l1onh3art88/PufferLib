@@ -220,7 +220,7 @@ static void bot_step(Robocode* env, int bot_idx) {
     int t = -1; float best = 1e18f;
     for (int j = 0; j < env->num_agents; j++) {
         Robot* a = &env->robots[j];
-        if (a->energy <= 0) continue;
+        if (a->energy < 0) continue;   // dead only — disabled is still a valid target
         float dx = a->x - bot->x, dy = a->y - bot->y;
         float d2 = dx*dx + dy*dy;
         if (d2 < best) { best = d2; t = j; }
