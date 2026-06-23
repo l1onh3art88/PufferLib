@@ -628,6 +628,56 @@ __constant__ int CH_META_SRC[CH_META] = {
 
 // ---- Chess kernels ----
 
+__device__ void chess_parse_obs_to_smem(
+        const precision_t* obs_row, int lane,
+        int* board_features, int* board_count,
+        int* move_context_features, int* move_context_count) {
+    int n = 0;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        int sq = i * 32 + lane;
+        int piece = (int)to_float(obs_row[CH_BOARD + sq]);
+        unsigned mask = __ballot_sync(0xffffffff, piece > 0);
+        int lane_offset = __popc(mask & ((1u << lane) - 1));
+        if (piece > 0) {
+            board_features[n + lane_offset] = (piece - 1) * CH_BOARD_SQUARES + sq;
+        }
+        n += __popc(mask);
+    }
+    *board_count = n;
+
+    int phase_val = 0, selected_val = 0, from_count = 0, to_count = 0;
+    if (lane == 0) phase_val = (int)to_float(obs_row[CH_PICK_PHASE]) > 0 ? 1 : 0;
+    if (lane == 1) selected_val = (int)to_float(obs_row[CH_SELECTED]);
+    if (lane == 2) from_count = (int)to_float(obs_row[CH_VALID_FROM_COUNT]);
+    if (lane == 3) to_count   = (int)to_float(obs_row[CH_VALID_TO_COUNT]);
+    phase_val    = __shfl_sync(0xffffffff, phase_val, 0);
+    selected_val = __shfl_sync(0xffffffff, selected_val, 1);
+    from_count   = __shfl_sync(0xffffffff, from_count, 2);
+    to_count     = __shfl_sync(0xffffffff, to_count, 3);
+
+    n = 0;
+    if (lane == 0) move_context_features[n] = CH_MOVE_CONTEXT_PHASE + phase_val;
+    n = 1;
+    if (selected_val < CH_BOARD_SQUARES) {
+        if (lane == 0) move_context_features[n] = CH_MOVE_CONTEXT_SELECTED + selected_val;
+        n++;
+    }
+
+    if (lane < from_count) {
+        int sq = (int)to_float(obs_row[CH_VALID_FROM + lane]);
+        move_context_features[n + lane] = CH_MOVE_CONTEXT_VALID_FROM + sq;
+    }
+    n += from_count;
+
+    if (lane < to_count) {
+        int sq = (int)to_float(obs_row[CH_VALID_TO + lane]);
+        move_context_features[n + lane] = CH_MOVE_CONTEXT_VALID_TO + sq;
+    }
+    n += to_count;
+    if (lane == 0) *move_context_count = n;
+}
+
 __global__ void chess_meta_kernel(
         precision_t* __restrict__ meta,
         const precision_t* __restrict__ obs,
@@ -640,6 +690,69 @@ __global__ void chess_meta_kernel(
     float x = to_float(obs[b * obs_size + src]);
     if (x > 1.0f) x *= (1.0f / 255.0f);
     meta[idx] = from_float(x);
+}
+
+__global__ void chess_embed_forward_kernel_opt(
+        precision_t* __restrict__ out,
+        const precision_t* __restrict__ obs,
+        const precision_t* __restrict__ board_w,
+        const precision_t* __restrict__ move_context_w,
+        const precision_t* __restrict__ bias,
+        int* __restrict__ board_active_idx,
+        int* __restrict__ board_active_cnt,
+        int* __restrict__ mc_active_idx,
+        int* __restrict__ mc_active_cnt,
+        int B, int hidden, int obs_size) {
+    __shared__ int board_features[CH_BOARD_SQUARES];
+    __shared__ int move_context_features[CH_MAX_MOVE_CONTEXT_ACTIVE];
+    __shared__ int board_count;
+    __shared__ int move_context_count;
+
+    int b = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const precision_t* obs_row = obs + b * obs_size;
+
+    if (threadIdx.x < 32) {
+        int lane = threadIdx.x;
+        int bc = 0, mc = 0;
+        chess_parse_obs_to_smem(obs_row, lane,
+                board_features, &bc, move_context_features, &mc);
+        if (lane == 0) {
+            board_count = bc;
+            move_context_count = mc;
+        }
+    }
+
+    __syncthreads();
+
+    if (board_active_idx) {
+        int* g_board = board_active_idx + b * CH_BOARD_SQUARES;
+        int* g_mc = mc_active_idx + b * CH_MAX_MOVE_CONTEXT_ACTIVE;
+        if (threadIdx.x == 0) {
+            board_active_cnt[b] = board_count;
+            mc_active_cnt[b] = move_context_count;
+        }
+        if (threadIdx.x < board_count)
+            g_board[threadIdx.x] = board_features[threadIdx.x];
+        if (threadIdx.x < move_context_count)
+            g_mc[threadIdx.x] = move_context_features[threadIdx.x];
+        __syncthreads();
+    }
+
+    if (h >= hidden) return;
+
+    int out_idx = b * hidden + h;
+    float acc = to_float(out[out_idx]) + to_float(bias[h]);
+
+    for (int i = 0; i < board_count; i++) {
+        acc += to_float(board_w[board_features[i] * hidden + h]);
+    }
+
+    for (int i = 0; i < move_context_count; i++) {
+        acc += to_float(move_context_w[move_context_features[i] * hidden + h]);
+    }
+
+    out[out_idx] = from_float(fmaxf(0.0f, acc));
 }
 
 __global__ void chess_embed_forward_kernel(
@@ -708,6 +821,52 @@ __global__ void chess_embed_forward_kernel(
     }
 
     out[out_idx] = from_float(fmaxf(0.0f, acc));
+}
+
+__global__ void chess_embed_backward_kernel_opt(
+        float* __restrict__ board_wgrad_f,
+        float* __restrict__ move_context_wgrad_f,
+        const precision_t* __restrict__ grad,
+        const int* __restrict__ board_active_idx,
+        const int* __restrict__ board_active_cnt,
+        const int* __restrict__ mc_active_idx,
+        const int* __restrict__ mc_active_cnt,
+        int B, int hidden) {
+    __shared__ int s_board[CH_BOARD_SQUARES];
+    __shared__ int s_mc[CH_MAX_MOVE_CONTEXT_ACTIVE];
+    __shared__ int s_board_cnt;
+    __shared__ int s_mc_cnt;
+
+    int b = blockIdx.y;
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (threadIdx.x == 0) {
+        s_board_cnt = board_active_cnt[b];
+        s_mc_cnt = mc_active_cnt[b];
+    }
+    __syncthreads();
+
+    const int* board_row = board_active_idx + b * CH_BOARD_SQUARES;
+    const int* mc_row = mc_active_idx + b * CH_MAX_MOVE_CONTEXT_ACTIVE;
+    if (threadIdx.x < s_board_cnt) {
+        s_board[threadIdx.x] = board_row[threadIdx.x];
+    } else if (threadIdx.x < s_board_cnt + s_mc_cnt) {
+        s_mc[threadIdx.x - s_board_cnt] = mc_row[threadIdx.x - s_board_cnt];
+    }
+    __syncthreads();
+
+    if (h >= hidden) return;
+
+    float g = to_float(grad[b * hidden + h]);
+    if (g == 0.0f) return;
+
+    for (int i = 0; i < s_board_cnt; i++) {
+        atomicAdd(&board_wgrad_f[s_board[i] * hidden + h], g);
+    }
+
+    for (int i = 0; i < s_mc_cnt; i++) {
+        atomicAdd(&move_context_wgrad_f[s_mc[i] * hidden + h], g);
+    }
 }
 
 __global__ void chess_embed_backward_kernel(
@@ -784,7 +943,8 @@ struct ChessEmbedEncoderWeights {
 };
 
 struct ChessEmbedEncoderActivations {
-    PrecisionTensor meta, out, saved_obs;
+    PrecisionTensor meta, out;
+    IntTensor board_active_idx, board_active_cnt, mc_active_idx, mc_active_cnt;
     PrecisionTensor board_wgrad, move_context_wgrad, meta_wgrad, bgrad;
     FloatTensor board_wgrad_f, move_context_wgrad_f;
 };
@@ -804,13 +964,14 @@ static PrecisionTensor chess_embed_encoder_forward(void* w, void* activations,
     ChessEmbedEncoderActivations* a = (ChessEmbedEncoderActivations*)activations;
     int B = input.shape[0];
 
-    if (a->saved_obs.data) puf_copy(&a->saved_obs, &input, stream);
     chess_meta_kernel<<<grid_size(B * CH_META), BLOCK_SIZE, 0, stream>>>(
         a->meta.data, input.data, B, ew->obs_size);
     puf_mm(&a->meta, &ew->meta_w, &a->out, stream);
     dim3 embed_grid(grid_size(ew->hidden), B);
-    chess_embed_forward_kernel<<<embed_grid, BLOCK_SIZE, 0, stream>>>(
+    chess_embed_forward_kernel_opt<<<embed_grid, BLOCK_SIZE, 0, stream>>>(
         a->out.data, input.data, ew->board_w.data, ew->move_context_w.data, ew->bias.data,
+        a->board_active_idx.data, a->board_active_cnt.data,
+        a->mc_active_idx.data, a->mc_active_cnt.data,
         B, ew->hidden, ew->obs_size);
     return a->out;
 }
@@ -832,9 +993,11 @@ static void chess_embed_encoder_backward(void* w, void* activations,
     cudaMemsetAsync(a->board_wgrad_f.data, 0, board_n * sizeof(float), stream);
     cudaMemsetAsync(a->move_context_wgrad_f.data, 0, move_context_n * sizeof(float), stream);
     dim3 embed_grid(grid_size(H), B);
-    chess_embed_backward_kernel<<<embed_grid, BLOCK_SIZE, 0, stream>>>(
-        a->board_wgrad_f.data, a->move_context_wgrad_f.data, grad.data, a->saved_obs.data,
-        B, H, ew->obs_size);
+    chess_embed_backward_kernel_opt<<<embed_grid, BLOCK_SIZE, 0, stream>>>(
+        a->board_wgrad_f.data, a->move_context_wgrad_f.data, grad.data,
+        a->board_active_idx.data, a->board_active_cnt.data,
+        a->mc_active_idx.data, a->mc_active_cnt.data,
+        B, H);
     n3_float_to_precision_kernel<<<grid_size(board_n), BLOCK_SIZE, 0, stream>>>(
         a->board_wgrad.data, a->board_wgrad_f.data, board_n);
     n3_float_to_precision_kernel<<<grid_size(move_context_n), BLOCK_SIZE, 0, stream>>>(
@@ -869,10 +1032,16 @@ static void chess_embed_encoder_reg_train(void* w, void* activations,
     *a = {};
     a->meta = {.shape = {B_TT, CH_META}};
     a->out = {.shape = {B_TT, ew->hidden}};
-    a->saved_obs = {.shape = {B_TT, ew->obs_size}};
+    a->board_active_idx = {.shape = {B_TT, CH_BOARD_SQUARES}};
+    a->board_active_cnt = {.shape = {B_TT}};
+    a->mc_active_idx = {.shape = {B_TT, CH_MAX_MOVE_CONTEXT_ACTIVE}};
+    a->mc_active_cnt = {.shape = {B_TT}};
     alloc_register(acts, &a->meta);
     alloc_register(acts, &a->out);
-    alloc_register(acts, &a->saved_obs);
+    alloc_register(acts, &a->board_active_idx);
+    alloc_register(acts, &a->board_active_cnt);
+    alloc_register(acts, &a->mc_active_idx);
+    alloc_register(acts, &a->mc_active_cnt);
 
     a->board_wgrad = {.shape = {CH_BOARD_FEATURES, ew->hidden}};
     a->move_context_wgrad = {.shape = {CH_MOVE_CONTEXT_FEATURES, ew->hidden}};
