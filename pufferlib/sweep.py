@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import pufferlib
+from pufferlib import league
 
 import torch
 import gpytorch
@@ -146,7 +147,8 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
 
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'metric_distribution', 'goal', 'downsample', 'use_gpu', 'prune_pareto',
-                    'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs'):
+                    'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs',
+                    *league.SWEEP_CONTROL_KEYS):
             continue
 
         assert isinstance(param, dict), f'Param {name} is not a dict'
@@ -747,6 +749,16 @@ class Protein:
         target_ratio = np.clip(self.target_cost_ratio.pop() + 0.1 * np.random.randn(), 0, 1)
         return (1 + expansion_rate) * target_ratio
 
+    def _random_suggestion(self, fill, fixed_cost_norm=None):
+        zero_one = self.sobol.random(1)[0]
+        suggestion = 2*zero_one - 1
+        if fixed_cost_norm is not None:
+            suggestion[self.cost_param_idx] = fixed_cost_norm
+        elif self.cost_param_idx is not None:
+            cost_suggestion = self.cost_random_suggestion + 0.1 * np.random.randn()
+            suggestion[self.cost_param_idx] = np.clip(cost_suggestion, -1, 1)
+        return self.hyperparameters.to_dict(suggestion, fill)
+
     def suggest(self, fill, fixed_total_timesteps=None):
         info = {}
         self.suggestion_idx += 1
@@ -760,18 +772,15 @@ class Protein:
         #     return self.hyperparameters.to_dict(suggestion, fill), info
 
         if self.suggestion_idx <= self.num_random_samples:
-            # Suggest the next point in the Sobol sequence
-            zero_one = self.sobol.random(1)[0]
-            suggestion = 2*zero_one - 1  # Scale from [0, 1) to [-1, 1)
-            if fixed_cost_norm is not None:
-                suggestion[self.cost_param_idx] = fixed_cost_norm
-            elif self.cost_param_idx is not None:
-                cost_suggestion = self.cost_random_suggestion + 0.1 * np.random.randn()
-                suggestion[self.cost_param_idx] = np.clip(cost_suggestion, -1, 1)  # limit the cost
-            return self.hyperparameters.to_dict(suggestion, fill), info
+            return self._random_suggestion(fill, fixed_cost_norm), info
+
+        if len(self.success_observations) < 2:
+            return self._random_suggestion(fill, fixed_cost_norm), info
 
         elif self.resample_frequency and self.suggestion_idx % self.resample_frequency == 0:
             candidates, _ = pareto_points(self.success_observations)
+            if not candidates:
+                return self._random_suggestion(fill, fixed_cost_norm), info
             suggestions = np.stack([e['input'] for e in candidates])
             best_idx = np.random.randint(0, len(candidates))
             best = suggestions[best_idx]
@@ -785,14 +794,23 @@ class Protein:
             self.cost_opt = torch.optim.Adam(self.gp_cost.parameters(), lr=self.gp_learning_rate, amsgrad=True)
        
         pareto_front, pareto_idxs = pareto_points(self.success_observations)
-        pruned_front = prune_pareto_front(pareto_front)
-        pareto_observations = pruned_front if self.prune_pareto else pareto_front
+        if not pareto_front:
+            return self._random_suggestion(fill, fixed_cost_norm), info
 
-        # Use the max cost from the pruned pareto to avoid inefficiently long runs
+        pruned_front = prune_pareto_front(pareto_front)
+        if not pruned_front:
+            pruned_front = pareto_front
+        pareto_observations = pruned_front if self.prune_pareto else pareto_front
+        if not pareto_observations:
+            pareto_observations = self.success_observations
+
+        # Use the max cost from the pruned pareto to avoid inefficiently long runs.
+        # Empty fronts can happen early if prior trials failed or were filtered.
+        front_max_cost = pruned_front[-1]['cost']
         if self.upper_cost_threshold < 0:
-            self.upper_cost_threshold = pruned_front[-1]['cost']
+            self.upper_cost_threshold = front_max_cost
         # Try to change the threshold slowly
-        elif self.upper_cost_threshold < pruned_front[-1]['cost']:
+        elif self.upper_cost_threshold < front_max_cost:
             self.upper_cost_threshold *= 1.01
         self.stop_threshold_model.fit(self.success_observations, self.upper_cost_threshold)
 
@@ -812,7 +830,7 @@ class Protein:
         suggestions = suggestions[dedup_indices]
 
         if len(suggestions) == 0:
-            return self.suggest(fill) # Fallback to random if all suggestions are filtered
+            return self._random_suggestion(fill, fixed_cost_norm), info
 
         ### Predict scores and costs
         # Batch predictions to avoid GPU OOM for large number of suggestions
@@ -904,17 +922,25 @@ class Protein:
         logit = math.log(value / (1 - value))
         return np.clip(logit, -5, 100)
 
-    def observe(self, hypers, score, cost, is_failure=False):
-        params = self.hyperparameters.from_dict(hypers)
+    def _store_score(self, score):
+        return league.store_protein_score(self, score)
 
-        if self.metric_distribution == 'percentile':
-            score = self.logit_transform(score)
+    def _rebuild_top_observations(self):
+        league.rebuild_protein_top_observations(self)
+
+    def refresh_observations_by_run_id(self, scores_by_run_id):
+        return league.refresh_protein_observations_by_run_id(self, scores_by_run_id)
+
+    def observe(self, hypers, score, cost, is_failure=False, run_id=None):
+        params = self.hyperparameters.from_dict(hypers)
+        score = self._store_score(score)
 
         new_observation = dict(
             input=params,
             output=score,
             cost=cost,
             is_failure=is_failure,
+            run_id=run_id,
         )
 
         if is_failure or not np.isfinite(score) or np.isnan(score):
@@ -922,12 +948,19 @@ class Protein:
             self.failure_observations.append(new_observation)
             return
 
-        if self.success_observations:
+        if run_id is not None:
+            for idx, obs in enumerate(self.success_observations):
+                if obs.get('run_id') == run_id:
+                    self.success_observations[idx] = new_observation
+                    self._rebuild_top_observations()
+                    return
+        elif self.success_observations:
             success_params = np.stack([e['input'] for e in self.success_observations])
             dist = np.linalg.norm(params - success_params, axis=1)
             same = np.where(dist < EPSILON)[0]
             if len(same) > 0:
                 self.success_observations[same[0]] = new_observation
+                self._rebuild_top_observations()
                 return
 
         # Ignore obs that are below the minimum cost
@@ -957,15 +990,15 @@ class Protein:
         return score < threshold
 
     def early_stop(self, logs, target_key):
-        for k, v in logs['loss'].items():
-            if np.isnan(v):
+        for k, v in logs.items():
+            if k.startswith('loss/') and np.isnan(v):
                 logs['is_loss_nan'] = True
                 return True
 
         if 'uptime' not in logs or target_key not in logs:
             return False
 
-        metric_val, cost = logs['env'][target_key], logs['uptime']
+        metric_val, cost = logs[target_key], logs['uptime']
         self._running_target_buffer.append(metric_val)
         target_running_mean = np.mean(self._running_target_buffer)
         threshold = self.get_early_stop_threshold(cost)

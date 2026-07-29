@@ -8,7 +8,7 @@
 
 #define NUM_ACTIONS 5
 #define NUM_BULLETS 16
-#define EGO_FEATURES 8
+#define EGO_FEATURES 14
 #define OTHER_FEATURES 8
 
 static const float ACCEL_VALUES[4] = {
@@ -30,11 +30,11 @@ static const float FIREPOWER_VALUES[6] = {
     0, 0.1f, 0.5f, 1.0f, 2.0f, 3.0f
 };
 float cos_deg(float deg) {
-    return cos(deg * 3.14159265358979323846 / 180.0);
+    return cosf(deg * 3.14159265358979323846f / 180.0f);
 }
 
 float sin_deg(float deg) {
-    return sin(deg * 3.14159265358979323846 / 180.0);
+    return sinf(deg * 3.14159265358979323846f / 180.0f);
 }
 
 typedef struct BotMem BotMem;  // defined in bots.h
@@ -48,6 +48,9 @@ struct Log {
     float episode_length;
     float score;            // damage dealt this episode
     float damage_received;  // starting energy - current energy at episode end
+    float melee_damage_inflicted;
+    float damage_taken;
+    float range_damage_inflicted;
     // Historical pool tracking (selfplay-pool mode). Per-bank score/games for
     // matches against frozen historical opponents. hist_score / hist_n are
     // legacy aggregates summed across all banks.
@@ -85,9 +88,15 @@ struct Robot {
     float gun_heading;
     float radar_heading_prev;
     float radar_heading;
+    float speed_mult;
+    float handling_mult;
+    float power_mult;
+    float reward_melee_damage_inflicted;
+    float reward_damage_taken;
+    float reward_range_damage_inflicted;
     int bullet_idx;
     float gun_heat;
-    int energy;
+    float energy;
 };
 
 typedef struct Client Client;
@@ -117,8 +126,21 @@ struct Robocode {
     Bullet* bullets;
     Log log;
     Log* logs;
+    // reward_damage is kept as a legacy config field. The explicit shaped
+    // damage coefficients are fixed per env config / sweep trial and copied
+    // into each learning slot on reset so policies can condition on them.
     float reward_damage;
     float reward_spot;
+    float reward_melee_damage_inflicted;
+    float reward_damage_taken;
+    float reward_range_damage_inflicted;
+    float reward_melee_damage_inflicted_slot_0;
+    float reward_damage_taken_slot_0;
+    float reward_range_damage_inflicted_slot_0;
+    float reward_melee_damage_inflicted_slot_1;
+    float reward_damage_taken_slot_1;
+    float reward_range_damage_inflicted_slot_1;
+    float dr;
     int bot_policy;
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
 
@@ -178,9 +200,12 @@ void add_log(Robocode* env) {
         env->log.perf            += env->logs[i].perf;
         env->log.episode_return  += env->logs[i].episode_return;
         env->log.episode_length  += env->logs[i].episode_length;
-        env->log.score           += env->logs[i].score;
-        env->log.damage_received += env->logs[i].damage_received;
-        env->log.n               += 1.0f;
+        env->log.score                   += env->logs[i].score;
+        env->log.damage_received         += env->logs[i].damage_received;
+        env->log.melee_damage_inflicted  += env->logs[i].melee_damage_inflicted;
+        env->log.damage_taken            += env->logs[i].damage_taken;
+        env->log.range_damage_inflicted  += env->logs[i].range_damage_inflicted;
+        env->log.n                       += 1.0f;
     }
 }
 
@@ -240,23 +265,59 @@ static bool bullets_collide(
     return (mx*mx + my*my) < r2;
 }
 
+static inline void add_agent_reward(Robocode* env, int agent_idx, float reward) {
+    *env->reward_ptr[agent_idx] += reward;
+    env->logs[agent_idx].episode_return += reward;
+}
+
+static inline void record_melee_damage_inflicted(Robocode* env, int agent_idx, float damage) {
+    if (damage <= 0.0f || agent_idx < 0 || agent_idx >= env->num_agents) return;
+    env->logs[agent_idx].melee_damage_inflicted += damage;
+    add_agent_reward(env, agent_idx,
+        damage * env->robots[agent_idx].reward_melee_damage_inflicted);
+}
+
+static inline void record_damage_taken(Robocode* env, int agent_idx, float damage) {
+    if (damage <= 0.0f || agent_idx < 0 || agent_idx >= env->num_agents) return;
+    env->logs[agent_idx].damage_taken += damage;
+    add_agent_reward(env, agent_idx,
+        damage * env->robots[agent_idx].reward_damage_taken);
+}
+
+static inline void record_range_damage_inflicted(Robocode* env, int agent_idx, float damage) {
+    if (damage <= 0.0f || agent_idx < 0 || agent_idx >= env->num_agents) return;
+    env->logs[agent_idx].range_damage_inflicted += damage;
+    add_agent_reward(env, agent_idx,
+        damage * env->robots[agent_idx].reward_range_damage_inflicted);
+}
+
+static inline void record_melee_collision(Robocode* env, int a_idx, int b_idx, float damage) {
+    record_melee_damage_inflicted(env, a_idx, damage);
+    record_melee_damage_inflicted(env, b_idx, damage);
+    record_damage_taken(env, a_idx, damage);
+    record_damage_taken(env, b_idx, damage);
+}
+
 void move(Robocode* env, Robot* robot, float distance) {
+    int robot_idx = (int)(robot - env->robots);
     float dx = cos_deg(robot->heading);
     float dy = sin_deg(robot->heading);
     //float accel = 1.0;//2.0*distance / (robot->v * robot->v);
     float accel = distance;
+    float handling = fmaxf(robot->handling_mult, 0.0f);
+    float max_speed = 8.0f * fmaxf(robot->speed_mult, 0.0f);
 
-    if (accel > 1.0) {
-        accel = 1.0;
-    } else if (accel < -2.0) {
-        accel = -2.0;
+    if (accel > handling) {
+        accel = handling;
+    } else if (accel < -2.0f * handling) {
+        accel = -2.0f * handling;
     }
 
     robot->v += accel;
-    if (robot->v > 8.0) {
-        robot->v = 8.0;
-    } else if (robot->v < -8.0) {
-        robot->v = -8.0;
+    if (robot->v > max_speed) {
+        robot->v = max_speed;
+    } else if (robot->v < -max_speed) {
+        robot->v = -max_speed;
     }
 
     float new_x = robot->x + dx * robot->v;
@@ -269,7 +330,7 @@ void move(Robocode* env, Robot* robot, float distance) {
         if (target == robot) {
             continue;
         }
-        if (target->energy < 0) {     // dead = phase-through; disabled = still solid
+        if (target->energy < 0) {
             continue;
         }
         float abs_x = fabsf(target->x - new_x);
@@ -278,8 +339,10 @@ void move(Robocode* env, Robot* robot, float distance) {
             continue;
         }
 
-        target->energy -= 0.6;
-        robot->energy -= 0.6;
+        float melee_damage = 0.6f;
+        record_melee_collision(env, robot_idx, j, melee_damage);
+        target->energy -= melee_damage;
+        robot->energy -= melee_damage;
         robot->v = 0;
         target->v = 0;   // both robots stop on ramming collision (classic rule)
         return;
@@ -326,6 +389,55 @@ void fire(Robocode* env, Robot* robot, int robot_idx, float firepower) {
     bullet->live = true;
 }
 
+static inline float rand_unit(Robocode* env) {
+    return (float)rand_r(&env->rng) / ((float)RAND_MAX + 1.0f);
+}
+
+static inline void sample_dr_triplet(Robocode* env, float* a, float* b, float* c) {
+    *a = 1.0f;
+    *b = 1.0f;
+    *c = 1.0f;
+
+    if (env->dr <= 0.0f) return;
+    float upper = 1.0f + env->dr;
+    if (upper <= 0.0f) return;
+    float lower = 1.0f / upper;
+    float width = upper - lower;
+    if (width <= 0.0f) return;
+
+    for (int tries = 0; tries < 64; tries++) {
+        float first = lower + width * rand_unit(env);
+        float second = lower + width * rand_unit(env);
+        float third = 3.0f - first - second;
+        if (third >= lower && third <= upper) {
+            *a = first;
+            *b = second;
+            *c = third;
+            return;
+        }
+    }
+}
+
+static inline void sample_agent_multipliers(Robocode* env, Robot* robot) {
+    sample_dr_triplet(env, &robot->speed_mult, &robot->handling_mult, &robot->power_mult);
+}
+
+static inline void assign_agent_reward_coefficients(Robocode* env, Robot* robot, int agent_idx) {
+    if (agent_idx == 0) {
+        robot->reward_melee_damage_inflicted = env->reward_melee_damage_inflicted_slot_0;
+        robot->reward_damage_taken = env->reward_damage_taken_slot_0;
+        robot->reward_range_damage_inflicted = env->reward_range_damage_inflicted_slot_0;
+    } else if (agent_idx == 1) {
+        robot->reward_melee_damage_inflicted = env->reward_melee_damage_inflicted_slot_1;
+        robot->reward_damage_taken = env->reward_damage_taken_slot_1;
+        robot->reward_range_damage_inflicted = env->reward_range_damage_inflicted_slot_1;
+    } else {
+        robot->reward_melee_damage_inflicted = env->reward_melee_damage_inflicted;
+        robot->reward_damage_taken = env->reward_damage_taken;
+        robot->reward_range_damage_inflicted = env->reward_range_damage_inflicted;
+    }
+}
+
 int scan_area(Robocode* env, Robot* robot){
     // Sweep is the signed angle traversed from radar_heading_prev to
     // radar_heading, normalized to (-180, 180]. A robot is scanned if its
@@ -339,7 +451,7 @@ int scan_area(Robocode* env, Robot* robot){
     for (int j = 0; j < total_robots; j++) {
         Robot* other = &env->robots[j];
         if (other == robot) continue;
-        if (other->energy < 0) continue;   // disabled (energy=0) is still scannable
+        if (other->energy < 0) continue;
 
         float dx = other->x - robot->x;
         float dy = other->y - robot->y;
@@ -371,6 +483,12 @@ void compute_observations(Robocode* env){
         obs[5] = robot->radar_heading_prev * DEG2RAD;
         obs[6] = robot->v / 8.0f;
         obs[7] = robot->energy / 100.0f;
+        obs[8] = robot->speed_mult;
+        obs[9] = robot->power_mult;
+        obs[10] = robot->handling_mult;
+        obs[11] = robot->reward_melee_damage_inflicted;
+        obs[12] = robot->reward_damage_taken;
+        obs[13] = robot->reward_range_damage_inflicted;
 
         int scanned = scan_area(env, robot);
         if (scanned < 0) {
@@ -408,20 +526,22 @@ void compute_observations(Robocode* env){
         float aim_err = bearing - robot->gun_heading;
         if (aim_err >  180.0f) aim_err -= 360.0f;
         else if (aim_err < -180.0f) aim_err += 360.0f;
-        obs[8]  = dx_ego / 1200.0f;
-        obs[9]  = dy_ego / 1200.0f;
-        obs[10] = dh_body  * DEG2RAD;
-        obs[11] = dh_gun   * DEG2RAD;
-        obs[12] = dh_radar * DEG2RAD;
-        obs[13] = other->energy / 100.0f;
-        obs[14] = aim_err * DEG2RAD;
-        obs[15] = 1.0f;
+        int off = EGO_FEATURES;
+        obs[off + 0] = dx_ego / 1200.0f;
+        obs[off + 1] = dy_ego / 1200.0f;
+        obs[off + 2] = dh_body  * DEG2RAD;
+        obs[off + 3] = dh_gun   * DEG2RAD;
+        obs[off + 4] = dh_radar * DEG2RAD;
+        obs[off + 5] = other->energy / 100.0f;
+        obs[off + 6] = aim_err * DEG2RAD;
+        obs[off + 7] = 1.0f;
     }
 }
 void c_reset(Robocode* env) {
     env->tick = 0;
-    env->boundary_reached = 0;   // cleared so next episode-end can flip it back
+    // boundary_reached is owned by selfplay.py alignment; do not clear it here.
     int total_robots = env->num_agents + env->num_bots;
+    memset(env->bullets, 0, NUM_BULLETS * total_robots * sizeof(Bullet));
     int idx = 0;
     float x, y;
     while (idx < total_robots) {
@@ -446,11 +566,20 @@ void c_reset(Robocode* env) {
             robot->gun_heading = 0;
             robot->radar_heading = 0;
             robot->radar_heading_prev = 0;
-            robot->energy = 100;
+            robot->energy = 100.0f;
             robot->gun_heat = 3;
             robot->bullet_idx = 0;
             if (idx < env->num_agents) {
+                sample_agent_multipliers(env, robot);
+                assign_agent_reward_coefficients(env, robot, idx);
                 env->logs[idx] = (Log){0};
+            } else {
+                robot->speed_mult = 1.0f;
+                robot->handling_mult = 1.0f;
+                robot->power_mult = 1.0f;
+                robot->reward_melee_damage_inflicted = 0.0f;
+                robot->reward_damage_taken = 0.0f;
+                robot->reward_range_damage_inflicted = 0.0f;
             }
             idx += 1;
         }
@@ -461,8 +590,28 @@ void c_reset(Robocode* env) {
 
 #include "bots.h"
 
+// Agent matches end as soon as a slot reaches zero energy. If all slots are
+// disabled in the same tick, score the episode as a draw. Return 2 = no end.
+static inline int agent_terminal_outcome(Robocode* env) {
+    if (env->num_agents <= 0) return 2;
+    bool slot0_dead = env->robots[0].energy <= 0.0f;
+    if (env->num_agents == 1) return slot0_dead ? -1 : 2;
+
+    bool any_nonzero_dead = false;
+    bool any_nonzero_alive = false;
+    for (int a = 1; a < env->num_agents; a++) {
+        if (env->robots[a].energy <= 0.0f) any_nonzero_dead = true;
+        else any_nonzero_alive = true;
+    }
+
+    if (slot0_dead && !any_nonzero_alive) return 0;
+    if (slot0_dead) return -1;
+    if (any_nonzero_dead) return +1;
+    return 2;
+}
+
 // Helper for every episode-end path. outcome: +1 slot-0 won, -1 slot-0 lost,
-// 0 draw (timeout). Historical accounting only applies when env->tag > 0.
+// 0 draw. Historical accounting only applies when env->tag > 0.
 static inline void end_episode(Robocode* env, int outcome) {
     float s0_score = (outcome > 0) ? 1.0f : (outcome < 0) ? 0.0f : 0.5f;
     // Scale by num_agents so that (slot_0_score / n) where n increments by
@@ -500,12 +649,10 @@ void c_step(Robocode* env) {
         *env->reward_ptr[a]   = 0.0f;
         *env->terminal_ptr[a] = 0.0f;
     }
-    for (int a = 0; a < env->num_agents; a++) {
-        if (env->robots[a].energy < 0) {  // strict: death requires energy past 0
-            // Primary (slot 0) wins iff a non-zero slot died.
-            end_episode(env, (a == 0) ? -1 : +1);
-            return;
-        }
+    int agent_outcome = agent_terminal_outcome(env);
+    if (agent_outcome != 2) {
+        end_episode(env, agent_outcome);
+        return;
     }
     // move all bullets
     float prev_x[total_bullets], prev_y[total_bullets];
@@ -540,7 +687,7 @@ void c_step(Robocode* env) {
     bool any_bot_alive = (env->num_bots == 0);
     for (int shooter = 0; shooter < total_robots; shooter++) {
         Robot* robot = &env->robots[shooter];
-        if (shooter >= env->num_agents && robot->energy >= 0) any_bot_alive = true;  // disabled counts as alive
+        if (shooter >= env->num_agents && robot->energy > 0.0f) any_bot_alive = true;
         for (int blt = 0; blt < NUM_BULLETS; blt++) {
             int bi = shooter * NUM_BULLETS + blt;
             Bullet* bullet = &env->bullets[bi];
@@ -550,7 +697,7 @@ void c_step(Robocode* env) {
                 if (!bullet->live) break;  
                 if (j == shooter) continue;
                 Robot* target = &env->robots[j];
-                if (target->energy < 0) continue;   // disabled (=0) is still hittable
+                if (target->energy < 0) continue;
                 // Broad-phase: keep if EITHER endpoint of the swept segment is
                 // within 32 units of target center. Using only the end position
                 // would miss tunneling at firepower 0.1 (speed ~19.7/tick).
@@ -578,17 +725,16 @@ void c_step(Robocode* env) {
                 if (!t_agent && s_agent) {
                     bot_on_hit_by_bullet(env, j, bullet->heading, bullet->firepower);
                 }
-                bool killed = target->energy < 0;   // strict: brought past 0
-                float r = killed ? 1.0f : damage * env->reward_damage;
+                bool killed = target->energy <= 0.0f;
                 if (s_agent) {
-                    *env->reward_ptr[shooter] += r;
+                    record_range_damage_inflicted(env, shooter, damage);
                     env->logs[shooter].score += damage;
-                    env->logs[shooter].episode_return += r;
+                    if (killed) add_agent_reward(env, shooter, 1.0f);
                     if (killed && !t_agent) env->logs[shooter].perf += 1.0f;
                 }
                 if (t_agent) {
-                    *env->reward_ptr[j] -= r;
-                    env->logs[j].episode_return -= r;
+                    record_damage_taken(env, j, damage);
+                    if (killed) add_agent_reward(env, j, -1.0f);
                 }
             }
         }
@@ -597,14 +743,19 @@ void c_step(Robocode* env) {
         end_episode(env, +1);  // primary wiped all bots
         return;
     }
+    agent_outcome = agent_terminal_outcome(env);
+    if (agent_outcome != 2) {
+        end_episode(env, agent_outcome);
+        return;
+    }
     for (int i = 0; i < env->num_agents; i++) {
         Robot* robot = &env->robots[i];
         float* atn = env->action_ptr[i];
         env->logs[i].episode_length += 1.0f;
 
-        // Disabled (energy <= 0): no actions, velocity frozen to 0.
-        // Classic Robocode rule — alive but inert, can still be hit and killed.
-        if (robot->energy <= 0) {
+        // Defensive guard; agent_terminal_outcome should have already ended
+        // episodes for disabled agents.
+        if (robot->energy <= 0.0f) {
             robot->v = 0;
             continue;
         }
@@ -615,27 +766,29 @@ void c_step(Robocode* env) {
         }
 
         // Move
-        float move_atn = ACCEL_VALUES[(int)atn[0]];
+        float handling = fmaxf(robot->handling_mult, 0.0f);
+        float move_atn = ACCEL_VALUES[(int)atn[0]] * handling;
         move(env, robot, move_atn);
 
         // Turn
-        float turn_atn = TURN_VALUES[(int)atn[1]];
+        float turn_atn = TURN_VALUES[(int)atn[1]] * handling;
 
         float abs_v = fabs(robot->v);
-        float max_turn = 10 - 0.75*abs_v;
+        float max_turn = (10 - 0.75*abs_v) * handling;
+        if (max_turn < 0.0f) max_turn = 0.0f;
         float body_turn_degrees = turn(&robot->heading, turn_atn, max_turn, 0);
 
         // Gun
-        float gun_atn = GUN_TURN_VALUES[(int)atn[2]];
-        float gun_degrees = turn(&robot->gun_heading, gun_atn, 20.0, body_turn_degrees);
+        float gun_atn = GUN_TURN_VALUES[(int)atn[2]] * handling;
+        float gun_degrees = turn(&robot->gun_heading, gun_atn, 20.0f * handling, body_turn_degrees);
 
         // Radar
-        float radar_atn = RADAR_TURN_VALUES[(int)atn[3]];
+        float radar_atn = RADAR_TURN_VALUES[(int)atn[3]] * handling;
         robot->radar_heading_prev = robot->radar_heading;
-        turn(&robot->radar_heading, radar_atn, 45.0, body_turn_degrees+gun_degrees);
+        turn(&robot->radar_heading, radar_atn, 45.0f * handling, body_turn_degrees+gun_degrees);
 
         // Fire
-        float firepower = FIREPOWER_VALUES[(int)atn[4]];
+        float firepower = FIREPOWER_VALUES[(int)atn[4]] * fmaxf(robot->power_mult, 0.0f);
         if (firepower > 0) {
             fire(env, robot,i, firepower);
         }
@@ -653,10 +806,30 @@ void c_step(Robocode* env) {
             wall_dmg = 0.0f;
         }
         robot->energy -= wall_dmg;
+        record_damage_taken(env, i, wall_dmg);
         robot->v = 0;
     }
+    agent_outcome = agent_terminal_outcome(env);
+    if (agent_outcome != 2) {
+        end_episode(env, agent_outcome);
+        return;
+    }
+
     // bot step
     for (int b = env->num_agents; b < total_robots; b++) bot_step(env, b);
+    if (env->num_bots > 0) {
+        any_bot_alive = false;
+        for (int b = env->num_agents; b < total_robots; b++) {
+            if (env->robots[b].energy > 0.0f) {
+                any_bot_alive = true;
+                break;
+            }
+        }
+        if (!any_bot_alive) {
+            end_episode(env, +1);
+            return;
+        }
+    }
     compute_observations(env);
 }
 
@@ -707,7 +880,7 @@ void c_render(Robocode* env) {
     int total_robots = env->num_agents + env->num_bots;
     for (int i = 0; i < total_robots; i++) {
         Robot robot = env->robots[i];
-        if (robot.energy < 0) continue;     // still draw disabled (energy=0) bots
+        if (robot.energy < 0) continue;
         bool is_agent = i < env->num_agents;
         Vector2 robot_pos = (Vector2){robot.x, robot.y};
 
@@ -733,7 +906,7 @@ void c_render(Robocode* env) {
         DrawTexturePro(client->atlas, radar_rect, dest_rect, origin, robot.radar_heading+90, WHITE);
         DrawTexturePro(client->atlas, gun_rect,   dest_rect, origin, robot.gun_heading+90,   WHITE);
 
-        DrawText(TextFormat("%i", robot.energy), robot.x-16, robot.y-48, 12, WHITE);
+        DrawText(TextFormat("%.1f", robot.energy), robot.x-16, robot.y-48, 12, WHITE);
     }
 
     for (int i = 0; i < (env->num_agents + env->num_bots)*NUM_BULLETS; i++) {

@@ -2,22 +2,22 @@
 snapshot, the rest are pure selfplay. Used by `_train` in pufferl.py — gated on
 `selfplay.enabled` (config section).
 
-Pool grows on two triggers:
-  - snapshot_interval: every N global steps, save primary weights as a new
-    pool entry regardless of winrate. Provides a steady cadence.
-  - winrate-driven swap: when primary beats the current opponent at >=
-    swap_winrate over >= min_games, also save primary as a pool entry, then
-    swap to a new opponent. Marks progress checkpoints in the curriculum.
+Pool growth and opponent swaps are decoupled:
+  - snapshot_interval: every N global steps, rank 0 saves primary weights as a
+    new pool entry and publishes the pool. 0 disables interval snapshotting.
+  - opp_timeout_steps: every N global steps per bank, ranks sample new opponents
+    on a fixed cadence and load them after all historical envs reach an episode
+    boundary. 0 disables fixed-interval swapping.
 
-Swap (without a snapshot) also fires when opp_timeout_steps have elapsed
-since the current opponent was finalized. Timeout prevents stalemates from
-pinning the curriculum to a single opponent indefinitely.
-
+Winrate is diagnostic only; it does not trigger snapshots or swaps.
 Pool storage is disk-only (paths held in memory; weights only on GPU when
 loaded as the frozen bank). Stride-eviction preserves temporal coverage when
 the pool exceeds its cap.
 """
+import glob
+import json
 import os
+import time
 
 import numpy as np
 
@@ -25,17 +25,37 @@ from pufferlib import _C
 
 
 def sample_opponent(pool, rng):
-    candidates = pool if len(pool) < 6 else pool[:-5]
-    weights = np.array([(i + 1) ** 0.5 for i in range(len(candidates))], dtype=np.float64)
-    weights /= weights.sum()
-    idx = int(rng.choice(len(candidates), p=weights))
-    return candidates[idx]
+    if not pool:
+        raise RuntimeError('selfplay opponent pool is empty')
+    return pool[int(rng.integers(len(pool)))]
 
 
-def update_elo(primary_elo, opp_elo, score_rate, k):
-    expected = 1.0 / (1.0 + 10.0 ** ((opp_elo - primary_elo) / 400.0))
-    delta = k * (score_rate - expected)
-    return primary_elo + delta, opp_elo - delta
+def resolve_opponent_pool(spec):
+    if not spec:
+        return []
+    if isinstance(spec, (list, tuple)):
+        candidates = []
+        for item in spec:
+            candidates.extend(resolve_opponent_pool(item))
+        return sorted(dict.fromkeys(candidates))
+
+    raw_spec = os.path.expanduser(str(spec))
+
+    def _expand(path_spec):
+        if os.path.isdir(path_spec):
+            return glob.glob(os.path.join(path_spec, '*.bin'))
+        candidates = glob.glob(path_spec)
+        if not candidates and os.path.isfile(path_spec):
+            candidates = [path_spec]
+        return candidates
+
+    candidates = _expand(raw_spec)
+    if not candidates and not os.path.isabs(raw_spec):
+        repo_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        candidates = _expand(os.path.join(repo_root, raw_spec))
+
+    return sorted(os.path.abspath(path) for path in candidates
+                  if path.endswith('.bin') and os.path.isfile(path))
 
 
 def evict(pool, max_size):
@@ -116,7 +136,98 @@ def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_sizes
     return perm, tags, num_hist_envs_per_bank
 
 
-def setup(pufferl, backend, args, run_id):
+def make_bank_state(path, current_agent_step, num_hist_envs):
+    return {
+        'cur_opp_path': path,
+        'hist_score': 0.0,
+        'hist_n': 0.0,
+        'pending_opp_path': None,
+        'epoch_armed': 0,
+        'opp_started_step': current_agent_step,
+        'num_hist_envs': num_hist_envs,
+        'last_winrate_at_swap': 0.0,
+        'last_epochs_to_align': 0,
+    }
+
+
+def shared_state_path(pool_dir):
+    return os.path.join(pool_dir, 'shared_opponent.json')
+
+
+def publish_shared_state(pool_state):
+    path = pool_state['shared_state_path']
+    version = int(pool_state.get('shared_state_version', 0)) + 1
+    pool = pool_state.get('pool', ())
+    data = {
+        'version': version,
+        'agent_step': pool_state.get('last_snapshot_step', 0),
+        'pool_size': len(pool),
+        'pool': [{'path': entry['path']} for entry in pool],
+        # Diagnostic + bootstrap for ranks that are just starting. Followers do
+        # not keep following rank 0's bank after setup; they sample locally.
+        'banks': [{'path': bank['cur_opp_path']} for bank in pool_state['banks']],
+    }
+    tmp = f'{path}.tmp.{os.getpid()}'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+        f.write('\n')
+    os.replace(tmp, path)
+    pool_state['shared_state_version'] = version
+
+
+def read_shared_state(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def wait_shared_state(path, timeout=300.0):
+    start = time.time()
+    while True:
+        try:
+            return read_shared_state(path)
+        except (FileNotFoundError, json.JSONDecodeError):
+            if time.time() - start > timeout:
+                raise RuntimeError(f'timed out waiting for shared selfplay state: {path}')
+            time.sleep(0.05)
+
+
+def _pool_from_shared_state(state):
+    pool = []
+    seen = set()
+    for entry in state.get('pool', []):
+        path = entry.get('path')
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        pool.append({'path': path})
+    return pool
+
+
+def _external_pool_entries(sp):
+    spec = sp.get('opponent_pool', '')
+    paths = resolve_opponent_pool(spec)
+    if spec and not paths:
+        raise RuntimeError(f'selfplay.opponent_pool resolved no .bin files: {spec}')
+    return [{'path': path} for path in paths]
+
+
+def sync_shared_pool(pool_state):
+    try:
+        state = read_shared_state(pool_state['shared_state_path'])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+
+    version = int(state.get('version', 0))
+    if version <= int(pool_state.get('shared_state_version', 0)):
+        return
+
+    pool = _pool_from_shared_state(state)
+    if pool:
+        pool_state['pool'] = pool
+    pool_state['shared_state_version'] = version
+
+
+def setup(pufferl, backend, args, run_id, artifact_owner=True):
     '''Wire up agent_perm/tags and bootstrap the frozen bank with the current
     weights so historical envs have an opponent from rollout 1. Returns a
     pool_state dict (or None if disabled).'''
@@ -167,48 +278,70 @@ def setup(pufferl, backend, args, run_id):
     backend.set_env_tags(pufferl, tags)
 
     pool_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id, 'pool')
-    os.makedirs(pool_dir, exist_ok=True)
-    bootstrap_path = os.path.join(pool_dir, f'{pufferl.global_step:016d}.bin')
-    backend.save_weights(pufferl, bootstrap_path)
-    # Load bootstrap into every bank — they'll diverge as each bank's swap fires.
-    for b in range(num_banks):
-        backend.load_frozen_bank(pufferl, b, bootstrap_path)
+    state_path = shared_state_path(pool_dir)
 
-    elo_init = float(sp.get('elo_init', 0.0))
-    elo_k    = float(sp.get('elo_k',    16.0))
-    rng = np.random.default_rng(int(sp.get('seed', 0)))
+    rank = int(args.get('rank', 0))
+    rng = np.random.default_rng(int(sp.get('seed', 0)) + rank)
+    world_size = max(1, int(args.get('world_size', 1)))
+    current_agent_step = int(pufferl.global_step) * world_size
 
+    pool = []
     banks_state = []
-    for b in range(num_banks):
-        banks_state.append({
-            'cur_opp_path': bootstrap_path,
-            'cur_opp_elo': elo_init,
-            'hist_score': 0.0,
-            'hist_n': 0.0,
-            'pending_opp_path': None,
-            'pending_opp_elo': None,
-            'epoch_armed': 0,
-            'opp_started_step': int(pufferl.global_step),
-            'num_hist_envs': num_hist_envs_per_bank[b],
-            'last_winrate_at_swap': 0.0,
-            'last_epochs_to_align': 0,
-        })
+    shared_version = 0
+    external_pool = _external_pool_entries(sp)
+    if artifact_owner:
+        os.makedirs(pool_dir, exist_ok=True)
+        if external_pool:
+            pool = external_pool
+        else:
+            bootstrap_path = os.path.join(pool_dir, f'{pufferl.global_step:016d}.bin')
+            backend.save_weights(pufferl, bootstrap_path)
+            pool = [{'path': bootstrap_path}]
+        for b in range(num_banks):
+            opp_entry = sample_opponent(pool, rng)
+            backend.load_frozen_bank(pufferl, b, opp_entry['path'])
+            banks_state.append(make_bank_state(
+                opp_entry['path'], current_agent_step, num_hist_envs_per_bank[b]))
+    else:
+        state = wait_shared_state(state_path)
+        shared_version = int(state.get('version', 0))
+        pool = _pool_from_shared_state(state)
+        bank_entries = state.get('banks', [])
+        if len(bank_entries) < num_banks:
+            raise RuntimeError(f'shared selfplay state has {len(bank_entries)} banks, expected {num_banks}')
+        for b in range(num_banks):
+            entry = bank_entries[b]
+            opp_path = entry['path']
+            backend.load_frozen_bank(pufferl, b, opp_path)
+            banks_state.append(make_bank_state(
+                opp_path, current_agent_step, num_hist_envs_per_bank[b]))
 
-    return {
+    pool_state = {
         'pool_dir': pool_dir,
-        'pool': [{'path': bootstrap_path, 'elo': elo_init}],
+        'shared_state_path': state_path,
+        'shared_state_version': shared_version,
+        'artifact_owner': artifact_owner,
+        'pool': pool,
         'rng': rng,
         'max_size': int(sp['max_size']),
-        'min_games': int(sp['min_games']),
-        'swap_winrate': float(sp['swap_winrate']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
         'num_banks': num_banks,
         'banks': banks_state,
-        'primary_elo': elo_init,
-        'elo_k': elo_k,
-        'last_snapshot_step': int(pufferl.global_step),
+        'world_size': world_size,
+        'last_snapshot_step': current_agent_step,
     }
+    if artifact_owner:
+        publish_shared_state(pool_state)
+    return pool_state
+
+
+def sync(pufferl, backend, pool_state):
+    if pool_state is None:
+        return
+    if pool_state.get('artifact_owner', True):
+        return
+    sync_shared_pool(pool_state)
 
 
 def step(pufferl, backend, pool_state, flat_logs, epoch):
@@ -217,8 +350,13 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
 
     n_window = float(flat_logs.get('env/n', 0.0))
     num_banks = pool_state['num_banks']
+    current_agent_step = int(pufferl.global_step) * int(pool_state.get('world_size', 1))
 
-    # 1. Per-bank Elo update from the most recent rollout window.
+    artifact_owner = pool_state.get('artifact_owner', True)
+    if not artifact_owner:
+        sync_shared_pool(pool_state)
+
+    # 1. Per-bank score accumulation from the most recent rollout window.
     for b in range(num_banks):
         bank = pool_state['banks'][b]
         hist_score_w = float(flat_logs.get(f'env/hist_score_bank_{b}', 0.0)) * n_window
@@ -226,41 +364,31 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         if hist_n_w > 0.0:
             bank['hist_score'] += hist_score_w
             bank['hist_n']     += hist_n_w
-            score_rate = hist_score_w / hist_n_w
-            new_p, new_o = update_elo(pool_state['primary_elo'],
-                bank['cur_opp_elo'], score_rate, pool_state['elo_k'])
-            # All banks update the shared primary Elo. Multiple banks updating
-            # primary in one step is fine — Elo is symmetric, just a few more
-            # tiny adjustments per rollout window.
-            pool_state['primary_elo'] = new_p
-            bank['cur_opp_elo'] = new_o
-            for entry in pool_state['pool']:
-                if entry['path'] == bank['cur_opp_path']:
-                    entry['elo'] = new_o
-                    break
 
     # 2. Global snapshot cadence (shared across banks).
-    if (pool_state['snapshot_interval'] > 0
-            and pufferl.global_step - pool_state['last_snapshot_step']
+    pool_changed = False
+    if (artifact_owner
+            and pool_state['snapshot_interval'] > 0
+            and current_agent_step - pool_state['last_snapshot_step']
                 >= pool_state['snapshot_interval']):
+        os.makedirs(pool_state['pool_dir'], exist_ok=True)
         snap_path = os.path.join(pool_state['pool_dir'],
             f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, snap_path)
-        pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
+        pool_state['pool'].append({'path': snap_path})
         pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
-        pool_state['last_snapshot_step'] = int(pufferl.global_step)
+        pool_state['last_snapshot_step'] = current_agent_step
+        pool_changed = True
 
-    # 3. Per-bank swap logic. Each bank decides independently based on its own
-    # winrate. Tags 1..num_banks correspond to bank 0..num_banks-1.
+    # 3. Per-bank fixed-interval swap logic. Tags 1..num_banks correspond to
+    # bank 0..num_banks-1. Winrate is logged but does not drive swaps.
+    opponent_changed = False
     for b in range(num_banks):
         bank = pool_state['banks'][b]
         winrate = (bank['hist_score'] / bank['hist_n']
                        if bank['hist_n'] > 0 else None)
-        winrate_met = (winrate is not None
-            and bank['hist_n'] >= pool_state['min_games']
-            and winrate >= pool_state['swap_winrate'])
         timed_out = (pool_state['opp_timeout_steps'] > 0
-            and pufferl.global_step - bank['opp_started_step']
+            and current_agent_step - bank['opp_started_step']
                 >= pool_state['opp_timeout_steps'])
         tag_value = b + 1
 
@@ -269,33 +397,25 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 backend.load_frozen_bank(pufferl, b, bank['pending_opp_path'])
                 backend.count_aligned(pufferl, tag_value, 1)
                 bank['cur_opp_path'] = bank['pending_opp_path']
-                bank['cur_opp_elo'] = bank['pending_opp_elo']
                 bank['pending_opp_path'] = None
-                bank['pending_opp_elo'] = None
                 bank['hist_score'] = 0.0
                 bank['hist_n'] = 0.0
-                bank['opp_started_step'] = int(pufferl.global_step)
+                bank['opp_started_step'] = current_agent_step
                 bank['last_epochs_to_align'] = epoch - bank['epoch_armed']
-        elif winrate_met or timed_out:
-            # Winrate-driven snapshot kept while pool is small (< 10). After
-            # that, only the global interval cadence grows the pool. Timeout
-            # swaps never snapshot (stalemate, not progress).
-            if winrate_met and len(pool_state['pool']) < 10:
-                snap_path = os.path.join(pool_state['pool_dir'],
-                    f'{pufferl.global_step:016d}.bin')
-                backend.save_weights(pufferl, snap_path)
-                pool_state['pool'].append({'path': snap_path, 'elo': pool_state['primary_elo']})
-                pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
-                pool_state['last_snapshot_step'] = int(pufferl.global_step)
+                opponent_changed = True
+        elif timed_out:
             opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
             bank['pending_opp_path'] = opp_entry['path']
-            bank['pending_opp_elo'] = opp_entry['elo']
             bank['epoch_armed'] = epoch
             bank['last_winrate_at_swap'] = winrate if winrate is not None else 0.0
+            # Start a fresh alignment window for the pending opponent.
+            backend.count_aligned(pufferl, tag_value, 1)
+
+    if artifact_owner and (pool_changed or opponent_changed):
+        publish_shared_state(pool_state)
 
     # 4. Emit logs — per-bank and aggregate.
     flat_logs['pool/size']     = len(pool_state['pool'])
-    flat_logs['env/elo']       = pool_state['primary_elo']
     flat_logs['pool/num_banks'] = num_banks
     total_score = 0.0
     total_n     = 0.0
