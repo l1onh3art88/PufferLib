@@ -754,12 +754,108 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
     return grad;
 }
 
+// ---- SMERL mode conditioning ------------------------------------------------
+// Optional per-row behavior mode z. The policy is conditioned on z by adding a
+// learned embedding to the encoder output, before the recurrent network — the
+// env observation is untouched, so obs layout and checkpoint compatibility are
+// unaffected. Params live in their own allocator (see smerl.cu), not the flat
+// weight buffer that save_weights dumps.
+//
+// mode_ids is indexed by rollout row, not by flat (row, t): one z per row, held
+// fixed for the run. Rows with z outside [0, num_modes) are left unconditioned
+// — that is the sentinel for frozen-bank rows. Frozen banks additionally leave
+// Policy.smerl NULL, so they never reach this path at all.
+//
+// Discriminator fields (disc_*) and bonus_rewards are filled by smerl_create.
+// Disc train / bonus kernels live in smerl.cu and are called from the policy
+// forward hooks below via function pointers set at create time — keeps the
+// include order (models.cu before smerl.cu) acyclic.
+struct SmerlCond {
+    FloatTensor embed;       // [num_modes, hidden] fp32 params
+    FloatTensor embed_grad;  // [num_modes, hidden] fp32 grads
+    const int* mode_ids;     // device [rows]; set by the caller before forward
+    int num_modes;
+    int hidden;
+
+    // Discriminator (linear h -> K). Stop-grad CE only updates these.
+    FloatTensor disc_w;      // [num_modes, hidden]
+    FloatTensor disc_b;      // [num_modes]
+    FloatTensor disc_w_grad;
+    FloatTensor disc_b_grad;
+    FloatTensor disc_logits; // [max_rows, num_modes] scratch
+    FloatTensor disc_loss_acc;
+    FloatTensor disc_acc_acc;
+    FloatTensor disc_n_acc;
+    int max_rows;
+
+    // Optional rollout diversity bonus target (length = batch rows). NULL in train.
+    precision_t* bonus_rewards;
+    const int* gates;  // device [num_modes], 0/1
+    float bonus_coef;
+
+    // Filled by smerl_create. Avoid calling into smerl.cu by name from here.
+    // N = number of feature rows (B in rollout, B*TT in train); TT disambiguates
+    // mode_ids indexing (one z per agent row, not per timestep).
+    void (*disc_train_fn)(SmerlCond*, PrecisionTensor, int /*N*/, int /*TT*/, cudaStream_t);
+    void (*apply_bonus_fn)(SmerlCond*, PrecisionTensor, int /*N*/, cudaStream_t);
+};
+
+__global__ void smerl_add_embed(precision_t* __restrict__ h,
+        const float* __restrict__ embed, const int* __restrict__ mode_ids,
+        int n, int TT, int hidden, int num_modes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int z = mode_ids[idx / (TT * hidden)];
+    if (z < 0 || z >= num_modes) return;
+    h[idx] = from_float(to_float(h[idx]) + embed[z * hidden + (idx % hidden)]);
+}
+
+// Gradient wrt the embedding is the sum of grad_h over every row sharing that
+// mode. fp32 accumulation keeps this exact under bf16 activations.
+__global__ void smerl_embed_backward(const precision_t* __restrict__ grad_h,
+        float* __restrict__ embed_grad, const int* __restrict__ mode_ids,
+        int n, int TT, int hidden, int num_modes) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    int z = mode_ids[idx / (TT * hidden)];
+    if (z < 0 || z >= num_modes) return;
+    atomicAdd(&embed_grad[z * hidden + (idx % hidden)], to_float(grad_h[idx]));
+}
+
+// h is (B*TT, hidden) in train and (B, hidden) in rollout; TT disambiguates.
+// Sized off numel so a {B, TT, H} shape works the same as {B_TT, H}.
+// Pre-mode features: disc train / bonus run before the embedding is added.
+static inline void smerl_condition(SmerlCond* s, PrecisionTensor h, int TT, cudaStream_t stream) {
+    if (s == nullptr || s->mode_ids == nullptr) return;
+    int n = (int)numel(h.shape);
+    int N = n / s->hidden;
+    if (s->apply_bonus_fn != nullptr && s->bonus_rewards != nullptr) {
+        s->apply_bonus_fn(s, h, N, stream);
+    }
+    if (s->disc_train_fn != nullptr && s->bonus_rewards == nullptr) {
+        // Train path only: rollout sets bonus_rewards and skips CE (disc still
+        // sees states via the next train step).
+        s->disc_train_fn(s, h, N, TT, stream);
+    }
+    smerl_add_embed<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        h.data, s->embed.data, s->mode_ids, n, TT, s->hidden, s->num_modes);
+}
+
+static inline void smerl_condition_backward(SmerlCond* s, PrecisionTensor grad_h,
+        int TT, cudaStream_t stream) {
+    if (s == nullptr || s->mode_ids == nullptr) return;
+    int n = (int)numel(grad_h.shape);
+    smerl_embed_backward<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
+        grad_h.data, s->embed_grad.data, s->mode_ids, n, TT, s->hidden, s->num_modes);
+}
+
 struct Policy {
     Encoder encoder;
     Decoder decoder;
     Network network;
     int input_dim, hidden_dim, output_dim;
     int num_atns;
+    SmerlCond* smerl;  // NULL = no mode conditioning (default; always for banks)
 };
 
 struct PolicyActivations {
@@ -783,6 +879,7 @@ static void policy_activations_free(Policy* p, PolicyActivations& a) {
 PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& activations,
         PrecisionTensor obs, PrecisionTensor state, cudaStream_t stream) {
     PrecisionTensor enc_out = p->encoder.forward(w.encoder, activations.encoder, obs, stream);
+    smerl_condition(p->smerl, enc_out, 1, stream);
     PrecisionTensor h = p->network.forward(w.network, enc_out, state, activations.network, stream);
     return p->decoder.forward(w.decoder, activations.decoder, h, stream);
 }
@@ -791,6 +888,7 @@ PrecisionTensor policy_forward_train(Policy* p, PolicyWeights& w, PolicyActivati
         PrecisionTensor x, PrecisionTensor state, cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *puf_squeeze(&x, 0), stream);
+    smerl_condition(p->smerl, h, TT, stream);
     h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, activations.network, stream);
     PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     return *puf_unsqueeze(&dec_out, 0, B, TT);
@@ -802,6 +900,9 @@ void policy_backward(Policy* p, PolicyWeights& w, PolicyActivations& activations
     PrecisionTensor grad_h = p->decoder.backward(w.decoder, activations.decoder,
         *puf_squeeze(&grad_logits, 0), grad_logstd, *puf_squeeze(&grad_value, 0), stream);
     grad_h = p->network.backward(w.network, *puf_unsqueeze(&grad_h, 0, B, TT), activations.network, stream);
+    // grad wrt (enc_out + embed[z]) — same tensor feeds both the encoder and the
+    // embedding, so this must run off the pre-encoder-backward grad.
+    smerl_condition_backward(p->smerl, grad_h, TT, stream);
     p->encoder.backward(w.encoder, activations.encoder, grad_h, stream);
 }
 

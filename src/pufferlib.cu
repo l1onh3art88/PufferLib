@@ -7,6 +7,7 @@
 
 #include <time.h>
 #include "models.cu"
+#include "smerl.cu"
 #include "ocean.cu"
 #include "muon.cu"
 #include "vecenv.h"
@@ -316,6 +317,8 @@ typedef struct {
     // Threading
     int num_threads;
     int seed;
+    // SMERL mode diversity (default-off; see smerl.cu)
+    SmerlConfig smerl;
 } HypersT;
 
 // A frozen weight bank: same shape as the primary, but its own params buffer
@@ -388,6 +391,9 @@ typedef struct {
     // worker thread only writes inside its own physical chunk.
     // Bank 0 = primary (learner). NULL = no layout set (primary owns full chunk).
     int* bank_layout;
+    // SMERL mode diversity. NULL unless smerl.enabled. Owns its own param
+    // allocator so checkpoint.bin stays byte-compatible with non-SMERL runs.
+    SmerlState* smerl;
 } PuffeRL;
 
 Dict* log_environments_impl(PuffeRL& pufferl) {
@@ -722,7 +728,22 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
             mask_stride_b = mask_stride;
         }
 
+        // Mode ids are indexed by global physical row, and this slice is
+        // contiguous in that space, so a pointer offset suffices. Only bank 0
+        // is conditioned — frozen banks have policy.smerl == NULL. Set before
+        // the forward so cudagraph capture bakes the right pointer per (buf, t).
+        // bonus_rewards points at the already-copied env rewards for this slice
+        // so diversity shaping lands in the rollout buffer before GAE.
+        if (b == 0 && pufferl->smerl != NULL) {
+            pufferl->smerl->cond.mode_ids = pufferl->smerl->mode_ids.data + sub_start;
+            pufferl->smerl->cond.bonus_rewards = rew_dst.data + bank_off;
+            pufferl->smerl->cond.gates = pufferl->smerl->gates.data;
+            pufferl->smerl->cond.bonus_coef = pufferl->smerl->cfg.bonus_coef;
+        }
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
+        if (b == 0 && pufferl->smerl != NULL) {
+            pufferl->smerl->cond.bonus_rewards = nullptr;
+        }
 
         PrecisionTensor p_logstd = {};
         DecoderWeights* dw = (DecoderWeights*)w_bank->decoder;
@@ -1660,6 +1681,16 @@ void train_impl(PuffeRL& pufferl) {
                 sel_src, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
+        // Mode of minibatch row j is the mode of the agent row it was sampled
+        // from. Runs outside the captured region, like the select_copy above,
+        // so the graph only ever sees mb_mode's fixed pointer.
+        if (pufferl.smerl != NULL) {
+            int mb_segs = pufferl.prio_bufs.idx.shape[0];
+            smerl_gather_modes<<<grid_size(mb_segs), BLOCK_SIZE, 0, train_stream>>>(
+                pufferl.smerl->mb_mode.data, pufferl.smerl->mode_ids.data,
+                pufferl.prio_bufs.idx.data, mb_segs);
+            pufferl.smerl->cond.mode_ids = pufferl.smerl->mb_mode.data;
+        }
         profile_end(hypers.profile);
 
         cudaEventRecord(pufferl.profile.events[3]);  // end misc / start forward
@@ -1696,6 +1727,11 @@ void train_impl(PuffeRL& pufferl) {
                 grad_logits_puf, grad_logstd_puf, grad_values_puf, stream);
 
             muon_step(&pufferl.muon, pufferl.master_weights, pufferl.grad_puf, hypers.max_grad_norm, stream);
+            // SMERL params sit outside the flat weight buffer Muon owns, so they
+            // get their own Adam step. Zeroes its grads for the next minibatch.
+            if (pufferl.smerl != NULL) {
+                smerl_optim_step(pufferl.smerl, stream);
+            }
             if (USE_BF16) {
                 int n = numel(pufferl.param_puf.shape);
                 cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
@@ -1803,6 +1839,9 @@ static Policy build_policy(const char* env_name, int input_size, int hidden_size
         .encoder = encoder, .decoder = decoder, .network = network,
         .input_dim = input_size, .hidden_dim = hidden_size, .output_dim = decoder_output_size,
         .num_atns = act_n,
+        // Mode conditioning is opt-in and attached later, only to the primary
+        // policy. Frozen banks call build_policy too and must stay unconditioned.
+        .smerl = nullptr,
     };
 }
 
@@ -2151,6 +2190,19 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     cudaMemcpy(pufferl->ppo_bufs_puf.grad_loss.data, &one, sizeof(float), cudaMemcpyHostToDevice);
     muon_post_create(&pufferl->muon);
 
+    // SMERL. Must be created before cudagraph capture so the rollout and train
+    // graphs bake in its buffer pointers. Attaching cond to the primary policy
+    // only — build_policy leaves frozen banks at smerl == NULL.
+    pufferl->smerl = nullptr;
+    if (hypers.smerl.enabled) {
+        pufferl->smerl = new SmerlState();
+        int agents_per_buffer = total_agents / num_buffers;
+        smerl_create(pufferl->smerl, hypers.smerl, hidden_size,
+            total_agents, minibatch_segments, horizon, agents_per_buffer, seed);
+        smerl_bind_hooks(pufferl->smerl);
+        pufferl->policy.smerl = &pufferl->smerl->cond;
+    }
+
     // Set up frozen banks declared in vec_kwargs (num_frozen_banks +
     // frozen_bank_pct: each bank gets floor(agents_per_buffer * pct) agents).
     // Must happen BEFORE cudagraph capture so the graph bakes in their pointers
@@ -2282,9 +2334,19 @@ void close_impl(PuffeRL& pufferl) {
         cudaProfilerStop();
     }
 
-    cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
-        cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+    // Graphs are only allocated when cudagraphs >= 0 (and only instantiated
+    // after the warmup epochs). Destroying a null handle is not safe on all
+    // driver stacks, so gate on the pointers themselves.
+    if (pufferl.train_cudagraph != nullptr) {
+        cudaGraphExecDestroy(pufferl.train_cudagraph);
+        pufferl.train_cudagraph = nullptr;
+    }
+    if (pufferl.fused_rollout_cudagraphs != nullptr) {
+        for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+            if (pufferl.fused_rollout_cudagraphs[i] != nullptr) {
+                cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
+            }
+        }
     }
 
     policy_weights_free(&pufferl.policy, &pufferl.weights);
@@ -2300,6 +2362,13 @@ void close_impl(PuffeRL& pufferl) {
 
     if (USE_BF16) {
         cudaFree(pufferl.master_weights.data);
+    }
+
+    if (pufferl.smerl != NULL) {
+        smerl_destroy(pufferl.smerl);
+        delete pufferl.smerl;
+        pufferl.smerl = nullptr;
+        pufferl.policy.smerl = nullptr;
     }
 
     alloc_free(&pufferl.params_alloc);

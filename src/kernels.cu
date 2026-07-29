@@ -443,6 +443,9 @@ void alloc_register(Allocator* a, LongTensor* t) {
 void alloc_register(Allocator* a, IntTensor* t) {
     alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(int));
 }
+void alloc_register(Allocator* a, ByteTensor* t) {
+    alloc_register_impl(a, (void**)&t->data, t->shape, sizeof(unsigned char));
+}
 
 cudaError_t alloc_create(Allocator* alloc) {
     if (alloc->total_bytes == 0) return cudaSuccess;

@@ -56,6 +56,16 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     cudaMemset(pufferl.losses_puf.data, 0, numel(pufferl.losses_puf.shape) * sizeof(float));
     result["loss"] = losses_dict;
 
+    // SMERL disc metrics (no-op when disabled)
+    if (pufferl.smerl != nullptr) {
+        float disc_loss = 0.0f, disc_acc = 0.0f;
+        smerl_pop_disc_metrics(pufferl.smerl, &disc_loss, &disc_acc);
+        pybind11::dict smerl_dict;
+        smerl_dict["disc_loss"] = disc_loss;
+        smerl_dict["disc_acc"] = disc_acc;
+        result["smerl"] = smerl_dict;
+    }
+
     // Profile
     pybind11::dict perf_dict;
     float train_total = 0;
@@ -215,6 +225,64 @@ void load_weights(pybind11::object pufferl_obj, const std::string& path) {
         cast<<<grid_size(n), BLOCK_SIZE, 0, pufferl.default_stream>>>(
             pufferl.param_puf.data, pufferl.master_weights.data, n);
     }
+}
+
+static SmerlState& require_smerl(PuffeRL& pufferl) {
+    if (pufferl.smerl == nullptr) {
+        throw std::runtime_error("SMERL is not enabled (set smerl.enabled = 1)");
+    }
+    return *pufferl.smerl;
+}
+
+void py_set_smerl_modes(py::object pufferl_obj, py::array_t<int> modes) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    SmerlState& s = require_smerl(pufferl);
+    auto buf = modes.request();
+    if (buf.ndim != 1) throw std::runtime_error("smerl modes must be 1-D");
+    if ((int)buf.shape[0] != s.total_agents) {
+        throw std::runtime_error("smerl modes length must equal total_agents");
+    }
+    const int* host = (const int*)buf.ptr;
+    for (int i = 0; i < s.total_agents; i++) {
+        if (host[i] >= s.cfg.num_modes) {
+            throw std::runtime_error("smerl mode id >= num_modes");
+        }
+    }
+    smerl_set_modes(&s, host);
+}
+
+void py_set_smerl_gates(py::object pufferl_obj, py::array_t<int> gates) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    SmerlState& s = require_smerl(pufferl);
+    auto buf = gates.request();
+    if (buf.ndim != 1) throw std::runtime_error("smerl gates must be 1-D");
+    if ((int)buf.shape[0] != s.cfg.num_modes) {
+        throw std::runtime_error("smerl gates length must equal num_modes");
+    }
+    smerl_set_gates(&s, (const int*)buf.ptr);
+}
+
+void py_set_smerl_force_mode(py::object pufferl_obj, int mode) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    SmerlState& s = require_smerl(pufferl);
+    if (mode < 0 || mode >= s.cfg.num_modes) {
+        throw std::runtime_error("smerl force_mode out of range");
+    }
+    smerl_force_mode(&s, mode);
+}
+
+void py_save_smerl(py::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    smerl_save(&require_smerl(pufferl), path.c_str());
+}
+
+void py_load_smerl(py::object pufferl_obj, const std::string& path) {
+    PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
+    smerl_load(&require_smerl(pufferl), path.c_str());
+}
+
+bool py_smerl_enabled(py::object pufferl_obj) {
+    return pufferl_obj.cast<PuffeRL&>().smerl != nullptr;
 }
 
 int py_add_frozen_bank(py::object pufferl_obj, int slice_size,
@@ -442,6 +510,31 @@ std::unique_ptr<PuffeRL> create_pufferl(py::dict args) {
     // Seed
     hypers.seed = get_config(args, "seed");
 
+    // SMERL. Absent [smerl] section => disabled, so old configs keep working.
+    // Keys present in the section override defaults; missing keys keep defaults
+    // so partial [smerl] sections (or older configs) still load.
+    hypers.smerl = SmerlConfig{
+        .enabled = false, .num_modes = 8, .bonus_coef = 0.01f,
+        .disc_hidden = 64, .disc_lr = 1e-3f, .embed_lr = 1e-3f,
+        .beta1 = 0.9f, .beta2 = 0.999f, .eps = 1e-8f,
+    };
+    if (args.contains("smerl")) {
+        py::dict smerl_kwargs = args["smerl"].cast<py::dict>();
+        auto get_or = [&](const char* key, double def) -> double {
+            if (!smerl_kwargs.contains(key)) return def;
+            return get_config(smerl_kwargs, key);
+        };
+        hypers.smerl.enabled = (bool)get_or("enabled", 0.0);
+        hypers.smerl.num_modes = (int)get_or("num_modes", hypers.smerl.num_modes);
+        hypers.smerl.bonus_coef = (float)get_or("bonus_coef", hypers.smerl.bonus_coef);
+        hypers.smerl.disc_hidden = (int)get_or("disc_hidden", hypers.smerl.disc_hidden);
+        hypers.smerl.disc_lr = (float)get_or("disc_lr", hypers.smerl.disc_lr);
+        hypers.smerl.embed_lr = (float)get_or("embed_lr", hypers.smerl.embed_lr);
+        if (hypers.smerl.enabled && hypers.smerl.num_modes < 2) {
+            throw std::runtime_error("smerl.num_modes must be >= 2");
+        }
+    }
+
     int device_count = 0;
     int err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess) {
@@ -521,6 +614,12 @@ PYBIND11_MODULE(_C, m) {
     m.def("close", &puf_close);
     m.def("save_weights", &save_weights);
     m.def("load_weights", &load_weights);
+    m.def("set_smerl_modes", &py_set_smerl_modes);
+    m.def("set_smerl_gates", &py_set_smerl_gates);
+    m.def("set_smerl_force_mode", &py_set_smerl_force_mode);
+    m.def("save_smerl", &py_save_smerl);
+    m.def("load_smerl", &py_load_smerl);
+    m.def("smerl_enabled", &py_smerl_enabled);
     m.def("add_frozen_bank", &py_add_frozen_bank);
     m.def("load_frozen_bank", &py_load_frozen_bank);
     m.def("set_agent_perm", &py_set_agent_perm);

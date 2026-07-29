@@ -26,6 +26,7 @@ except ImportError:
     raise ImportError('Failed to import PufferLib C++ backend. If you have non-default PyTorch, try installing with --no-build-isolation')
 
 from pufferlib import selfplay
+from pufferlib import smerl
 from pufferlib import league
 
 import rich
@@ -267,6 +268,19 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             result_queue.put((args['gpu_id'], [], [], []))
         return
 
+    # SMERL mode diversity (no-op unless smerl.enabled). Requires selfplay.
+    smerl_state = None
+    try:
+        smerl_state = smerl.setup(
+            pufferl, backend, args, run_id,
+            artifact_owner=artifact_owner, pool_state=pool_state)
+    except RuntimeError as e:
+        print(f'WARNING: {e}, skipping')
+        backend.close(pufferl)
+        if artifact_owner and result_queue is not None:
+            result_queue.put((args['gpu_id'], [], [], []))
+        return
+
     model_path = ''
     flat_logs = {}
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
@@ -274,6 +288,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     for epoch in range(train_epochs + eval_epochs):
         if epoch < train_epochs:
             selfplay.sync(pufferl, backend, pool_state)
+            # Re-assert training modes in case a heldout force_mode path ever
+            # touched the train instance.
+            smerl.assign_modes(pufferl, backend, smerl_state)
         backend.rollouts(pufferl)
 
         if epoch < train_epochs:
@@ -288,6 +305,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if should_save and artifact_owner:
             model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, model_path)
+            smerl.save_sidecar(pufferl, backend, model_path)
 
         if (time.time() < pufferl.last_log_time + 0.6
                 and epoch < train_epochs - 1):
@@ -297,6 +315,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
         if epoch < train_epochs:
             selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
+            smerl.step(pufferl, backend, args, smerl_state, flat_logs)
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
@@ -324,6 +343,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if league_mode and artifact_owner and not model_path:
         model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, model_path)
+        smerl.save_sidecar(pufferl, backend, model_path)
 
     if league_mode and artifact_owner:
         league.finish_trial(args, run_id, model_path, all_logs, flat_logs, result_queue)
@@ -508,8 +528,12 @@ def sweep(env_name, args=None, pareto=False):
 
 
 def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_games=0,
-        bot_policy=1, max_ticks=0, args=None, verbose=True):
-    '''Evaluate a trained policy against the env's scripted bot.'''
+        bot_policy=1, max_ticks=0, args=None, verbose=True, eval_output=None):
+    '''Evaluate a trained policy against the env's scripted bot.
+
+    bot_policy < 0 keeps whatever args['env']['bot_policy'] already holds.
+    eval_output writes the final logs to a JSON file — the machine-readable
+    contract for callers that shell out to `puffer eval_bot`.'''
     args = args or load_config(env_name)
     args['reset_state'] = False
     args['train']['horizon'] = 1
@@ -549,6 +573,17 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
     if max_ticks > 0:
         args['env']['max_ticks'] = max_ticks
 
+    # SMERL heldout: keep mode conditioning if the caller enabled it (and
+    # optionally force_mode). Otherwise force disabled so plain eval stays
+    # checkpoint-compatible.
+    force_mode = None
+    smerl_cfg = args.get('smerl') or {}
+    if smerl_cfg.get('force_mode') is not None:
+        force_mode = int(smerl_cfg['force_mode'])
+        args.setdefault('smerl', {})['enabled'] = 1
+    elif not smerl_cfg.get('enabled', 0):
+        args.setdefault('smerl', {})['enabled'] = 0
+
     backend = _resolve_backend(args)
     if backend is not _C:
         raise RuntimeError('eval_bot() requires the native CUDA backend')
@@ -566,7 +601,14 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
 
     if load_path is not None:
         backend.load_weights(pufferl, load_path)
-        print(f'Loaded weights from {load_path}')
+        smerl.load_sidecar(pufferl, backend, load_path)
+        if verbose:
+            print(f'Loaded weights from {load_path}')
+
+    if force_mode is not None:
+        if not backend.smerl_enabled(pufferl):
+            raise RuntimeError('smerl.force_mode set but SMERL is not enabled')
+        backend.set_smerl_force_mode(pufferl, force_mode)
 
     def _delta_logs(current, baseline):
         if not baseline:
@@ -600,18 +642,38 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
         scored_logs = _delta_logs(logs, baseline_logs)
         scored_n = int(scored_logs.get('env/n', n))
         if verbose:
+            winrate = scored_logs.get('env/slot_0_score', 0.0)
             perf = scored_logs.get('env/perf', 0.0)
             score = scored_logs.get('env/score', 0.0)
             if burnin_games and not baseline_logs:
                 print(f'\rbot_eval_burnin={n}/{burnin_games}', end='')
             else:
-                print(f'\rbot_eval={scored_n}/{num_games}  perf={perf:.4f}  score={score:.3f}', end='')
+                print(f'\rbot_eval={scored_n}/{num_games}  winrate={winrate:.4f}'
+                      f'  perf={perf:.4f}  score={score:.3f}', end='')
         if (n - baseline_n) >= num_games and (not burnin_games or baseline_logs):
             logs = scored_logs
             break
 
     if verbose:
         print()
+
+    if eval_output:
+        out_dir = os.path.dirname(os.path.abspath(eval_output))
+        os.makedirs(out_dir, exist_ok=True)
+        def _jsonable(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return value
+        with open(eval_output, 'w') as f:
+            json.dump({
+                'env_name': env_name,
+                'load_path': load_path,
+                'bot_policy': args['env'].get('bot_policy'),
+                'num_games': num_games,
+                'logs': {k: _jsonable(v) for k, v in logs.items()},
+            }, f, indent=2)
+            f.write('\n')
 
     if not args.get('skip_match_close', False):
         backend.close(pufferl)
@@ -748,7 +810,9 @@ def load_config(env_name):
     parser.add_argument('--load-enemy-model-path', type=str, default=None,
         help='Path to opponent checkpoint for `puffer match` (slot 1 / black in chess)')
     parser.add_argument('--num-games', type=int, default=4096,
-        help='Number of games to play in `puffer match`')
+        help='Number of games to play in `puffer match` / `puffer eval_bot`')
+    parser.add_argument('--eval-output', type=str, default=None,
+        help='Write `puffer eval_bot` results to this JSON path')
     parser.add_argument('--enemy-hidden-size', type=int, default=None,
         help='hidden_size of the enemy checkpoint (defaults to primary)')
     parser.add_argument('--enemy-num-layers', type=int, default=None,
@@ -829,7 +893,14 @@ def main():
     if 'train' in mode:
         train(env_name=env_name, args=args)
     elif 'eval_bot' in mode:
-        eval_bot(env_name=env_name, args=args)
+        # Pass CLI args through instead of falling back to the signature
+        # defaults. bot_policy=-1 defers to args['env']['bot_policy'], so
+        # --env.bot-policy actually takes effect.
+        eval_bot(env_name=env_name, args=args,
+            policy_path=args.get('load_model_path'),
+            num_games=args.get('num_games', 4096),
+            bot_policy=args.get('env', {}).get('bot_policy', -1),
+            eval_output=args.get('eval_output'))
     elif 'eval' in mode:
         eval(env_name=env_name, args=args)
     elif 'sweep' in mode:

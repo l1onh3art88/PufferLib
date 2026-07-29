@@ -1,0 +1,463 @@
+// SMERL-like mode diversity. One policy, K persistent behavior modes.
+//
+// A mode z is a property of a *rollout row*, fixed for the run — not resampled
+// per episode. That choice is load-bearing: prio_replay samples whole segments
+// (one row's full horizon), so the train-time mode of minibatch row j is just
+// mode_ids[idx[j]]. Per-episode z would instead need a per-timestep mode channel
+// threaded through the rollout buffer, the transpose, and select_copy.
+//
+// Everything here lives outside the primary weight buffer. save_weights dumps a
+// flat fp32 blob and load_weights size-checks it exactly, so folding mode
+// embeddings into params_alloc would invalidate every existing checkpoint and
+// every frozen-bank / opponent-pool load. SMERL params get their own allocator
+// and a `.smerl` sidecar next to the checkpoint.
+//
+// Discriminator: linear map from pre-mode encoder features h -> K logits.
+// Trained with stop-grad CE (no backprop into the encoder). Diversity bonus is
+// applied to rollout rewards (gated per mode) using the same disc.
+
+#ifndef PUFFERLIB_SMERL_CU
+#define PUFFERLIB_SMERL_CU
+
+#include "models.cu"
+
+#define SMERL_MAGIC   0x4C524D53u  // 'SMRL'
+#define SMERL_VERSION 1
+
+struct SmerlConfig {
+    bool enabled;
+    int num_modes;
+    float bonus_coef;
+    int disc_hidden;   // reserved / sidecar versioning; v1 disc is linear h->K
+    float disc_lr;
+    float embed_lr;
+    float beta1, beta2, eps;
+};
+
+struct SmerlState {
+    SmerlConfig cfg;
+    SmerlCond cond;
+    Allocator params;       // optimizable params — dumped verbatim to the sidecar
+    Allocator opt;          // grads, Adam moments, step counter, mode/gate buffers, scratch
+    IntTensor mode_ids;     // [total_agents] per-row z; -1 = unconditioned
+    IntTensor mb_mode;      // [minibatch_segments] gathered per minibatch
+    IntTensor gates;        // [num_modes] 1 = mode earns the diversity bonus
+    FloatTensor adam_m, adam_v, adam_t;
+    int total_agents;
+    int minibatch_segments;
+    int embed_n;            // num_modes * hidden
+    int disc_n;             // num_modes * hidden + num_modes
+};
+
+// Sidecar header. Arch fields are checked on load so a mismatched sidecar fails
+// loudly instead of silently reinterpreting bytes.
+struct SmerlHeader {
+    uint32_t magic;
+    uint32_t version;
+    int32_t num_modes;
+    int32_t hidden;
+    int32_t disc_hidden;
+    int32_t reserved;
+    int64_t param_bytes;
+};
+
+__global__ void smerl_adam_kernel(float* __restrict__ w, float* __restrict__ g,
+        float* __restrict__ m, float* __restrict__ v, const float* __restrict__ t_ptr,
+        float lr, float b1, float b2, float eps, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float t = *t_ptr;
+    float grad = g[idx];
+    float mi = b1 * m[idx] + (1.0f - b1) * grad;
+    float vi = b2 * v[idx] + (1.0f - b2) * grad * grad;
+    m[idx] = mi;
+    v[idx] = vi;
+    // Bias correction reads t from device memory so this stays cudagraph-safe.
+    float mhat = mi / (1.0f - powf(b1, t));
+    float vhat = vi / (1.0f - powf(b2, t));
+    w[idx] -= lr * mhat / (sqrtf(vhat) + eps);
+}
+
+__global__ void smerl_tick_kernel(float* t_ptr) { *t_ptr += 1.0f; }
+
+// Gather this minibatch's per-row modes. idx[j] is a segment == an agent row,
+// which is exactly what mode_ids is indexed by.
+__global__ void smerl_gather_modes(int* __restrict__ out, const int* __restrict__ mode_ids,
+        const int* __restrict__ idx, int n) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) out[j] = mode_ids[idx[j]];
+}
+
+// logits[i,k] = sum_j h[i,j] * W[k,j] + b[k]
+__global__ void smerl_disc_forward(float* __restrict__ logits,
+        const precision_t* __restrict__ h, const float* __restrict__ W,
+        const float* __restrict__ b, int N, int H, int K) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int NK = N * K;
+    if (idx >= NK) return;
+    int i = idx / K;
+    int k = idx % K;
+    const precision_t* hi = h + (long)i * H;
+    const float* Wk = W + (long)k * H;
+    float acc = b[k];
+    for (int j = 0; j < H; j++) acc += to_float(hi[j]) * Wk[j];
+    logits[idx] = acc;
+}
+
+// Stop-grad CE: dW, db only. Also accumulates loss / accuracy counters.
+// mode_ids is length B = N/TT (one z per agent row); feature row i maps to
+// mode_ids[i / TT].
+__global__ void smerl_disc_ce_bwd(float* __restrict__ dW, float* __restrict__ db,
+        const precision_t* __restrict__ h, const float* __restrict__ logits,
+        const int* __restrict__ modes, float* __restrict__ loss_acc,
+        float* __restrict__ acc_acc, float* __restrict__ n_acc,
+        int N, int TT, int H, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    int z = modes[i / TT];
+    if (z < 0 || z >= K) return;
+
+    const float* li = logits + (long)i * K;
+    float max_l = li[0];
+    for (int k = 1; k < K; k++) max_l = fmaxf(max_l, li[k]);
+    float sum = 0.0f;
+    for (int k = 0; k < K; k++) sum += expf(li[k] - max_l);
+    float inv = 1.0f / fmaxf(sum, 1e-20f);
+    float log_qz = (li[z] - max_l) - logf(fmaxf(sum, 1e-20f));
+
+    atomicAdd(loss_acc, -log_qz);
+    // argmax accuracy
+    int pred = 0;
+    float best = li[0];
+    for (int k = 1; k < K; k++) {
+        if (li[k] > best) { best = li[k]; pred = k; }
+    }
+    if (pred == z) atomicAdd(acc_acc, 1.0f);
+    atomicAdd(n_acc, 1.0f);
+
+    const precision_t* hi = h + (long)i * H;
+    for (int k = 0; k < K; k++) {
+        float p = expf(li[k] - max_l) * inv;
+        float g = p - ((k == z) ? 1.0f : 0.0f);
+        atomicAdd(&db[k], g);
+        float* dWk = dW + (long)k * H;
+        for (int j = 0; j < H; j++) {
+            atomicAdd(&dWk[j], g * to_float(hi[j]));
+        }
+    }
+}
+
+// Add gate[z] * bonus_coef * (log q(z|s) + log K) into rewards[i].
+// Rows with invalid mode or closed gate are left unchanged.
+__global__ void smerl_disc_bonus(precision_t* __restrict__ rewards,
+        const precision_t* __restrict__ h, const float* __restrict__ W,
+        const float* __restrict__ b, const int* __restrict__ modes,
+        const int* __restrict__ gates, float bonus_coef,
+        float log_k, int N, int H, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    int z = modes[i];
+    if (z < 0 || z >= K) return;
+    if (!gates[z]) return;
+    if (bonus_coef == 0.0f) return;
+
+    const precision_t* hi = h + (long)i * H;
+    // compute logits on the fly (N is buffer-sized; cheap vs allocating extra)
+    float max_l = -1.0e30f;
+    // K is small (typically 8); stack buffer is fine
+    float li_stack[32];
+    int KK = K < 32 ? K : 32;
+    for (int k = 0; k < KK; k++) {
+        const float* Wk = W + (long)k * H;
+        float acc = b[k];
+        for (int j = 0; j < H; j++) acc += to_float(hi[j]) * Wk[j];
+        li_stack[k] = acc;
+        max_l = fmaxf(max_l, acc);
+    }
+    float sum = 0.0f;
+    for (int k = 0; k < KK; k++) sum += expf(li_stack[k] - max_l);
+    float log_qz = (li_stack[z] - max_l) - logf(fmaxf(sum, 1e-20f));
+    float r = to_float(rewards[i]) + bonus_coef * (log_qz + log_k);
+    // Match train_impl's hard clamp so GAE never sees out-of-range shaped rewards.
+    r = fminf(1.0f, fmaxf(-1.0f, r));
+    rewards[i] = from_float(r);
+}
+
+static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
+        int total_agents, int minibatch_segments, int horizon, int agents_per_buffer,
+        ulong seed) {
+    s->cfg = cfg;
+    s->total_agents = total_agents;
+    s->minibatch_segments = minibatch_segments;
+    int K = cfg.num_modes;
+    s->embed_n = K * hidden;
+    s->disc_n = K * hidden + K;
+
+    s->cond.num_modes = K;
+    s->cond.hidden = hidden;
+    s->cond.mode_ids = nullptr;
+    s->cond.bonus_rewards = nullptr;
+    s->cond.gates = nullptr;
+    s->cond.bonus_coef = cfg.bonus_coef;
+    s->cond.max_rows = agents_per_buffer > minibatch_segments * horizon
+        ? agents_per_buffer : minibatch_segments * horizon;
+    s->cond.disc_train_fn = nullptr;
+    s->cond.apply_bonus_fn = nullptr;
+
+    s->cond.embed = {.shape = {K, hidden}};
+    s->cond.disc_w = {.shape = {K, hidden}};
+    s->cond.disc_b = {.shape = {K}};
+    alloc_register(&s->params, &s->cond.embed);
+    alloc_register(&s->params, &s->cond.disc_w);
+    alloc_register(&s->params, &s->cond.disc_b);
+
+    s->cond.embed_grad = {.shape = {K, hidden}};
+    s->cond.disc_w_grad = {.shape = {K, hidden}};
+    s->cond.disc_b_grad = {.shape = {K}};
+    s->adam_m = {.shape = {s->embed_n + s->disc_n}};
+    s->adam_v = {.shape = {s->embed_n + s->disc_n}};
+    s->adam_t = {.shape = {1}};
+    s->mode_ids = {.shape = {total_agents}};
+    s->mb_mode = {.shape = {minibatch_segments}};
+    s->gates = {.shape = {K}};
+    s->cond.disc_logits = {.shape = {s->cond.max_rows, K}};
+    s->cond.disc_loss_acc = {.shape = {1}};
+    s->cond.disc_acc_acc = {.shape = {1}};
+    s->cond.disc_n_acc = {.shape = {1}};
+
+    alloc_register(&s->opt, &s->cond.embed_grad);
+    alloc_register(&s->opt, &s->cond.disc_w_grad);
+    alloc_register(&s->opt, &s->cond.disc_b_grad);
+    alloc_register(&s->opt, &s->adam_m);
+    alloc_register(&s->opt, &s->adam_v);
+    alloc_register(&s->opt, &s->adam_t);
+    alloc_register(&s->opt, &s->mode_ids);
+    alloc_register(&s->opt, &s->mb_mode);
+    alloc_register(&s->opt, &s->gates);
+    alloc_register(&s->opt, &s->cond.disc_logits);
+    alloc_register(&s->opt, &s->cond.disc_loss_acc);
+    alloc_register(&s->opt, &s->cond.disc_acc_acc);
+    alloc_register(&s->opt, &s->cond.disc_n_acc);
+
+    alloc_create(&s->params);
+    alloc_create(&s->opt);
+
+    // Small random init. Large enough that modes start distinguishable, small
+    // enough not to swamp the encoder output on step 0.
+    long n_params = s->params.total_bytes / sizeof(float);
+    // curandGenerateNormal wants even counts
+    long n_gen = (n_params % 2 == 0) ? n_params : n_params + 1;
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, seed);
+    // Temporary even buffer if needed
+    if (n_gen != n_params) {
+        float* tmp;
+        cudaMalloc(&tmp, n_gen * sizeof(float));
+        curandGenerateNormal(gen, tmp, n_gen, 0.0f, 0.02f);
+        cudaMemcpy(s->params.mem, tmp, n_params * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaFree(tmp);
+    } else {
+        curandGenerateNormal(gen, (float*)s->params.mem, n_gen, 0.0f, 0.02f);
+    }
+    curandDestroyGenerator(gen);
+    // Bias starts at 0 so modes are equiprobable under a cold disc.
+    cudaMemset(s->cond.disc_b.data, 0, K * sizeof(float));
+
+    // Default to unconditioned everywhere; Python assigns real modes at setup.
+    // Until then an enabled-but-unassigned run behaves exactly like a plain one.
+    cudaMemset(s->mode_ids.data, 0xFF, total_agents * sizeof(int));  // = -1
+    cudaMemset(s->mb_mode.data, 0xFF, minibatch_segments * sizeof(int));
+    cudaMemset(s->gates.data, 0, K * sizeof(int));
+    s->cond.gates = s->gates.data;
+    // disc_train_fn / apply_bonus_fn bound after their definitions below.
+    cudaDeviceSynchronize();
+}
+
+static void smerl_destroy(SmerlState* s) {
+    alloc_free(&s->params);
+    alloc_free(&s->opt);
+}
+
+// One Adam step on SMERL params, then zero the grads for the next accumulation.
+// Called inside the captured train region — all pointers fixed, step counter on
+// device, so it graphs cleanly. Embed and disc use independent learning rates
+// but share one Adam step counter (same t for bias correction is fine).
+static void smerl_optim_step(SmerlState* s, cudaStream_t stream) {
+    smerl_tick_kernel<<<1, 1, 0, stream>>>(s->adam_t.data);
+
+    // Layout in adam_m/v matches params layout: [embed | disc_w | disc_b].
+    // grads live in separate tensors; pack into contiguous optim regions via
+    // direct kernels on each slice.
+    int K = s->cfg.num_modes;
+    int H = s->cond.hidden;
+    int embed_n = s->embed_n;
+    int disc_w_n = K * H;
+    int disc_b_n = K;
+
+    smerl_adam_kernel<<<grid_size(embed_n), BLOCK_SIZE, 0, stream>>>(
+        s->cond.embed.data, s->cond.embed_grad.data,
+        s->adam_m.data, s->adam_v.data, s->adam_t.data,
+        s->cfg.embed_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, embed_n);
+
+    smerl_adam_kernel<<<grid_size(disc_w_n), BLOCK_SIZE, 0, stream>>>(
+        s->cond.disc_w.data, s->cond.disc_w_grad.data,
+        s->adam_m.data + embed_n, s->adam_v.data + embed_n, s->adam_t.data,
+        s->cfg.disc_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, disc_w_n);
+
+    smerl_adam_kernel<<<grid_size(disc_b_n), BLOCK_SIZE, 0, stream>>>(
+        s->cond.disc_b.data, s->cond.disc_b_grad.data,
+        s->adam_m.data + embed_n + disc_w_n, s->adam_v.data + embed_n + disc_w_n,
+        s->adam_t.data,
+        s->cfg.disc_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, disc_b_n);
+
+    cudaMemsetAsync(s->cond.embed_grad.data, 0, embed_n * sizeof(float), stream);
+    cudaMemsetAsync(s->cond.disc_w_grad.data, 0, disc_w_n * sizeof(float), stream);
+    cudaMemsetAsync(s->cond.disc_b_grad.data, 0, disc_b_n * sizeof(float), stream);
+}
+
+static void smerl_set_modes(SmerlState* s, const int* host_modes) {
+    cudaMemcpy(s->mode_ids.data, host_modes,
+        s->total_agents * sizeof(int), cudaMemcpyHostToDevice);
+}
+
+static void smerl_set_gates(SmerlState* s, const int* host_gates) {
+    cudaMemcpy(s->gates.data, host_gates, s->cfg.num_modes * sizeof(int),
+        cudaMemcpyHostToDevice);
+}
+
+// Force every row to one mode. Used by heldout eval to score a single mode.
+static void smerl_force_mode(SmerlState* s, int mode) {
+    int* host = (int*)malloc(s->total_agents * sizeof(int));
+    for (int i = 0; i < s->total_agents; i++) host[i] = mode;
+    smerl_set_modes(s, host);
+    free(host);
+    // The train-side gather is bypassed during eval, so pin mb_mode too.
+    int* mb = (int*)malloc(s->minibatch_segments * sizeof(int));
+    for (int i = 0; i < s->minibatch_segments; i++) mb[i] = mode;
+    cudaMemcpy(s->mb_mode.data, mb, s->minibatch_segments * sizeof(int),
+        cudaMemcpyHostToDevice);
+    free(mb);
+}
+
+// Disc CE train step on a pre-mode feature batch h shaped (N, H) flat, with
+// mode_ids length N/TT. Stop-grad into h.
+static void smerl_disc_train(SmerlCond* c, PrecisionTensor h, int N, int TT,
+        cudaStream_t stream) {
+    if (c == nullptr || c->mode_ids == nullptr || N <= 0) return;
+    if (N > c->max_rows) {
+        // Should never fire: max_rows sized to cover rollout bank + train mb.
+        return;
+    }
+    if (TT < 1) TT = 1;
+    int H = c->hidden;
+    int K = c->num_modes;
+    smerl_disc_forward<<<grid_size(N * K), BLOCK_SIZE, 0, stream>>>(
+        c->disc_logits.data, h.data, c->disc_w.data, c->disc_b.data, N, H, K);
+    smerl_disc_ce_bwd<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        c->disc_w_grad.data, c->disc_b_grad.data, h.data, c->disc_logits.data,
+        c->mode_ids, c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data,
+        N, TT, H, K);
+}
+
+// Diversity bonus into rewards for this forward's rows (rollout path).
+static void smerl_apply_bonus(SmerlCond* c, PrecisionTensor h, int N, cudaStream_t stream) {
+    if (c == nullptr || c->bonus_rewards == nullptr || c->mode_ids == nullptr) return;
+    if (c->bonus_coef == 0.0f || N <= 0) return;
+    int H = c->hidden;
+    int K = c->num_modes;
+    float log_k = logf((float)K);
+    smerl_disc_bonus<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        c->bonus_rewards, h.data, c->disc_w.data, c->disc_b.data,
+        c->mode_ids, c->gates, c->bonus_coef, log_k, N, H, K);
+}
+
+// Wire function pointers after definitions (models.cu cannot name these).
+static void smerl_bind_hooks(SmerlState* s) {
+    s->cond.disc_train_fn = smerl_disc_train;
+    s->cond.apply_bonus_fn = smerl_apply_bonus;
+}
+
+static void smerl_save(SmerlState* s, const char* path) {
+    SmerlHeader h = {
+        .magic = SMERL_MAGIC,
+        .version = SMERL_VERSION,
+        .num_modes = s->cfg.num_modes,
+        .hidden = s->cond.hidden,
+        .disc_hidden = s->cfg.disc_hidden,
+        .reserved = 0,
+        .param_bytes = s->params.total_bytes,
+    };
+    std::vector<char> buf(s->params.total_bytes);
+    cudaMemcpy(buf.data(), s->params.mem, s->params.total_bytes, cudaMemcpyDeviceToHost);
+    std::vector<int> gates(s->cfg.num_modes);
+    cudaMemcpy(gates.data(), s->gates.data, s->cfg.num_modes * sizeof(int),
+        cudaMemcpyDeviceToHost);
+    // Persist as uint8 for a compact stable sidecar layout.
+    std::vector<unsigned char> gates_u8(s->cfg.num_modes);
+    for (int i = 0; i < s->cfg.num_modes; i++) gates_u8[i] = gates[i] ? 1 : 0;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) throw std::runtime_error(std::string("Failed to open ") + path + " for writing");
+    fwrite(&h, sizeof(h), 1, f);
+    fwrite(buf.data(), 1, buf.size(), f);
+    fwrite(gates_u8.data(), 1, gates_u8.size(), f);
+    fclose(f);
+}
+
+static void smerl_load(SmerlState* s, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) throw std::runtime_error(std::string("Failed to open ") + path + " for reading");
+    SmerlHeader h;
+    if (fread(&h, sizeof(h), 1, f) != 1) {
+        fclose(f);
+        throw std::runtime_error(std::string("Truncated smerl sidecar: ") + path);
+    }
+    auto fail = [&](const std::string& msg) {
+        fclose(f);
+        throw std::runtime_error("smerl sidecar " + std::string(path) + ": " + msg);
+    };
+    if (h.magic != SMERL_MAGIC) fail("bad magic");
+    if (h.version != SMERL_VERSION) fail("version " + std::to_string(h.version) +
+        ", expected " + std::to_string(SMERL_VERSION));
+    if (h.num_modes != s->cfg.num_modes) fail("num_modes " + std::to_string(h.num_modes) +
+        ", expected " + std::to_string(s->cfg.num_modes));
+    if (h.hidden != s->cond.hidden) fail("hidden " + std::to_string(h.hidden) +
+        ", expected " + std::to_string(s->cond.hidden));
+    if (h.disc_hidden != s->cfg.disc_hidden) fail("disc_hidden " + std::to_string(h.disc_hidden) +
+        ", expected " + std::to_string(s->cfg.disc_hidden));
+    if (h.param_bytes != s->params.total_bytes) fail("param_bytes " +
+        std::to_string(h.param_bytes) + ", expected " + std::to_string(s->params.total_bytes));
+
+    std::vector<char> buf(h.param_bytes);
+    if ((int64_t)fread(buf.data(), 1, buf.size(), f) != h.param_bytes) fail("truncated params");
+    std::vector<unsigned char> gates_u8(s->cfg.num_modes);
+    if ((int)fread(gates_u8.data(), 1, gates_u8.size(), f) != s->cfg.num_modes) fail("truncated gates");
+    fclose(f);
+
+    std::vector<int> gates(s->cfg.num_modes);
+    for (int i = 0; i < s->cfg.num_modes; i++) gates[i] = gates_u8[i] ? 1 : 0;
+    cudaMemcpy(s->params.mem, buf.data(), buf.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(s->gates.data, gates.data(), gates.size() * sizeof(int),
+        cudaMemcpyHostToDevice);
+}
+
+// Pull disc metrics to host and zero the accumulators.
+static void smerl_pop_disc_metrics(SmerlState* s, float* loss_out, float* acc_out) {
+    float loss = 0, acc = 0, n = 0;
+    cudaMemcpy(&loss, s->cond.disc_loss_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&acc, s->cond.disc_acc_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&n, s->cond.disc_n_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
+    if (n > 0) {
+        *loss_out = loss / n;
+        *acc_out = acc / n;
+    } else {
+        *loss_out = 0.0f;
+        *acc_out = 0.0f;
+    }
+    cudaMemset(s->cond.disc_loss_acc.data, 0, sizeof(float));
+    cudaMemset(s->cond.disc_acc_acc.data, 0, sizeof(float));
+    cudaMemset(s->cond.disc_n_acc.data, 0, sizeof(float));
+}
+
+#endif  // PUFFERLIB_SMERL_CU
