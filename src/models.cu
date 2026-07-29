@@ -783,6 +783,8 @@ struct SmerlCond {
     FloatTensor disc_w_grad;
     FloatTensor disc_b_grad;
     FloatTensor disc_logits; // [max_rows, num_modes] scratch
+    FloatTensor disc_g;      // [max_rows, num_modes] CE grad (softmax - onehot)
+    FloatTensor h_fp32;      // [max_rows, hidden] cast buffer for float GEMMs
     FloatTensor disc_loss_acc;
     FloatTensor disc_acc_acc;
     FloatTensor disc_n_acc;
@@ -792,6 +794,8 @@ struct SmerlCond {
     precision_t* bonus_rewards;
     const int* gates;  // device [num_modes], 0/1
     float bonus_coef;
+    // Host-side flag updated by set_smerl_gates. Skip bonus launches when 0.
+    int any_gate_on;
 
     // Filled by smerl_create. Avoid calling into smerl.cu by name from here.
     // N = number of feature rows (B in rollout, B*TT in train); TT disambiguates

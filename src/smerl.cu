@@ -88,35 +88,47 @@ __global__ void smerl_gather_modes(int* __restrict__ out, const int* __restrict_
     if (j < n) out[j] = mode_ids[idx[j]];
 }
 
-// logits[i,k] = sum_j h[i,j] * W[k,j] + b[k]
-__global__ void smerl_disc_forward(float* __restrict__ logits,
-        const precision_t* __restrict__ h, const float* __restrict__ W,
-        const float* __restrict__ b, int N, int H, int K) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int NK = N * K;
-    if (idx >= NK) return;
-    int i = idx / K;
-    int k = idx % K;
-    const precision_t* hi = h + (long)i * H;
-    const float* Wk = W + (long)k * H;
-    float acc = b[k];
-    for (int j = 0; j < H; j++) acc += to_float(hi[j]) * Wk[j];
-    logits[idx] = acc;
+// Float GEMM matching puf_mm's layout convention (row-major logical, cublasEx).
+// out[M, N] = op(A)[M, K] @ op(B)[K, N] with the same op wiring as cublasGemmExDense.
+static inline void smerl_f32_gemm(
+        cublasOperation_t op_a, cublasOperation_t op_b,
+        int M, int N, int K, const float* A, const float* B, float* C,
+        cudaStream_t stream, float alpha = 1.0f, float beta = 0.0f) {
+    int lda = (op_a == CUBLAS_OP_N) ? K : M;
+    int ldb = (op_b == CUBLAS_OP_N) ? N : K;
+    cublasHandle_t handle = cublas_get_handle();
+    cublasSetStream(handle, stream);
+    cublasGemmEx(handle, op_b, op_a, N, M, K, &alpha,
+        B, CUDA_R_32F, ldb, A, CUDA_R_32F, lda, &beta,
+        C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }
 
-// Stop-grad CE: dW, db only. Also accumulates loss / accuracy counters.
-// mode_ids is length B = N/TT (one z per agent row); feature row i maps to
-// mode_ids[i / TT].
-__global__ void smerl_disc_ce_bwd(float* __restrict__ dW, float* __restrict__ db,
-        const precision_t* __restrict__ h, const float* __restrict__ logits,
-        const int* __restrict__ modes, float* __restrict__ loss_acc,
-        float* __restrict__ acc_acc, float* __restrict__ n_acc,
-        int N, int TT, int H, int K) {
+__global__ void smerl_cast_h_to_f32(float* __restrict__ dst,
+        const precision_t* __restrict__ src, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = to_float(src[idx]);
+}
+
+__global__ void smerl_add_bias(float* __restrict__ logits,
+        const float* __restrict__ b, int N, int K) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N * K) logits[idx] += b[idx % K];
+}
+
+// Softmax CE: write g = p - one_hot(z), accumulate loss/acc/n. Invalid modes
+// zero their g row so the subsequent GEMM ignores them.
+__global__ void smerl_disc_ce_grads(float* __restrict__ g,
+        const float* __restrict__ logits, const int* __restrict__ modes,
+        float* __restrict__ loss_acc, float* __restrict__ acc_acc,
+        float* __restrict__ n_acc, int N, int TT, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int z = modes[i / TT];
-    if (z < 0 || z >= K) return;
-
+    float* gi = g + (long)i * K;
+    if (z < 0 || z >= K) {
+        for (int k = 0; k < K; k++) gi[k] = 0.0f;
+        return;
+    }
     const float* li = logits + (long)i * K;
     float max_l = li[0];
     for (int k = 1; k < K; k++) max_l = fmaxf(max_l, li[k]);
@@ -126,7 +138,6 @@ __global__ void smerl_disc_ce_bwd(float* __restrict__ dW, float* __restrict__ db
     float log_qz = (li[z] - max_l) - logf(fmaxf(sum, 1e-20f));
 
     atomicAdd(loss_acc, -log_qz);
-    // argmax accuracy
     int pred = 0;
     float best = li[0];
     for (int k = 1; k < K; k++) {
@@ -135,52 +146,56 @@ __global__ void smerl_disc_ce_bwd(float* __restrict__ dW, float* __restrict__ db
     if (pred == z) atomicAdd(acc_acc, 1.0f);
     atomicAdd(n_acc, 1.0f);
 
-    const precision_t* hi = h + (long)i * H;
     for (int k = 0; k < K; k++) {
         float p = expf(li[k] - max_l) * inv;
-        float g = p - ((k == z) ? 1.0f : 0.0f);
-        atomicAdd(&db[k], g);
-        float* dWk = dW + (long)k * H;
-        for (int j = 0; j < H; j++) {
-            atomicAdd(&dWk[j], g * to_float(hi[j]));
-        }
+        gi[k] = p - ((k == z) ? 1.0f : 0.0f);
     }
 }
 
-// Add gate[z] * bonus_coef * (log q(z|s) + log K) into rewards[i].
-// Rows with invalid mode or closed gate are left unchanged.
-__global__ void smerl_disc_bonus(precision_t* __restrict__ rewards,
-        const precision_t* __restrict__ h, const float* __restrict__ W,
-        const float* __restrict__ b, const int* __restrict__ modes,
-        const int* __restrict__ gates, float bonus_coef,
-        float log_k, int N, int H, int K) {
+// db[k] += sum_i g[i, k]
+__global__ void smerl_disc_bias_grad(float* __restrict__ db,
+        const float* __restrict__ g, int N, int K) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+    float acc = 0.0f;
+    for (int i = 0; i < N; i++) acc += g[(long)i * K + k];
+    atomicAdd(&db[k], acc);
+}
+
+// Apply diversity bonus from precomputed logits[N, K].
+__global__ void smerl_disc_bonus_from_logits(precision_t* __restrict__ rewards,
+        const float* __restrict__ logits, const int* __restrict__ modes,
+        const int* __restrict__ gates, float bonus_coef, float log_k,
+        int N, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int z = modes[i];
     if (z < 0 || z >= K) return;
     if (!gates[z]) return;
-    if (bonus_coef == 0.0f) return;
-
-    const precision_t* hi = h + (long)i * H;
-    // compute logits on the fly (N is buffer-sized; cheap vs allocating extra)
-    float max_l = -1.0e30f;
-    // K is small (typically 8); stack buffer is fine
-    float li_stack[32];
-    int KK = K < 32 ? K : 32;
-    for (int k = 0; k < KK; k++) {
-        const float* Wk = W + (long)k * H;
-        float acc = b[k];
-        for (int j = 0; j < H; j++) acc += to_float(hi[j]) * Wk[j];
-        li_stack[k] = acc;
-        max_l = fmaxf(max_l, acc);
-    }
+    const float* li = logits + (long)i * K;
+    float max_l = li[0];
+    for (int k = 1; k < K; k++) max_l = fmaxf(max_l, li[k]);
     float sum = 0.0f;
-    for (int k = 0; k < KK; k++) sum += expf(li_stack[k] - max_l);
-    float log_qz = (li_stack[z] - max_l) - logf(fmaxf(sum, 1e-20f));
+    for (int k = 0; k < K; k++) sum += expf(li[k] - max_l);
+    float log_qz = (li[z] - max_l) - logf(fmaxf(sum, 1e-20f));
     float r = to_float(rewards[i]) + bonus_coef * (log_qz + log_k);
-    // Match train_impl's hard clamp so GAE never sees out-of-range shaped rewards.
     r = fminf(1.0f, fmaxf(-1.0f, r));
     rewards[i] = from_float(r);
+}
+
+// logits = h @ W^T + b   (h cast to f32 first)
+static void smerl_disc_logits(SmerlCond* c, PrecisionTensor h, int N,
+        cudaStream_t stream) {
+    int H = c->hidden;
+    int K = c->num_modes;
+    long n = (long)N * H;
+    smerl_cast_h_to_f32<<<grid_size((int)n), BLOCK_SIZE, 0, stream>>>(
+        c->h_fp32.data, h.data, (int)n);
+    // logits[N, K] = h_fp32[N, H] @ W[K, H]^T
+    smerl_f32_gemm(CUBLAS_OP_N, CUBLAS_OP_T, N, K, H,
+        c->h_fp32.data, c->disc_w.data, c->disc_logits.data, stream);
+    smerl_add_bias<<<grid_size(N * K), BLOCK_SIZE, 0, stream>>>(
+        c->disc_logits.data, c->disc_b.data, N, K);
 }
 
 static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
@@ -199,6 +214,7 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->cond.bonus_rewards = nullptr;
     s->cond.gates = nullptr;
     s->cond.bonus_coef = cfg.bonus_coef;
+    s->cond.any_gate_on = 0;
     s->cond.max_rows = agents_per_buffer > minibatch_segments * horizon
         ? agents_per_buffer : minibatch_segments * horizon;
     s->cond.disc_train_fn = nullptr;
@@ -221,6 +237,8 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->mb_mode = {.shape = {minibatch_segments}};
     s->gates = {.shape = {K}};
     s->cond.disc_logits = {.shape = {s->cond.max_rows, K}};
+    s->cond.disc_g = {.shape = {s->cond.max_rows, K}};
+    s->cond.h_fp32 = {.shape = {s->cond.max_rows, hidden}};
     s->cond.disc_loss_acc = {.shape = {1}};
     s->cond.disc_acc_acc = {.shape = {1}};
     s->cond.disc_n_acc = {.shape = {1}};
@@ -235,6 +253,8 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     alloc_register(&s->opt, &s->mb_mode);
     alloc_register(&s->opt, &s->gates);
     alloc_register(&s->opt, &s->cond.disc_logits);
+    alloc_register(&s->opt, &s->cond.disc_g);
+    alloc_register(&s->opt, &s->cond.h_fp32);
     alloc_register(&s->opt, &s->cond.disc_loss_acc);
     alloc_register(&s->opt, &s->cond.disc_acc_acc);
     alloc_register(&s->opt, &s->cond.disc_n_acc);
@@ -324,6 +344,11 @@ static void smerl_set_modes(SmerlState* s, const int* host_modes) {
 static void smerl_set_gates(SmerlState* s, const int* host_gates) {
     cudaMemcpy(s->gates.data, host_gates, s->cfg.num_modes * sizeof(int),
         cudaMemcpyHostToDevice);
+    int any = 0;
+    for (int i = 0; i < s->cfg.num_modes; i++) {
+        if (host_gates[i]) { any = 1; break; }
+    }
+    s->cond.any_gate_on = any;
 }
 
 // Force every row to one mode. Used by heldout eval to score a single mode.
@@ -342,34 +367,41 @@ static void smerl_force_mode(SmerlState* s, int mode) {
 
 // Disc CE train step on a pre-mode feature batch h shaped (N, H) flat, with
 // mode_ids length N/TT. Stop-grad into h.
+// Path: cast h -> f32 GEMM logits -> CE grads g -> GEMM dW += g^T @ h, db += sum g.
+// Avoids the previous N*K*H atomicAdd storm that cut train SPS roughly in half.
 static void smerl_disc_train(SmerlCond* c, PrecisionTensor h, int N, int TT,
         cudaStream_t stream) {
     if (c == nullptr || c->mode_ids == nullptr || N <= 0) return;
-    if (N > c->max_rows) {
-        // Should never fire: max_rows sized to cover rollout bank + train mb.
-        return;
-    }
+    if (N > c->max_rows) return;
     if (TT < 1) TT = 1;
     int H = c->hidden;
     int K = c->num_modes;
-    smerl_disc_forward<<<grid_size(N * K), BLOCK_SIZE, 0, stream>>>(
-        c->disc_logits.data, h.data, c->disc_w.data, c->disc_b.data, N, H, K);
-    smerl_disc_ce_bwd<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
-        c->disc_w_grad.data, c->disc_b_grad.data, h.data, c->disc_logits.data,
-        c->mode_ids, c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data,
-        N, TT, H, K);
+
+    smerl_disc_logits(c, h, N, stream);
+    smerl_disc_ce_grads<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        c->disc_g.data, c->disc_logits.data, c->mode_ids,
+        c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data,
+        N, TT, K);
+    // dW[K, H] += g[N, K]^T @ h_fp32[N, H]
+    smerl_f32_gemm(CUBLAS_OP_T, CUBLAS_OP_N, K, H, N,
+        c->disc_g.data, c->h_fp32.data, c->disc_w_grad.data, stream,
+        /*alpha=*/1.0f, /*beta=*/1.0f);
+    smerl_disc_bias_grad<<<grid_size(K), BLOCK_SIZE, 0, stream>>>(
+        c->disc_b_grad.data, c->disc_g.data, N, K);
 }
 
 // Diversity bonus into rewards for this forward's rows (rollout path).
+// No-ops when all gates are off (common before activation_score is reached).
 static void smerl_apply_bonus(SmerlCond* c, PrecisionTensor h, int N, cudaStream_t stream) {
     if (c == nullptr || c->bonus_rewards == nullptr || c->mode_ids == nullptr) return;
-    if (c->bonus_coef == 0.0f || N <= 0) return;
-    int H = c->hidden;
+    if (c->bonus_coef == 0.0f || !c->any_gate_on || N <= 0) return;
+    if (N > c->max_rows) return;
     int K = c->num_modes;
     float log_k = logf((float)K);
-    smerl_disc_bonus<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
-        c->bonus_rewards, h.data, c->disc_w.data, c->disc_b.data,
-        c->mode_ids, c->gates, c->bonus_coef, log_k, N, H, K);
+    smerl_disc_logits(c, h, N, stream);
+    smerl_disc_bonus_from_logits<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        c->bonus_rewards, c->disc_logits.data, c->mode_ids, c->gates,
+        c->bonus_coef, log_k, N, K);
 }
 
 // Wire function pointers after definitions (models.cu cannot name these).
