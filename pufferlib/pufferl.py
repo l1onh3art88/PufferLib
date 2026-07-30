@@ -576,10 +576,16 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
     # SMERL heldout: keep mode conditioning if the caller enabled it (and
     # optionally force_mode). Otherwise force disabled so plain eval stays
     # checkpoint-compatible.
+    # force_mode: config/CLI use -1 for "unset" (argparse only exposes ini keys).
     force_mode = None
     smerl_cfg = args.get('smerl') or {}
-    if smerl_cfg.get('force_mode') is not None:
-        force_mode = int(smerl_cfg['force_mode'])
+    fm = smerl_cfg.get('force_mode', -1)
+    try:
+        fm = int(fm)
+    except (TypeError, ValueError):
+        fm = -1
+    if fm >= 0:
+        force_mode = fm
         args.setdefault('smerl', {})['enabled'] = 1
     elif not smerl_cfg.get('enabled', 0):
         args.setdefault('smerl', {})['enabled'] = 0
