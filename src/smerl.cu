@@ -323,14 +323,12 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     alloc_create(&s->params);
     alloc_create(&s->opt);
 
-    // Small random init. Same pattern as puf_normal_init (kernels.cu): host
-    // curand into a temp buffer, then copy. Never write GenerateNormal straight
-    // into the live param slab — that raced with the disc_b memset below
-    // (GenerateNormal is async on the default stream) and could leave
-    // non-deterministic bias / embed bytes across runs.
+    // Same host-curand pattern as puf_normal_init (kernels.cu): temp buffer,
+    // GenerateNormal, copy. Seed is caller-supplied (hypers.seed + 0xSMRL + rank);
+    // independent of Philox rollout RNG and of the policy kaiming counter.
     //
-    // Seed is the caller-supplied SMERL seed (hypers.seed + rank + offset);
-    // independent of Philox rollout RNG state.
+    // GenerateNormal is async on the default stream — never write straight into
+    // the live param slab and memset disc_b without a barrier (that raced).
     long n_params = s->params.total_bytes / sizeof(float);
     long n_gen = (n_params % 2 == 0) ? n_params : n_params + 1;  // GenerateNormal needs even n
     float* tmp = nullptr;
@@ -340,13 +338,11 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     curandSetPseudoRandomGeneratorSeed(gen, seed);
     curandSetGeneratorOffset(gen, 0);
     curandGenerateNormal(gen, tmp, n_gen, 0.0f, 0.02f);
-    curandDestroyGenerator(gen);  // flushes the generate
+    curandDestroyGenerator(gen);
     cudaMemcpy(s->params.mem, tmp, n_params * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaFree(tmp);
-    // Bias starts at 0 so modes are equiprobable under a cold disc.
-    // Must run after the memcpy above has completed (DeviceToDevice is ordered
-    // on the default stream w.r.t. subsequent default-stream work; sync to be safe).
     cudaDeviceSynchronize();
+    // Bias starts at 0 so modes are equiprobable under a cold disc.
     cudaMemset(s->cond.disc_b.data, 0, K * sizeof(float));
 
     // Default to unconditioned everywhere; Python assigns real modes at setup.

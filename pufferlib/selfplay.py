@@ -9,7 +9,12 @@ Pool growth and opponent swaps are decoupled:
     on a fixed cadence and load them after all historical envs reach an episode
     boundary. 0 disables fixed-interval swapping.
 
-Winrate is diagnostic only; it does not trigger snapshots or swaps.
+Opponent sampling is configurable:
+  - sample = uniform: equal probability over pool entries
+  - sample = pfsp: prioritized fictitious self-play — weight opponents by how
+    hard they are for the current learner (from per-checkpoint matchup stats).
+    Snapshot/swap timing is still fixed; winrate only affects *who* is sampled.
+
 Pool storage is disk-only (paths held in memory; weights only on GPU when
 loaded as the frozen bank). Stride-eviction preserves temporal coverage when
 the pool exceeds its cap.
@@ -24,10 +29,101 @@ import numpy as np
 from pufferlib import _C
 
 
-def sample_opponent(pool, rng):
+def make_pool_entry(path, learner_score=0.0, learner_n=0.0):
+    '''Pool entry: checkpoint path + learner matchup stats vs that checkpoint.
+
+    learner_score / learner_n ≈ primary winrate while that opp was loaded
+    (same units as env/hist_score: weighted episode outcomes).'''
+    return {
+        'path': path,
+        'learner_score': float(learner_score),
+        'learner_n': float(learner_n),
+    }
+
+
+def learner_winrate(entry):
+    n = float(entry.get('learner_n', 0.0) or 0.0)
+    if n <= 0.0:
+        return None
+    return float(entry.get('learner_score', 0.0) or 0.0) / n
+
+
+def pfsp_weights(win_rates, weighting='linear', power=1.0, epsilon=0.05, explore=1.0):
+    '''PFSP sampling weights from learner winrates vs each opponent.
+
+    win_rates[i] is primary's WR against pool[i], or None if never played.
+    Weightings (AlphaStar-style family):
+      linear:   max(eps, 1 - wr)^power   — prefer hard opponents
+      squared:  max(eps, 1 - wr)^2
+      variance: max(eps, 1 - |2wr-1|)    — prefer near-50% matchups
+    Unseen opponents get `explore` weight (default 1.0) so the pool is probed.
+    '''
+    wr = np.asarray(win_rates, dtype=np.float64)
+    n = len(wr)
+    if n == 0:
+        return wr
+    # None / nan → unseen
+    unseen = np.array([w is None or (isinstance(w, float) and np.isnan(w))
+                       for w in win_rates], dtype=bool)
+    # For seen, clip to [0,1]
+    seen_wr = np.zeros(n, dtype=np.float64)
+    for i, w in enumerate(win_rates):
+        if not unseen[i]:
+            seen_wr[i] = float(np.clip(w, 0.0, 1.0))
+
+    weighting = str(weighting).lower()
+    eps = float(epsilon)
+    p = float(power)
+    if weighting in ('linear', 'hardest'):
+        w = np.maximum(eps, 1.0 - seen_wr) ** p
+    elif weighting in ('squared', 'square'):
+        w = np.maximum(eps, 1.0 - seen_wr) ** 2.0
+    elif weighting in ('variance', 'focus', 'var'):
+        w = np.maximum(eps, 1.0 - np.abs(2.0 * seen_wr - 1.0))
+    else:
+        raise ValueError(f'unknown pfsp weighting: {weighting!r} '
+                         f'(expected linear|squared|variance)')
+
+    w = np.where(unseen, float(explore), w)
+    total = float(w.sum())
+    if total <= 0.0 or not np.isfinite(total):
+        return np.full(n, 1.0 / n)
+    return w / total
+
+
+def sample_opponent(pool, rng, sample='uniform', pfsp_weighting='linear',
+                    pfsp_power=1.0, pfsp_epsilon=0.05, pfsp_explore=1.0):
     if not pool:
         raise RuntimeError('selfplay opponent pool is empty')
-    return pool[int(rng.integers(len(pool)))]
+    sample = str(sample or 'uniform').lower()
+    if sample in ('uniform', 'uni', 'u'):
+        return pool[int(rng.integers(len(pool)))]
+    if sample in ('pfsp', 'prioritized', 'priority'):
+        win_rates = [learner_winrate(e) for e in pool]
+        weights = pfsp_weights(
+            win_rates, weighting=pfsp_weighting, power=pfsp_power,
+            epsilon=pfsp_epsilon, explore=pfsp_explore)
+        idx = int(rng.choice(len(pool), p=weights))
+        return pool[idx]
+    raise ValueError(f'unknown selfplay.sample={sample!r} (expected uniform|pfsp)')
+
+
+def _find_pool_entry(pool, path):
+    for e in pool:
+        if e.get('path') == path:
+            return e
+    return None
+
+
+def _record_matchup(pool, path, score, n):
+    '''Accumulate learner score/n against the checkpoint at path.'''
+    if n <= 0.0 or not path:
+        return
+    e = _find_pool_entry(pool, path)
+    if e is None:
+        return
+    e['learner_score'] = float(e.get('learner_score', 0.0) or 0.0) + float(score)
+    e['learner_n'] = float(e.get('learner_n', 0.0) or 0.0) + float(n)
 
 
 def resolve_opponent_pool(spec):
@@ -162,7 +258,11 @@ def publish_shared_state(pool_state):
         'version': version,
         'agent_step': pool_state.get('last_snapshot_step', 0),
         'pool_size': len(pool),
-        'pool': [{'path': entry['path']} for entry in pool],
+        'pool': [{
+            'path': entry['path'],
+            'learner_score': float(entry.get('learner_score', 0.0) or 0.0),
+            'learner_n': float(entry.get('learner_n', 0.0) or 0.0),
+        } for entry in pool],
         # Diagnostic + bootstrap for ranks that are just starting. Followers do
         # not keep following rank 0's bank after setup; they sample locally.
         'banks': [{'path': bank['cur_opp_path']} for bank in pool_state['banks']],
@@ -199,7 +299,11 @@ def _pool_from_shared_state(state):
         if not path or path in seen:
             continue
         seen.add(path)
-        pool.append({'path': path})
+        pool.append(make_pool_entry(
+            path,
+            learner_score=entry.get('learner_score', 0.0),
+            learner_n=entry.get('learner_n', 0.0),
+        ))
     return pool
 
 
@@ -208,7 +312,30 @@ def _external_pool_entries(sp):
     paths = resolve_opponent_pool(spec)
     if spec and not paths:
         raise RuntimeError(f'selfplay.opponent_pool resolved no .bin files: {spec}')
-    return [{'path': path} for path in paths]
+    return [make_pool_entry(path) for path in paths]
+
+
+def _merge_pool_stats(old_pool, new_pool):
+    '''Keep local matchup stats when the shared pool list is refreshed.'''
+    old = {e['path']: e for e in old_pool if e.get('path')}
+    merged = []
+    for e in new_pool:
+        path = e.get('path')
+        if path in old:
+            # Prefer higher-n local stats if present; else take published.
+            o, n = old[path], e
+            o_n = float(o.get('learner_n', 0.0) or 0.0)
+            n_n = float(n.get('learner_n', 0.0) or 0.0)
+            if o_n >= n_n:
+                merged.append(make_pool_entry(
+                    path, o.get('learner_score', 0.0), o_n))
+            else:
+                merged.append(make_pool_entry(
+                    path, n.get('learner_score', 0.0), n_n))
+        else:
+            merged.append(make_pool_entry(
+                path, e.get('learner_score', 0.0), e.get('learner_n', 0.0)))
+    return merged
 
 
 def sync_shared_pool(pool_state):
@@ -223,7 +350,7 @@ def sync_shared_pool(pool_state):
 
     pool = _pool_from_shared_state(state)
     if pool:
-        pool_state['pool'] = pool
+        pool_state['pool'] = _merge_pool_stats(pool_state.get('pool', []), pool)
     pool_state['shared_state_version'] = version
 
 
@@ -285,10 +412,22 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
     world_size = max(1, int(args.get('world_size', 1)))
     current_agent_step = int(pufferl.global_step) * world_size
 
+    sample = str(sp.get('sample', 'uniform')).lower()
+    pfsp_weighting = str(sp.get('pfsp_weighting', 'linear')).lower()
+    pfsp_power = float(sp.get('pfsp_power', 1.0))
+    pfsp_epsilon = float(sp.get('pfsp_epsilon', 0.05))
+    pfsp_explore = float(sp.get('pfsp_explore', 1.0))
+    if sample not in ('uniform', 'uni', 'u', 'pfsp', 'prioritized', 'priority'):
+        raise RuntimeError(f'selfplay.sample must be uniform|pfsp (got {sample!r})')
+
     pool = []
     banks_state = []
     shared_version = 0
     external_pool = _external_pool_entries(sp)
+    sample_kwargs = dict(
+        sample=sample, pfsp_weighting=pfsp_weighting, pfsp_power=pfsp_power,
+        pfsp_epsilon=pfsp_epsilon, pfsp_explore=pfsp_explore,
+    )
     if artifact_owner:
         os.makedirs(pool_dir, exist_ok=True)
         if external_pool:
@@ -296,9 +435,9 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
         else:
             bootstrap_path = os.path.join(pool_dir, f'{pufferl.global_step:016d}.bin')
             backend.save_weights(pufferl, bootstrap_path)
-            pool = [{'path': bootstrap_path}]
+            pool = [make_pool_entry(bootstrap_path)]
         for b in range(num_banks):
-            opp_entry = sample_opponent(pool, rng)
+            opp_entry = sample_opponent(pool, rng, **sample_kwargs)
             backend.load_frozen_bank(pufferl, b, opp_entry['path'])
             banks_state.append(make_bank_state(
                 opp_entry['path'], current_agent_step, num_hist_envs_per_bank[b]))
@@ -326,6 +465,11 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
         'max_size': int(sp['max_size']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': int(sp.get('opp_timeout_steps', 500_000_000)),
+        'sample': sample,
+        'pfsp_weighting': pfsp_weighting,
+        'pfsp_power': pfsp_power,
+        'pfsp_epsilon': pfsp_epsilon,
+        'pfsp_explore': pfsp_explore,
         'num_banks': num_banks,
         'banks': banks_state,
         'world_size': world_size,
@@ -357,6 +501,7 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         sync_shared_pool(pool_state)
 
     # 1. Per-bank score accumulation from the most recent rollout window.
+    #    Also fold into per-checkpoint matchup stats used by PFSP.
     for b in range(num_banks):
         bank = pool_state['banks'][b]
         hist_score_w = float(flat_logs.get(f'env/hist_score_bank_{b}', 0.0)) * n_window
@@ -364,6 +509,8 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         if hist_n_w > 0.0:
             bank['hist_score'] += hist_score_w
             bank['hist_n']     += hist_n_w
+            _record_matchup(pool_state['pool'], bank.get('cur_opp_path'),
+                            hist_score_w, hist_n_w)
 
     # 2. Global snapshot cadence (shared across banks).
     pool_changed = False
@@ -375,14 +522,21 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         snap_path = os.path.join(pool_state['pool_dir'],
             f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, snap_path)
-        pool_state['pool'].append({'path': snap_path})
+        pool_state['pool'].append(make_pool_entry(snap_path))
         pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
         pool_state['last_snapshot_step'] = current_agent_step
         pool_changed = True
 
     # 3. Per-bank fixed-interval swap logic. Tags 1..num_banks correspond to
-    # bank 0..num_banks-1. Winrate is logged but does not drive swaps.
+    # bank 0..num_banks-1. Timing is fixed; *who* is sampled is uniform or PFSP.
     opponent_changed = False
+    sample_kwargs = dict(
+        sample=pool_state.get('sample', 'uniform'),
+        pfsp_weighting=pool_state.get('pfsp_weighting', 'linear'),
+        pfsp_power=pool_state.get('pfsp_power', 1.0),
+        pfsp_epsilon=pool_state.get('pfsp_epsilon', 0.05),
+        pfsp_explore=pool_state.get('pfsp_explore', 1.0),
+    )
     for b in range(num_banks):
         bank = pool_state['banks'][b]
         winrate = (bank['hist_score'] / bank['hist_n']
@@ -404,7 +558,8 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 bank['last_epochs_to_align'] = epoch - bank['epoch_armed']
                 opponent_changed = True
         elif timed_out:
-            opp_entry = sample_opponent(pool_state['pool'], pool_state['rng'])
+            opp_entry = sample_opponent(
+                pool_state['pool'], pool_state['rng'], **sample_kwargs)
             bank['pending_opp_path'] = opp_entry['path']
             bank['epoch_armed'] = epoch
             bank['last_winrate_at_swap'] = winrate if winrate is not None else 0.0
@@ -417,6 +572,7 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
     # 4. Emit logs — per-bank and aggregate.
     flat_logs['pool/size']     = len(pool_state['pool'])
     flat_logs['pool/num_banks'] = num_banks
+    flat_logs['pool/sample'] = 1.0 if str(pool_state.get('sample', 'uniform')).startswith('p') else 0.0
     total_score = 0.0
     total_n     = 0.0
     for b in range(num_banks):
@@ -435,3 +591,14 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
         agg = total_score / total_n
         flat_logs['pool/winrate']           = agg
         flat_logs['env/historical_winrate'] = agg
+    # PFSP diagnostics: fraction of pool with matchup data + mean learner WR.
+    seen = 0
+    wr_sum = 0.0
+    for e in pool_state['pool']:
+        wr = learner_winrate(e)
+        if wr is not None:
+            seen += 1
+            wr_sum += wr
+    flat_logs['pool/pfsp_seen'] = seen
+    if seen > 0:
+        flat_logs['pool/pfsp_mean_learner_wr'] = wr_sum / seen
