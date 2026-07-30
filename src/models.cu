@@ -785,6 +785,9 @@ struct SmerlCond {
     FloatTensor disc_logits; // [max_rows, num_modes] scratch
     FloatTensor disc_g;      // [max_rows, num_modes] CE grad (softmax - onehot)
     FloatTensor h_fp32;      // [max_rows, hidden] cast buffer for float GEMMs
+    FloatTensor row_loss;    // [max_rows] per-row CE for deterministic reduce
+    FloatTensor row_hit;     // [max_rows] 1 if correct, 0 else (invalid rows 0)
+    FloatTensor row_valid;   // [max_rows] 1 if mode valid
     FloatTensor disc_loss_acc;
     FloatTensor disc_acc_acc;
     FloatTensor disc_n_acc;
@@ -814,16 +817,23 @@ __global__ void smerl_add_embed(precision_t* __restrict__ h,
     h[idx] = from_float(to_float(h[idx]) + embed[z * hidden + (idx % hidden)]);
 }
 
-// Gradient wrt the embedding is the sum of grad_h over every row sharing that
-// mode. fp32 accumulation keeps this exact under bf16 activations.
+// Gradient wrt the embedding: sum grad_h over rows that share mode z.
+// Deterministic: one thread owns each (z, h) and walks rows in increasing
+// order — no atomics, fixed reduction order.
 __global__ void smerl_embed_backward(const precision_t* __restrict__ grad_h,
         float* __restrict__ embed_grad, const int* __restrict__ mode_ids,
-        int n, int TT, int hidden, int num_modes) {
+        int N, int TT, int hidden, int num_modes) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    int z = mode_ids[idx / (TT * hidden)];
-    if (z < 0 || z >= num_modes) return;
-    atomicAdd(&embed_grad[z * hidden + (idx % hidden)], to_float(grad_h[idx]));
+    int total = num_modes * hidden;
+    if (idx >= total) return;
+    int z = idx / hidden;
+    int h = idx % hidden;
+    float acc = 0.0f;
+    for (int r = 0; r < N; r++) {
+        int mz = mode_ids[r / TT];
+        if (mz == z) acc += to_float(grad_h[(long)r * hidden + h]);
+    }
+    embed_grad[idx] += acc;
 }
 
 // h is (B*TT, hidden) in train and (B, hidden) in rollout; TT disambiguates.
@@ -849,8 +859,11 @@ static inline void smerl_condition_backward(SmerlCond* s, PrecisionTensor grad_h
         int TT, cudaStream_t stream) {
     if (s == nullptr || s->mode_ids == nullptr) return;
     int n = (int)numel(grad_h.shape);
-    smerl_embed_backward<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-        grad_h.data, s->embed_grad.data, s->mode_ids, n, TT, s->hidden, s->num_modes);
+    int N = n / s->hidden;
+    if (TT < 1) TT = 1;
+    int total = s->num_modes * s->hidden;
+    smerl_embed_backward<<<grid_size(total), BLOCK_SIZE, 0, stream>>>(
+        grad_h.data, s->embed_grad.data, s->mode_ids, N, TT, s->hidden, s->num_modes);
 }
 
 struct Policy {

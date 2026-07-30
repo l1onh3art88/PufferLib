@@ -115,18 +115,21 @@ __global__ void smerl_add_bias(float* __restrict__ logits,
     if (idx < N * K) logits[idx] += b[idx % K];
 }
 
-// Softmax CE: write g = p - one_hot(z), accumulate loss/acc/n. Invalid modes
-// zero their g row so the subsequent GEMM ignores them.
+// Softmax CE: write g = p - one_hot(z) and per-row metrics. No atomics —
+// metrics are reduced deterministically in smerl_reduce_metrics.
 __global__ void smerl_disc_ce_grads(float* __restrict__ g,
         const float* __restrict__ logits, const int* __restrict__ modes,
-        float* __restrict__ loss_acc, float* __restrict__ acc_acc,
-        float* __restrict__ n_acc, int N, int TT, int K) {
+        float* __restrict__ row_loss, float* __restrict__ row_hit,
+        float* __restrict__ row_valid, int N, int TT, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int z = modes[i / TT];
     float* gi = g + (long)i * K;
     if (z < 0 || z >= K) {
         for (int k = 0; k < K; k++) gi[k] = 0.0f;
+        row_loss[i] = 0.0f;
+        row_hit[i] = 0.0f;
+        row_valid[i] = 0.0f;
         return;
     }
     const float* li = logits + (long)i * K;
@@ -137,14 +140,14 @@ __global__ void smerl_disc_ce_grads(float* __restrict__ g,
     float inv = 1.0f / fmaxf(sum, 1e-20f);
     float log_qz = (li[z] - max_l) - logf(fmaxf(sum, 1e-20f));
 
-    atomicAdd(loss_acc, -log_qz);
     int pred = 0;
     float best = li[0];
     for (int k = 1; k < K; k++) {
         if (li[k] > best) { best = li[k]; pred = k; }
     }
-    if (pred == z) atomicAdd(acc_acc, 1.0f);
-    atomicAdd(n_acc, 1.0f);
+    row_loss[i] = -log_qz;
+    row_hit[i] = (pred == z) ? 1.0f : 0.0f;
+    row_valid[i] = 1.0f;
 
     for (int k = 0; k < K; k++) {
         float p = expf(li[k] - max_l) * inv;
@@ -152,14 +155,31 @@ __global__ void smerl_disc_ce_grads(float* __restrict__ g,
     }
 }
 
-// db[k] += sum_i g[i, k]
+// Sequential reduce in fixed order i=0..N-1 — bit-stable metrics.
+__global__ void smerl_reduce_metrics(
+        const float* __restrict__ row_loss, const float* __restrict__ row_hit,
+        const float* __restrict__ row_valid, float* __restrict__ loss_acc,
+        float* __restrict__ acc_acc, float* __restrict__ n_acc, int N) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float L = 0.0f, A = 0.0f, V = 0.0f;
+    for (int i = 0; i < N; i++) {
+        L += row_loss[i];
+        A += row_hit[i];
+        V += row_valid[i];
+    }
+    *loss_acc += L;
+    *acc_acc += A;
+    *n_acc += V;
+}
+
+// db[k] += sum_i g[i, k]  — one thread owns k, fixed loop order, no atomics.
 __global__ void smerl_disc_bias_grad(float* __restrict__ db,
         const float* __restrict__ g, int N, int K) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= K) return;
     float acc = 0.0f;
     for (int i = 0; i < N; i++) acc += g[(long)i * K + k];
-    atomicAdd(&db[k], acc);
+    db[k] += acc;
 }
 
 // Apply diversity bonus from precomputed logits[N, K].
@@ -239,6 +259,9 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->cond.disc_logits = {.shape = {s->cond.max_rows, K}};
     s->cond.disc_g = {.shape = {s->cond.max_rows, K}};
     s->cond.h_fp32 = {.shape = {s->cond.max_rows, hidden}};
+    s->cond.row_loss = {.shape = {s->cond.max_rows}};
+    s->cond.row_hit = {.shape = {s->cond.max_rows}};
+    s->cond.row_valid = {.shape = {s->cond.max_rows}};
     s->cond.disc_loss_acc = {.shape = {1}};
     s->cond.disc_acc_acc = {.shape = {1}};
     s->cond.disc_n_acc = {.shape = {1}};
@@ -255,6 +278,9 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     alloc_register(&s->opt, &s->cond.disc_logits);
     alloc_register(&s->opt, &s->cond.disc_g);
     alloc_register(&s->opt, &s->cond.h_fp32);
+    alloc_register(&s->opt, &s->cond.row_loss);
+    alloc_register(&s->opt, &s->cond.row_hit);
+    alloc_register(&s->opt, &s->cond.row_valid);
     alloc_register(&s->opt, &s->cond.disc_loss_acc);
     alloc_register(&s->opt, &s->cond.disc_acc_acc);
     alloc_register(&s->opt, &s->cond.disc_n_acc);
@@ -262,26 +288,30 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     alloc_create(&s->params);
     alloc_create(&s->opt);
 
-    // Small random init. Large enough that modes start distinguishable, small
-    // enough not to swamp the encoder output on step 0.
+    // Small random init. Same pattern as puf_normal_init (kernels.cu): host
+    // curand into a temp buffer, then copy. Never write GenerateNormal straight
+    // into the live param slab — that raced with the disc_b memset below
+    // (GenerateNormal is async on the default stream) and could leave
+    // non-deterministic bias / embed bytes across runs.
+    //
+    // Seed is the caller-supplied SMERL seed (hypers.seed + rank + offset);
+    // independent of Philox rollout RNG state.
     long n_params = s->params.total_bytes / sizeof(float);
-    // curandGenerateNormal wants even counts
-    long n_gen = (n_params % 2 == 0) ? n_params : n_params + 1;
+    long n_gen = (n_params % 2 == 0) ? n_params : n_params + 1;  // GenerateNormal needs even n
+    float* tmp = nullptr;
+    cudaMalloc(&tmp, n_gen * sizeof(float));
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, seed);
-    // Temporary even buffer if needed
-    if (n_gen != n_params) {
-        float* tmp;
-        cudaMalloc(&tmp, n_gen * sizeof(float));
-        curandGenerateNormal(gen, tmp, n_gen, 0.0f, 0.02f);
-        cudaMemcpy(s->params.mem, tmp, n_params * sizeof(float), cudaMemcpyDeviceToDevice);
-        cudaFree(tmp);
-    } else {
-        curandGenerateNormal(gen, (float*)s->params.mem, n_gen, 0.0f, 0.02f);
-    }
-    curandDestroyGenerator(gen);
+    curandSetGeneratorOffset(gen, 0);
+    curandGenerateNormal(gen, tmp, n_gen, 0.0f, 0.02f);
+    curandDestroyGenerator(gen);  // flushes the generate
+    cudaMemcpy(s->params.mem, tmp, n_params * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaFree(tmp);
     // Bias starts at 0 so modes are equiprobable under a cold disc.
+    // Must run after the memcpy above has completed (DeviceToDevice is ordered
+    // on the default stream w.r.t. subsequent default-stream work; sync to be safe).
+    cudaDeviceSynchronize();
     cudaMemset(s->cond.disc_b.data, 0, K * sizeof(float));
 
     // Default to unconditioned everywhere; Python assigns real modes at setup.
@@ -290,6 +320,7 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     cudaMemset(s->mb_mode.data, 0xFF, minibatch_segments * sizeof(int));
     cudaMemset(s->gates.data, 0, K * sizeof(int));
     s->cond.gates = s->gates.data;
+    s->cond.any_gate_on = 0;
     // disc_train_fn / apply_bonus_fn bound after their definitions below.
     cudaDeviceSynchronize();
 }
@@ -380,8 +411,10 @@ static void smerl_disc_train(SmerlCond* c, PrecisionTensor h, int N, int TT,
     smerl_disc_logits(c, h, N, stream);
     smerl_disc_ce_grads<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
         c->disc_g.data, c->disc_logits.data, c->mode_ids,
-        c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data,
-        N, TT, K);
+        c->row_loss.data, c->row_hit.data, c->row_valid.data, N, TT, K);
+    smerl_reduce_metrics<<<1, 1, 0, stream>>>(
+        c->row_loss.data, c->row_hit.data, c->row_valid.data,
+        c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data, N);
     // dW[K, H] += g[N, K]^T @ h_fp32[N, H]
     smerl_f32_gemm(CUBLAS_OP_T, CUBLAS_OP_N, K, H, N,
         c->disc_g.data, c->h_fp32.data, c->disc_w_grad.data, stream,

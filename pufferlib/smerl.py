@@ -91,18 +91,18 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
         raise RuntimeError('smerl: no primary rows left after frozen banks')
 
     rank = int(args.get('rank', 0))
-    seed = int(cfg.get('seed', args.get('seed', 0))) + rank
-    rng = np.random.default_rng(seed)
+    # Deterministic mode layout — no RNG. Numpy Generator.shuffle is seeded but
+    # still a footgun (version drift, accidental unseeded paths). Stripe modes
+    # across primary rows; offset by buffer index so buffers are not identical.
+    # Matches "fixed z per row for the run" and is bit-stable given layout.
+    _ = rank  # reserved if we ever need rank-striped layouts in multi-GPU
 
     # One mode per primary physical row. Frozen bank rows stay at sentinel -1
     # (native leave them unconditioned and never pays them a bonus).
     modes = np.full(total_agents, -1, dtype=np.int32)
     for b in range(num_buffers):
         start = b * agents_per_buffer
-        # Round-robin then shuffle so every mode is used and layout is not
-        # identical across buffers.
-        row_modes = (np.arange(primary_per_buffer, dtype=np.int32) % num_modes)
-        rng.shuffle(row_modes)
+        row_modes = (np.arange(primary_per_buffer, dtype=np.int32) + b) % num_modes
         modes[start:start + primary_per_buffer] = row_modes
     backend.set_smerl_modes(pufferl, modes)
 

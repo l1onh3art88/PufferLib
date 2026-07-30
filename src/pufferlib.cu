@@ -2197,8 +2197,12 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     if (hypers.smerl.enabled) {
         pufferl->smerl = new SmerlState();
         int agents_per_buffer = total_agents / num_buffers;
+        // Dedicated seed stream so SMERL init does not share the numeric seed
+        // with Philox rollout RNG (pufferl->seed + buf) or policy kaiming seeds.
+        // 'SMRL' in hex keeps it stable across ranks: base ^ offset + rank.
+        ulong smerl_seed = (ulong)hypers.seed + 0x534D524Cul + (ulong)hypers.rank;
         smerl_create(pufferl->smerl, hypers.smerl, hidden_size,
-            total_agents, minibatch_segments, horizon, agents_per_buffer, seed);
+            total_agents, minibatch_segments, horizon, agents_per_buffer, smerl_seed);
         smerl_bind_hooks(pufferl->smerl);
         pufferl->policy.smerl = &pufferl->smerl->cond;
     }
