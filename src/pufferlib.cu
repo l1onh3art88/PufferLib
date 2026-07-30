@@ -732,17 +732,18 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         // contiguous in that space, so a pointer offset suffices. Only bank 0
         // is conditioned — frozen banks have policy.smerl == NULL. Set before
         // the forward so cudagraph capture bakes the right pointer per (buf, t).
-        // bonus_rewards points at the already-copied env rewards for this slice
-        // so diversity shaping lands in the rollout buffer before GAE.
+        // div_out points at the SEPARATE diversity reward buffer (T,B layout),
+        // not env rewards — task rewards stay pure for value/GAE clamp.
         if (b == 0 && pufferl->smerl != NULL) {
             pufferl->smerl->cond.mode_ids = pufferl->smerl->mode_ids.data + sub_start;
-            pufferl->smerl->cond.bonus_rewards = rew_dst.data + bank_off;
+            long div_off = (long)t * pufferl->smerl->total_agents + sub_start;
+            pufferl->smerl->cond.div_out = pufferl->smerl->div_rewards_TB.data + div_off;
             pufferl->smerl->cond.gates = pufferl->smerl->gates.data;
             pufferl->smerl->cond.bonus_coef = pufferl->smerl->cfg.bonus_coef;
         }
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
         if (b == 0 && pufferl->smerl != NULL) {
-            pufferl->smerl->cond.bonus_rewards = nullptr;
+            pufferl->smerl->cond.div_out = nullptr;
         }
 
         PrecisionTensor p_logstd = {};
@@ -1652,6 +1653,7 @@ void train_impl(PuffeRL& pufferl) {
         puf_zero(&advantages_puf, train_stream);
 
         profile_begin("compute_advantage", hypers.profile);
+        // Task advantages only — env rewards already clamped; no r_div mixed in.
         puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
             rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
             hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
@@ -1660,10 +1662,30 @@ void train_impl(PuffeRL& pufferl) {
             zero_frozen_advantages_cuda(advantages_puf, apb,
                 pufferl.bank_layout[1], train_stream);
         }
+        // Separate diversity advantages: GAE on r_div with V=0 (does not touch
+        // task advantages or value targets). Mixed into mb_advantages after
+        // select_copy so returns stay V + A_task.
+        if (pufferl.smerl != NULL && pufferl.smerl->cond.any_gate_on
+                && pufferl.smerl->cfg.bonus_coef != 0.0f) {
+            int Td = pufferl.smerl->horizon;
+            int Bd = pufferl.smerl->total_agents;
+            transpose_102<<<grid_size(Td * Bd), BLOCK_SIZE, 0, train_stream>>>(
+                pufferl.smerl->div_rewards_BT.data, pufferl.smerl->div_rewards_TB.data,
+                Td, Bd, 1);
+            puff_advantage_cuda(pufferl.smerl->zero_values, pufferl.smerl->div_rewards_BT,
+                rollouts.terminals, rollouts.ratio, pufferl.smerl->div_advantages,
+                hypers.gamma, hypers.gae_lambda,
+                hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
+            if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL) {
+                int apb = hypers.total_agents / hypers.num_buffers;
+                zero_frozen_advantages_cuda(pufferl.smerl->div_advantages, apb,
+                    pufferl.bank_layout[1], train_stream);
+            }
+        }
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
-        // Use the training RNG offset slot (last slot, index num_buffers)
+        // Prioritize by task advantages only (competence), not diversity noise.
         long* train_rng_offset = pufferl.rng_offset_puf.data + hypers.num_buffers;
         prio_replay_cuda(advantages_puf, prio_alpha, minibatch_segments,
             hypers.total_agents, anneal_beta,
@@ -1677,6 +1699,7 @@ void train_impl(PuffeRL& pufferl) {
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
             int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+            // select_copy builds mb_returns = V + A_task from task advantages.
             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
                 sel_src, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
@@ -1690,6 +1713,12 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.smerl->mb_mode.data, pufferl.smerl->mode_ids.data,
                 pufferl.prio_bufs.idx.data, mb_segs);
             pufferl.smerl->cond.mode_ids = pufferl.smerl->mb_mode.data;
+            // Policy advantages become A_task + A_div; value targets unchanged.
+            if (pufferl.smerl->cond.any_gate_on && pufferl.smerl->cfg.bonus_coef != 0.0f) {
+                smerl_add_div_to_mb_adv<<<mb_segs, BLOCK_SIZE, 0, train_stream>>>(
+                    graph.mb_advantages.data, pufferl.smerl->div_advantages.data,
+                    pufferl.prio_bufs.idx.data, mb_segs, pufferl.smerl->horizon);
+            }
         }
         profile_end(hypers.profile);
 

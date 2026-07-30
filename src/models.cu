@@ -793,18 +793,19 @@ struct SmerlCond {
     FloatTensor disc_n_acc;
     int max_rows;
 
-    // Optional rollout diversity bonus target (length = batch rows). NULL in train.
-    precision_t* bonus_rewards;
+    // Rollout path: write pure diversity reward r_div into this length-N slice
+    // (NOT into env rewards). NULL during train forward (disc CE only).
+    precision_t* div_out;
     const int* gates;  // device [num_modes], 0/1
     float bonus_coef;
-    // Host-side flag updated by set_smerl_gates. Skip bonus launches when 0.
+    // Host-side flag updated by set_smerl_gates. Skip div launches when 0.
     int any_gate_on;
 
     // Filled by smerl_create. Avoid calling into smerl.cu by name from here.
     // N = number of feature rows (B in rollout, B*TT in train); TT disambiguates
     // mode_ids indexing (one z per agent row, not per timestep).
     void (*disc_train_fn)(SmerlCond*, PrecisionTensor, int /*N*/, int /*TT*/, cudaStream_t);
-    void (*apply_bonus_fn)(SmerlCond*, PrecisionTensor, int /*N*/, cudaStream_t);
+    void (*write_div_fn)(SmerlCond*, PrecisionTensor, int /*N*/, cudaStream_t);
 };
 
 __global__ void smerl_add_embed(precision_t* __restrict__ h,
@@ -843,12 +844,12 @@ static inline void smerl_condition(SmerlCond* s, PrecisionTensor h, int TT, cuda
     if (s == nullptr || s->mode_ids == nullptr) return;
     int n = (int)numel(h.shape);
     int N = n / s->hidden;
-    if (s->apply_bonus_fn != nullptr && s->bonus_rewards != nullptr) {
-        s->apply_bonus_fn(s, h, N, stream);
+    if (s->write_div_fn != nullptr && s->div_out != nullptr) {
+        // Rollout: store r_div in the separate diversity buffer (not env rewards).
+        s->write_div_fn(s, h, N, stream);
     }
-    if (s->disc_train_fn != nullptr && s->bonus_rewards == nullptr) {
-        // Train path only: rollout sets bonus_rewards and skips CE (disc still
-        // sees states via the next train step).
+    if (s->disc_train_fn != nullptr && s->div_out == nullptr) {
+        // Train path only: disc CE on pre-mode features.
         s->disc_train_fn(s, h, N, TT, stream);
     }
     smerl_add_embed<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(

@@ -43,8 +43,15 @@ struct SmerlState {
     IntTensor mb_mode;      // [minibatch_segments] gathered per minibatch
     IntTensor gates;        // [num_modes] 1 = mode earns the diversity bonus
     FloatTensor adam_m, adam_v, adam_t;
+    // Diversity reward separated from env rewards (no [-1,1] clamp mixing).
+    // Rollout layout (T, B) matches pufferl.rollouts; train uses BT + GAE.
+    PrecisionTensor div_rewards_TB;   // [horizon, total_agents]
+    PrecisionTensor div_rewards_BT;   // [total_agents, horizon]
+    PrecisionTensor div_advantages;   // [total_agents, horizon]
+    PrecisionTensor zero_values;      // [total_agents, horizon] zeros for div GAE
     int total_agents;
     int minibatch_segments;
+    int horizon;
     int embed_n;            // num_modes * hidden
     int disc_n;             // num_modes * hidden + num_modes
 };
@@ -182,25 +189,44 @@ __global__ void smerl_disc_bias_grad(float* __restrict__ db,
     db[k] += acc;
 }
 
-// Apply diversity bonus from precomputed logits[N, K].
-__global__ void smerl_disc_bonus_from_logits(precision_t* __restrict__ rewards,
+// Write pure diversity reward into div_out (NOT env rewards):
+//   r_div = bonus_coef * (log q(z|s) + log K)  if gate[z] else 0
+// Soft-clamp r_div alone to [-1,1] for numerical safety; env clamp stays separate.
+__global__ void smerl_write_div_from_logits(precision_t* __restrict__ div_out,
         const float* __restrict__ logits, const int* __restrict__ modes,
         const int* __restrict__ gates, float bonus_coef, float log_k,
         int N, int K) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int z = modes[i];
-    if (z < 0 || z >= K) return;
-    if (!gates[z]) return;
+    if (z < 0 || z >= K || !gates[z] || bonus_coef == 0.0f) {
+        div_out[i] = from_float(0.0f);
+        return;
+    }
     const float* li = logits + (long)i * K;
     float max_l = li[0];
     for (int k = 1; k < K; k++) max_l = fmaxf(max_l, li[k]);
     float sum = 0.0f;
     for (int k = 0; k < K; k++) sum += expf(li[k] - max_l);
     float log_qz = (li[z] - max_l) - logf(fmaxf(sum, 1e-20f));
-    float r = to_float(rewards[i]) + bonus_coef * (log_qz + log_k);
+    float r = bonus_coef * (log_qz + log_k);
     r = fminf(1.0f, fmaxf(-1.0f, r));
-    rewards[i] = from_float(r);
+    div_out[i] = from_float(r);
+}
+
+// After select_copy built mb_adv = A_task (and returns = V + A_task), add A_div
+// into mb advantages only — value targets stay task-pure.
+__global__ void smerl_add_div_to_mb_adv(precision_t* __restrict__ mb_adv,
+        const precision_t* __restrict__ div_adv, const int* __restrict__ idx,
+        int mb_segs, int horizon) {
+    int j = blockIdx.x;
+    if (j >= mb_segs) return;
+    int src = idx[j];
+    precision_t* dst = mb_adv + (long)j * horizon;
+    const precision_t* src_row = div_adv + (long)src * horizon;
+    for (int t = threadIdx.x; t < horizon; t += blockDim.x) {
+        dst[t] = from_float(to_float(dst[t]) + to_float(src_row[t]));
+    }
 }
 
 // logits = h @ W^T + b   (h cast to f32 first)
@@ -224,6 +250,7 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->cfg = cfg;
     s->total_agents = total_agents;
     s->minibatch_segments = minibatch_segments;
+    s->horizon = horizon;
     int K = cfg.num_modes;
     s->embed_n = K * hidden;
     s->disc_n = K * hidden + K;
@@ -231,14 +258,14 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->cond.num_modes = K;
     s->cond.hidden = hidden;
     s->cond.mode_ids = nullptr;
-    s->cond.bonus_rewards = nullptr;
+    s->cond.div_out = nullptr;
     s->cond.gates = nullptr;
     s->cond.bonus_coef = cfg.bonus_coef;
     s->cond.any_gate_on = 0;
     s->cond.max_rows = agents_per_buffer > minibatch_segments * horizon
         ? agents_per_buffer : minibatch_segments * horizon;
     s->cond.disc_train_fn = nullptr;
-    s->cond.apply_bonus_fn = nullptr;
+    s->cond.write_div_fn = nullptr;
 
     s->cond.embed = {.shape = {K, hidden}};
     s->cond.disc_w = {.shape = {K, hidden}};
@@ -265,6 +292,10 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->cond.disc_loss_acc = {.shape = {1}};
     s->cond.disc_acc_acc = {.shape = {1}};
     s->cond.disc_n_acc = {.shape = {1}};
+    s->div_rewards_TB = {.shape = {horizon, total_agents}};
+    s->div_rewards_BT = {.shape = {total_agents, horizon}};
+    s->div_advantages = {.shape = {total_agents, horizon}};
+    s->zero_values = {.shape = {total_agents, horizon}};
 
     alloc_register(&s->opt, &s->cond.embed_grad);
     alloc_register(&s->opt, &s->cond.disc_w_grad);
@@ -284,6 +315,10 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     alloc_register(&s->opt, &s->cond.disc_loss_acc);
     alloc_register(&s->opt, &s->cond.disc_acc_acc);
     alloc_register(&s->opt, &s->cond.disc_n_acc);
+    alloc_register(&s->opt, &s->div_rewards_TB);
+    alloc_register(&s->opt, &s->div_rewards_BT);
+    alloc_register(&s->opt, &s->div_advantages);
+    alloc_register(&s->opt, &s->zero_values);
 
     alloc_create(&s->params);
     alloc_create(&s->opt);
@@ -321,7 +356,10 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     cudaMemset(s->gates.data, 0, K * sizeof(int));
     s->cond.gates = s->gates.data;
     s->cond.any_gate_on = 0;
-    // disc_train_fn / apply_bonus_fn bound after their definitions below.
+    // zero_values stays zero for div GAE (never written after create).
+    cudaMemset(s->zero_values.data, 0, numel(s->zero_values.shape) * sizeof(precision_t));
+    cudaMemset(s->div_rewards_TB.data, 0, numel(s->div_rewards_TB.shape) * sizeof(precision_t));
+    // disc_train_fn / write_div_fn bound after their definitions below.
     cudaDeviceSynchronize();
 }
 
@@ -423,24 +461,35 @@ static void smerl_disc_train(SmerlCond* c, PrecisionTensor h, int N, int TT,
         c->disc_b_grad.data, c->disc_g.data, N, K);
 }
 
-// Diversity bonus into rewards for this forward's rows (rollout path).
+// Write pure r_div into cond.div_out for this rollout slice. Env rewards untouched.
 // No-ops when all gates are off (common before activation_score is reached).
-static void smerl_apply_bonus(SmerlCond* c, PrecisionTensor h, int N, cudaStream_t stream) {
-    if (c == nullptr || c->bonus_rewards == nullptr || c->mode_ids == nullptr) return;
-    if (c->bonus_coef == 0.0f || !c->any_gate_on || N <= 0) return;
+static void smerl_write_div(SmerlCond* c, PrecisionTensor h, int N, cudaStream_t stream) {
+    if (c == nullptr || c->div_out == nullptr || c->mode_ids == nullptr) return;
+    if (c->bonus_coef == 0.0f || !c->any_gate_on || N <= 0) {
+        if (c->div_out != nullptr && N > 0) {
+            cudaMemsetAsync(c->div_out, 0, N * sizeof(precision_t), stream);
+        }
+        return;
+    }
     if (N > c->max_rows) return;
     int K = c->num_modes;
     float log_k = logf((float)K);
     smerl_disc_logits(c, h, N, stream);
-    smerl_disc_bonus_from_logits<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
-        c->bonus_rewards, c->disc_logits.data, c->mode_ids, c->gates,
+    smerl_write_div_from_logits<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
+        c->div_out, c->disc_logits.data, c->mode_ids, c->gates,
         c->bonus_coef, log_k, N, K);
 }
 
 // Wire function pointers after definitions (models.cu cannot name these).
 static void smerl_bind_hooks(SmerlState* s) {
     s->cond.disc_train_fn = smerl_disc_train;
-    s->cond.apply_bonus_fn = smerl_apply_bonus;
+    s->cond.write_div_fn = smerl_write_div;
+}
+
+// Zero the full (T,B) diversity reward buffer (call at the start of each rollout).
+static void smerl_zero_div_rewards(SmerlState* s, cudaStream_t stream) {
+    if (s == nullptr) return;
+    puf_zero(&s->div_rewards_TB, stream);
 }
 
 static void smerl_save(SmerlState* s, const char* path) {

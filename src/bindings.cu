@@ -161,6 +161,11 @@ void rollouts(pybind11::object pufferl_obj) {
         }
     }
 
+    // Fresh diversity-reward buffer each rollout epoch (separate from env rewards).
+    if (pufferl.smerl != nullptr) {
+        smerl_zero_div_rewards(pufferl.smerl, pufferl.default_stream);
+    }
+
     static_vec_omp_step(pufferl.vec);
     float sec = (float)(wall_clock() - t0);
     pufferl.profile.accum[PROF_ROLLOUT] += sec * 1000.0f;  // store as ms
