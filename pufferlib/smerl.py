@@ -1,15 +1,17 @@
-"""SMERL-like mode diversity for self-play training.
+"""Minimal multi-mode conditioning for self-play training.
 
-One policy, K persistent behavior modes. Modes are a property of primary-policy
-rollout rows (fixed for the run). A discriminator is trained to predict z from
-pre-mode encoder features, and a small diversity bonus is paid only to modes
-that clear heldout competence gates.
+One shared policy, K persistent behavior modes. Each primary rollout row is
+assigned a fixed mode z for the run. The policy is conditioned by:
 
-Robocode adaptation (v1 target):
-  - 1v1, so each primary agent row gets its own mode (no team sharing).
-  - Heldout score is winrate vs scripted eval bots (`puffer eval_bot`), not
-    vs a frozen checkpoint anchor.
-  - Default-off; requires selfplay.enabled and env_name == 'robocode'.
+    h = encoder(obs) + embed[z]
+
+Embeds train with PPO (Adam, embed_lr). No discriminator, no diversity reward,
+no action-distance loss, no competence gates affecting training.
+
+Optional mid-train heldout vs scripted bots is metrics-only (default off:
+eval_interval_steps = 0). Manual eval still uses --smerl.force-mode.
+
+Requires selfplay.enabled and env_name == 'robocode'.
 """
 from __future__ import annotations
 
@@ -44,7 +46,7 @@ def enabled(args):
 
 
 def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
-    """Initialize modes/gates and native buffers. No-op unless smerl.enabled."""
+    """Initialize mode layout + native embeds. No-op unless smerl.enabled."""
     cfg = _cfg(args)
     if not cfg.get('enabled', 0):
         return None
@@ -56,7 +58,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
     env_name = args.get('env_name')
     if env_name != 'robocode':
         raise RuntimeError(
-            f'smerl v1 only supports env_name=robocode (got {env_name!r})')
+            f'smerl only supports env_name=robocode (got {env_name!r})')
     if not args.get('selfplay', {}).get('enabled', 0):
         raise RuntimeError('smerl requires selfplay.enabled = 1')
 
@@ -64,11 +66,13 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
     if num_modes < 2:
         raise RuntimeError('smerl.num_modes must be >= 2')
 
-    heldout_bots = _parse_bot_list(cfg.get('heldout_bots', '3'))
-    if not heldout_bots:
+    # Heldout bots optional — only needed if eval_interval_steps > 0.
+    heldout_bots = _parse_bot_list(cfg.get('heldout_bots', ''))
+    eval_interval_steps = int(cfg.get('eval_interval_steps', 0))
+    if eval_interval_steps > 0 and not heldout_bots:
         raise RuntimeError(
-            "smerl.heldout_bots is empty — e.g. heldout_bots = '3,4,5' "
-            '(wave_surfer, hawk_on_fire, raiko)')
+            "smerl.eval_interval_steps > 0 requires heldout_bots "
+            "(e.g. heldout_bots = '3,4,5')")
 
     total_agents = int(args['vec']['total_agents'])
     num_buffers = int(args['vec']['num_buffers'])
@@ -91,14 +95,9 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
         raise RuntimeError('smerl: no primary rows left after frozen banks')
 
     rank = int(args.get('rank', 0))
-    # Deterministic mode layout — no RNG. Numpy Generator.shuffle is seeded but
-    # still a footgun (version drift, accidental unseeded paths). Stripe modes
-    # across primary rows; offset by buffer index so buffers are not identical.
-    # Matches "fixed z per row for the run" and is bit-stable given layout.
-    _ = rank  # reserved if we ever need rank-striped layouts in multi-GPU
+    _ = rank  # reserved for multi-GPU layout
 
-    # One mode per primary physical row. Frozen bank rows stay at sentinel -1
-    # (native leave them unconditioned and never pays them a bonus).
+    # One mode per primary physical row. Frozen bank rows stay at sentinel -1.
     modes = np.full(total_agents, -1, dtype=np.int32)
     for b in range(num_buffers):
         start = b * agents_per_buffer
@@ -106,6 +105,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
         modes[start:start + primary_per_buffer] = row_modes
     backend.set_smerl_modes(pufferl, modes)
 
+    # Gates unused in minimal mode; keep zeros for native buffer shape.
     gates = np.zeros(num_modes, dtype=np.int32)
     backend.set_smerl_gates(pufferl, gates)
 
@@ -113,7 +113,6 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
     if artifact_owner:
         os.makedirs(work_dir, exist_ok=True)
 
-    # Optional resume from a sidecar next to a loaded checkpoint.
     load_path = args.get('load_model_path')
     if load_path and load_path != 'latest':
         sidecar = load_path + '.smerl'
@@ -132,7 +131,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
         'activation_score': float(cfg.get('activation_score', 0.25)),
         'gate_enter_epsilon': float(cfg.get('gate_enter_epsilon', 0.03)),
         'gate_exit_epsilon': float(cfg.get('gate_exit_epsilon', 0.06)),
-        'eval_interval_steps': int(cfg.get('eval_interval_steps', 200_000_000)),
+        'eval_interval_steps': eval_interval_steps,
         'eval_games': int(cfg.get('eval_games', 4096)),
         'score_ema': float(cfg.get('score_ema', 0.8)),
         'heldout_bots': heldout_bots,
@@ -141,8 +140,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True, pool_state=None):
         'primary_per_buffer': primary_per_buffer,
         'agents_per_buffer': agents_per_buffer,
         'num_buffers': num_buffers,
-        # Cached logs from the last gating pass (merged into flat_logs by step).
-        'last_logs': {},
+        'last_logs': {'smerl/num_modes': float(num_modes)},
     }
     return state
 
@@ -155,10 +153,7 @@ def assign_modes(pufferl, backend, state):
 
 
 def update_gates(scores, gates, activation_score, enter_eps, exit_eps):
-    """Two-stage heldout gating with hysteresis.
-
-    Returns a new int32 gate array (0/1). Pure function for unit testing.
-    """
+    """Legacy pure helper (tests). Gates do not affect minimal training."""
     scores = np.asarray(scores, dtype=np.float64)
     gates = np.asarray(gates, dtype=np.int32).copy()
     K = len(scores)
@@ -191,15 +186,12 @@ def _heldout_eval_mode(env_name, policy_path, mode, bots, eval_games, base_args,
         eval_args['env_name'] = env_name
         eval_args.setdefault('env', {})
         eval_args['env']['bot_policy'] = int(bot)
-        # Keep SMERL on so force_mode / sidecar load work; disable selfplay.
         eval_args.setdefault('smerl', {})
         eval_args['smerl'] = dict(eval_args.get('smerl') or {})
         eval_args['smerl']['enabled'] = 1
         eval_args['smerl']['force_mode'] = int(mode)
-        # Inherit num_modes etc. from training config so native arch matches.
         eval_args.setdefault('selfplay', {})['enabled'] = 0
         eval_args['skip_match_close'] = False
-        # Quiet heldout by default — training logs already show gate updates.
         logs = eval_bot(
             env_name,
             policy_path=policy_path,
@@ -213,8 +205,10 @@ def _heldout_eval_mode(env_name, policy_path, mode, bots, eval_games, base_args,
 
 
 def run_heldout_eval(pufferl, backend, args, state, verbose=False):
-    """Evaluate every mode vs heldout bots, update EMA scores and gates."""
+    """Optional metrics-only heldout (does not change training)."""
     if state is None or not state.get('artifact_owner', True):
+        return
+    if not state.get('heldout_bots'):
         return
 
     env_name = args['env_name']
@@ -237,40 +231,34 @@ def run_heldout_eval(pufferl, backend, args, state, verbose=False):
             state['scores'][z] = raw[z]
             state['score_initialized'][z] = True
 
+    # Gates logged for dashboards only — not pushed as training signals.
     state['gates'] = update_gates(
         state['scores'], state['gates'],
         state['activation_score'],
         state['gate_enter_epsilon'],
         state['gate_exit_epsilon'],
     )
-    backend.set_smerl_gates(pufferl, state['gates'])
-    # Restore training mode assignment (force_mode only touched the eval pufferl,
-    # but be explicit in case a future path reuses the train instance).
     assign_modes(pufferl, backend, state)
 
     best = float(np.max(state['scores']))
     state['last_logs'] = {
-        'smerl/active': 1.0 if best >= state['activation_score'] else 0.0,
-        'smerl/gated_modes': float(np.sum(state['gates'])),
+        'smerl/num_modes': float(K),
         'smerl/best_heldout': best,
     }
     for z in range(K):
         state['last_logs'][f'smerl/heldout_score_mode_{z}'] = float(state['scores'][z])
-        state['last_logs'][f'smerl/gate_mode_{z}'] = float(state['gates'][z])
         state['last_logs'][f'smerl/raw_heldout_mode_{z}'] = float(raw[z])
 
 
 def step(pufferl, backend, args, state, flat_logs):
-    """Periodic heldout eval + gate update. Merges smerl/* into flat_logs."""
+    """Optional periodic heldout metrics. Merges smerl/* into flat_logs."""
     if state is None:
         return
 
-    # Always surface last known gate state + native disc metrics.
     if state.get('last_logs'):
         flat_logs.update(state['last_logs'])
     else:
-        flat_logs.setdefault('smerl/active', 0.0)
-        flat_logs.setdefault('smerl/gated_modes', 0.0)
+        flat_logs.setdefault('smerl/num_modes', float(state.get('num_modes', 0)))
 
     if not state.get('artifact_owner', True):
         return

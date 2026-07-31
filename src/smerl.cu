@@ -1,20 +1,14 @@
-// SMERL-like mode diversity. One policy, K persistent behavior modes.
+// Minimal multi-mode conditioning. One policy, K persistent behavior modes.
 //
 // A mode z is a property of a *rollout row*, fixed for the run — not resampled
-// per episode. That choice is load-bearing: prio_replay samples whole segments
-// (one row's full horizon), so the train-time mode of minibatch row j is just
-// mode_ids[idx[j]]. Per-episode z would instead need a per-timestep mode channel
-// threaded through the rollout buffer, the transpose, and select_copy.
+// per episode. Train-time mode of minibatch row j is mode_ids[idx[j]].
 //
-// Everything here lives outside the primary weight buffer. save_weights dumps a
-// flat fp32 blob and load_weights size-checks it exactly, so folding mode
-// embeddings into params_alloc would invalidate every existing checkpoint and
-// every frozen-bank / opponent-pool load. SMERL params get their own allocator
-// and a `.smerl` sidecar next to the checkpoint.
+// Forward: h = encoder(obs) + embed[z], then RNN / policy heads.
+// Embeds train via PPO backprop + Adam (embed_lr). No discriminator, no
+// diversity reward, no action-distance loss.
 //
-// Discriminator: linear map from pre-mode encoder features h -> K logits.
-// Trained with stop-grad CE (no backprop into the encoder). Diversity bonus is
-// applied to rollout rewards (gated per mode) using the same disc.
+// Params live outside the primary weight buffer (`.smerl` sidecar). Disc weight
+// slots remain in the sidecar for layout compatibility but are not trained.
 
 #ifndef PUFFERLIB_SMERL_CU
 #define PUFFERLIB_SMERL_CU
@@ -43,12 +37,11 @@ struct SmerlState {
     IntTensor mb_mode;      // [minibatch_segments] gathered per minibatch
     IntTensor gates;        // [num_modes] 1 = mode earns the diversity bonus
     FloatTensor adam_m, adam_v, adam_t;
-    // Diversity reward separated from env rewards (no [-1,1] clamp mixing).
-    // Rollout layout (T, B) matches pufferl.rollouts; train uses BT + GAE.
-    PrecisionTensor div_rewards_TB;   // [horizon, total_agents]
-    PrecisionTensor div_rewards_BT;   // [total_agents, horizon]
-    PrecisionTensor div_advantages;   // [total_agents, horizon]
-    PrecisionTensor zero_values;      // [total_agents, horizon] zeros for div GAE
+    // Unused legacy buffers (kept so alloc layout / older call sites stay safe).
+    PrecisionTensor div_rewards_TB;
+    PrecisionTensor div_rewards_BT;
+    PrecisionTensor div_advantages;
+    PrecisionTensor zero_values;
     int total_agents;
     int minibatch_segments;
     int horizon;
@@ -296,7 +289,6 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     s->div_rewards_BT = {.shape = {total_agents, horizon}};
     s->div_advantages = {.shape = {total_agents, horizon}};
     s->zero_values = {.shape = {total_agents, horizon}};
-
     alloc_register(&s->opt, &s->cond.embed_grad);
     alloc_register(&s->opt, &s->cond.disc_w_grad);
     alloc_register(&s->opt, &s->cond.disc_b_grad);
@@ -355,7 +347,6 @@ static void smerl_create(SmerlState* s, const SmerlConfig& cfg, int hidden,
     // zero_values stays zero for div GAE (never written after create).
     cudaMemset(s->zero_values.data, 0, numel(s->zero_values.shape) * sizeof(precision_t));
     cudaMemset(s->div_rewards_TB.data, 0, numel(s->div_rewards_TB.shape) * sizeof(precision_t));
-    // disc_train_fn / write_div_fn bound after their definitions below.
     cudaDeviceSynchronize();
 }
 
@@ -380,22 +371,15 @@ static void smerl_optim_step(SmerlState* s, cudaStream_t stream) {
     int disc_w_n = K * H;
     int disc_b_n = K;
 
+    // v2: only mode embeds are optimized. Disc weights stay in the sidecar for
+    // layout compatibility but are not trained (action-distance replaces CE).
     smerl_adam_kernel<<<grid_size(embed_n), BLOCK_SIZE, 0, stream>>>(
         s->cond.embed.data, s->cond.embed_grad.data,
         s->adam_m.data, s->adam_v.data, s->adam_t.data,
         s->cfg.embed_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, embed_n);
 
-    smerl_adam_kernel<<<grid_size(disc_w_n), BLOCK_SIZE, 0, stream>>>(
-        s->cond.disc_w.data, s->cond.disc_w_grad.data,
-        s->adam_m.data + embed_n, s->adam_v.data + embed_n, s->adam_t.data,
-        s->cfg.disc_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, disc_w_n);
-
-    smerl_adam_kernel<<<grid_size(disc_b_n), BLOCK_SIZE, 0, stream>>>(
-        s->cond.disc_b.data, s->cond.disc_b_grad.data,
-        s->adam_m.data + embed_n + disc_w_n, s->adam_v.data + embed_n + disc_w_n,
-        s->adam_t.data,
-        s->cfg.disc_lr, s->cfg.beta1, s->cfg.beta2, s->cfg.eps, disc_b_n);
-
+    (void)disc_w_n;
+    (void)disc_b_n;
     cudaMemsetAsync(s->cond.embed_grad.data, 0, embed_n * sizeof(float), stream);
     cudaMemsetAsync(s->cond.disc_w_grad.data, 0, disc_w_n * sizeof(float), stream);
     cudaMemsetAsync(s->cond.disc_b_grad.data, 0, disc_b_n * sizeof(float), stream);
@@ -430,56 +414,10 @@ static void smerl_force_mode(SmerlState* s, int mode) {
     free(mb);
 }
 
-// Disc CE train step on a pre-mode feature batch h shaped (N, H) flat, with
-// mode_ids length N/TT. Stop-grad into h.
-// Path: cast h -> f32 GEMM logits -> CE grads g -> GEMM dW += g^T @ h, db += sum g.
-// Avoids the previous N*K*H atomicAdd storm that cut train SPS roughly in half.
-static void smerl_disc_train(SmerlCond* c, PrecisionTensor h, int N, int TT,
-        cudaStream_t stream) {
-    if (c == nullptr || c->mode_ids == nullptr || N <= 0) return;
-    if (N > c->max_rows) return;
-    if (TT < 1) TT = 1;
-    int H = c->hidden;
-    int K = c->num_modes;
-
-    smerl_disc_logits(c, h, N, stream);
-    smerl_disc_ce_grads<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
-        c->disc_g.data, c->disc_logits.data, c->mode_ids,
-        c->row_loss.data, c->row_hit.data, c->row_valid.data, N, TT, K);
-    smerl_reduce_metrics<<<1, 1, 0, stream>>>(
-        c->row_loss.data, c->row_hit.data, c->row_valid.data,
-        c->disc_loss_acc.data, c->disc_acc_acc.data, c->disc_n_acc.data, N);
-    // dW[K, H] += g[N, K]^T @ h_fp32[N, H]
-    smerl_f32_gemm(CUBLAS_OP_T, CUBLAS_OP_N, K, H, N,
-        c->disc_g.data, c->h_fp32.data, c->disc_w_grad.data, stream,
-        /*alpha=*/1.0f, /*beta=*/1.0f);
-    smerl_disc_bias_grad<<<grid_size(K), BLOCK_SIZE, 0, stream>>>(
-        c->disc_b_grad.data, c->disc_g.data, N, K);
-}
-
-// Write pure r_div into cond.div_out for this rollout slice. Env rewards untouched.
-// No-ops when all gates are off (common before activation_score is reached).
-static void smerl_write_div(SmerlCond* c, PrecisionTensor h, int N, cudaStream_t stream) {
-    if (c == nullptr || c->div_out == nullptr || c->mode_ids == nullptr) return;
-    if (c->bonus_coef == 0.0f || !c->any_gate_on || N <= 0) {
-        if (c->div_out != nullptr && N > 0) {
-            cudaMemsetAsync(c->div_out, 0, N * sizeof(precision_t), stream);
-        }
-        return;
-    }
-    if (N > c->max_rows) return;
-    int K = c->num_modes;
-    float log_k = logf((float)K);
-    smerl_disc_logits(c, h, N, stream);
-    smerl_write_div_from_logits<<<grid_size(N), BLOCK_SIZE, 0, stream>>>(
-        c->div_out, c->disc_logits.data, c->mode_ids, c->gates,
-        c->bonus_coef, log_k, N, K);
-}
-
-// Wire function pointers after definitions (models.cu cannot name these).
+// Minimal: no disc / r_div hooks.
 static void smerl_bind_hooks(SmerlState* s) {
-    s->cond.disc_train_fn = smerl_disc_train;
-    s->cond.write_div_fn = smerl_write_div;
+    s->cond.disc_train_fn = nullptr;
+    s->cond.write_div_fn = nullptr;
 }
 
 // Zero the full (T,B) diversity reward buffer (call at the start of each rollout).
@@ -552,22 +490,11 @@ static void smerl_load(SmerlState* s, const char* path) {
         cudaMemcpyHostToDevice);
 }
 
-// Pull disc metrics to host and zero the accumulators.
+// Legacy metric hook (always zeros — disc / action-div removed).
 static void smerl_pop_disc_metrics(SmerlState* s, float* loss_out, float* acc_out) {
-    float loss = 0, acc = 0, n = 0;
-    cudaMemcpy(&loss, s->cond.disc_loss_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&acc, s->cond.disc_acc_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&n, s->cond.disc_n_acc.data, sizeof(float), cudaMemcpyDeviceToHost);
-    if (n > 0) {
-        *loss_out = loss / n;
-        *acc_out = acc / n;
-    } else {
-        *loss_out = 0.0f;
-        *acc_out = 0.0f;
-    }
-    cudaMemset(s->cond.disc_loss_acc.data, 0, sizeof(float));
-    cudaMemset(s->cond.disc_acc_acc.data, 0, sizeof(float));
-    cudaMemset(s->cond.disc_n_acc.data, 0, sizeof(float));
+    (void)s;
+    *loss_out = 0.0f;
+    *acc_out = 0.0f;
 }
 
 #endif  // PUFFERLIB_SMERL_CU

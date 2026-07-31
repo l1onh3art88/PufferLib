@@ -763,13 +763,8 @@ static PrecisionTensor mingru_backward(void* w, PrecisionTensor grad, void* acti
 //
 // mode_ids is indexed by rollout row, not by flat (row, t): one z per row, held
 // fixed for the run. Rows with z outside [0, num_modes) are left unconditioned
-// — that is the sentinel for frozen-bank rows. Frozen banks additionally leave
-// Policy.smerl NULL, so they never reach this path at all.
-//
-// Discriminator fields (disc_*) and bonus_rewards are filled by smerl_create.
-// Disc train / bonus kernels live in smerl.cu and are called from the policy
-// forward hooks below via function pointers set at create time — keeps the
-// include order (models.cu before smerl.cu) acyclic.
+// — that is the sentinel for frozen-bank rows. Frozen banks leave Policy.smerl
+// NULL. Minimal path: embed add only (legacy disc_* fields remain for sidecar).
 struct SmerlCond {
     FloatTensor embed;       // [num_modes, hidden] fp32 params
     FloatTensor embed_grad;  // [num_modes, hidden] fp32 grads
@@ -839,19 +834,10 @@ __global__ void smerl_embed_backward(const precision_t* __restrict__ grad_h,
 
 // h is (B*TT, hidden) in train and (B, hidden) in rollout; TT disambiguates.
 // Sized off numel so a {B, TT, H} shape works the same as {B_TT, H}.
-// Pre-mode features: disc train / bonus run before the embedding is added.
+// Minimal SMERL: only mode embedding add (no disc / r_div).
 static inline void smerl_condition(SmerlCond* s, PrecisionTensor h, int TT, cudaStream_t stream) {
     if (s == nullptr || s->mode_ids == nullptr) return;
     int n = (int)numel(h.shape);
-    int N = n / s->hidden;
-    if (s->write_div_fn != nullptr && s->div_out != nullptr) {
-        // Rollout: store r_div in the separate diversity buffer (not env rewards).
-        s->write_div_fn(s, h, N, stream);
-    }
-    if (s->disc_train_fn != nullptr && s->div_out == nullptr) {
-        // Train path only: disc CE on pre-mode features.
-        s->disc_train_fn(s, h, N, TT, stream);
-    }
     smerl_add_embed<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
         h.data, s->embed.data, s->mode_ids, n, TT, s->hidden, s->num_modes);
 }

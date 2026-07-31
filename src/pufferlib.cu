@@ -1662,26 +1662,7 @@ void train_impl(PuffeRL& pufferl) {
             zero_frozen_advantages_cuda(advantages_puf, apb,
                 pufferl.bank_layout[1], train_stream);
         }
-        // Separate diversity advantages: GAE on r_div with V=0 (does not touch
-        // task advantages or value targets). Mixed into mb_advantages after
-        // select_copy so returns stay V + A_task.
-        if (pufferl.smerl != NULL && pufferl.smerl->cond.any_gate_on
-                && pufferl.smerl->cfg.bonus_coef != 0.0f) {
-            int Td = pufferl.smerl->horizon;
-            int Bd = pufferl.smerl->total_agents;
-            transpose_102<<<grid_size(Td * Bd), BLOCK_SIZE, 0, train_stream>>>(
-                pufferl.smerl->div_rewards_BT.data, pufferl.smerl->div_rewards_TB.data,
-                Td, Bd, 1);
-            puff_advantage_cuda(pufferl.smerl->zero_values, pufferl.smerl->div_rewards_BT,
-                rollouts.terminals, rollouts.ratio, pufferl.smerl->div_advantages,
-                hypers.gamma, hypers.gae_lambda,
-                hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
-            if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL) {
-                int apb = hypers.total_agents / hypers.num_buffers;
-                zero_frozen_advantages_cuda(pufferl.smerl->div_advantages, apb,
-                    pufferl.bank_layout[1], train_stream);
-            }
-        }
+        // SMERL minimal: mode embeds only (no r_div / action-distance).
         profile_end(hypers.profile);
 
         profile_begin("compute_prio", hypers.profile);
@@ -1713,12 +1694,6 @@ void train_impl(PuffeRL& pufferl) {
                 pufferl.smerl->mb_mode.data, pufferl.smerl->mode_ids.data,
                 pufferl.prio_bufs.idx.data, mb_segs);
             pufferl.smerl->cond.mode_ids = pufferl.smerl->mb_mode.data;
-            // Policy advantages become A_task + A_div; value targets unchanged.
-            if (pufferl.smerl->cond.any_gate_on && pufferl.smerl->cfg.bonus_coef != 0.0f) {
-                smerl_add_div_to_mb_adv<<<mb_segs, BLOCK_SIZE, 0, train_stream>>>(
-                    graph.mb_advantages.data, pufferl.smerl->div_advantages.data,
-                    pufferl.prio_bufs.idx.data, mb_segs, pufferl.smerl->horizon);
-            }
         }
         profile_end(hypers.profile);
 

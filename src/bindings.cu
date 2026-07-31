@@ -56,13 +56,10 @@ pybind11::dict puf_log(pybind11::object pufferl_obj) {
     cudaMemset(pufferl.losses_puf.data, 0, numel(pufferl.losses_puf.shape) * sizeof(float));
     result["loss"] = losses_dict;
 
-    // SMERL disc metrics (no-op when disabled)
+    // Minimal SMERL: no disc / action-div train metrics.
     if (pufferl.smerl != nullptr) {
-        float disc_loss = 0.0f, disc_acc = 0.0f;
-        smerl_pop_disc_metrics(pufferl.smerl, &disc_loss, &disc_acc);
         pybind11::dict smerl_dict;
-        smerl_dict["disc_loss"] = disc_loss;
-        smerl_dict["disc_acc"] = disc_acc;
+        smerl_dict["num_modes"] = (float)pufferl.smerl->cfg.num_modes;
         result["smerl"] = smerl_dict;
     }
 
