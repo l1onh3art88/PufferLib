@@ -29,6 +29,7 @@ typedef enum {
     BOT_WAVE_SURFER   = 3,
     BOT_HAWK_ON_FIRE  = 4,
     BOT_RAIKO         = 5,
+    BOT_DRUSSGT       = 6,
 } BotPolicy;
 
 #define WS_NUM_WAVES        8
@@ -74,6 +75,23 @@ typedef struct {
     int active;
 } RBRaikoWave;
 
+// DrussGT adaptation sizes / wave type (agent_drussgt.h uses the same names).
+#ifndef DGT_WAVES
+#define DGT_WAVES        12
+#define DGT_KNN_CAP     256
+#define DGT_GUN_CAP     256
+#define DGT_FEATS         6
+#endif
+typedef struct {
+    float ox, oy;
+    float head_on;
+    float speed;
+    int   fire_tick;
+    int   lat_sign;
+    float feats[DGT_FEATS];
+    int   active;
+} DGTWave;
+
 struct BotMem {
     int    tick;
     int    orbit_dir;            // -1, 0, +1
@@ -110,10 +128,37 @@ struct BotMem {
     int    raiko_wave_head;
     int    raiko_guess[RAIKO_DIST_BINS][RAIKO_GF_BINS];
     RBRaikoWave raiko_waves[RAIKO_WAVES];
+
+    // DrussGT adaptation (agent_drussgt.h). Only used when bot_policy == BOT_DRUSSGT.
+    int    dgt_initialized;
+    float  dgt_enemy_gunheat;
+    float  dgt_enemy_energy;
+    float  dgt_enemy_firepower;
+    float  dgt_lat_dir;
+    float  dgt_last_v;
+    float  dgt_goto_x, dgt_goto_y;
+    int    dgt_wave_head;
+    DGTWave dgt_waves[DGT_WAVES];
+    // Surf kNN
+    int    dgt_surf_n, dgt_surf_head;
+    float  dgt_surf_feats[DGT_KNN_CAP][DGT_FEATS];
+    float  dgt_surf_gf[DGT_KNN_CAP];
+    // Gun kNN
+    int    dgt_gun_n, dgt_gun_head;
+    float  dgt_gun_feats[DGT_GUN_CAP][DGT_FEATS];
+    float  dgt_gun_gf[DGT_GUN_CAP];
+    int    dgt_bullets_hit, dgt_bullets_passed;
+    int    dgt_last_fire_valid;
+    float  dgt_last_fire_x, dgt_last_fire_y;
+    float  dgt_last_fire_bearing;
+    float  dgt_last_fire_lat_dir;
+    float  dgt_last_fire_mea;
+    float  dgt_last_fire_feats[DGT_FEATS];
 };
 
 #include "agent_hawk_on_fire.h"
 #include "agent_raiko.h"
+#include "agent_drussgt.h"
 
 // ---- Lifetime ---------------------------------------------------------------
 static inline void bot_mems_alloc(Robocode* env) {
@@ -147,6 +192,10 @@ static inline void bot_mems_episode_reset(Robocode* env) {
         m->raiko_bearing_dir = m->raiko_bearing_dir == 0.0f ? 1.0f : m->raiko_bearing_dir;
         for (int wi = 0; wi < WS_NUM_WAVES; wi++) m->waves[wi].active = 0;
         for (int wi = 0; wi < RAIKO_WAVES; wi++) m->raiko_waves[wi].active = 0;
+        // DrussGT: clear wave / fire snapshot; keep kNN models across episodes.
+        m->dgt_initialized = 0;
+        m->dgt_last_fire_valid = 0;
+        for (int wi = 0; wi < DGT_WAVES; wi++) m->dgt_waves[wi].active = 0;
     }
 }
 
@@ -225,9 +274,13 @@ static inline void ws_add_sample(BotMem* m, const float feats[WS_NUM_FEATS], flo
 // sample to the kNN.
 static void bot_on_hit_by_bullet(Robocode* env, int bot_idx,
                                  float bullet_heading, float bullet_power) {
-    if (env->bot_policy != BOT_WAVE_SURFER) return;
     if (env->bot_mems == NULL) return;
     BotMem* m = &env->bot_mems[bot_idx - env->num_agents];
+    if (env->bot_policy == BOT_DRUSSGT) {
+        dgt_on_hit_by_bullet(m, bullet_heading, bullet_power);
+        return;
+    }
+    if (env->bot_policy != BOT_WAVE_SURFER) return;
     float speed = 20.0f - 3.0f * bullet_power;
     WSWave* best = NULL;
     int best_age = -1;
@@ -271,6 +324,10 @@ static void bot_step(Robocode* env, int bot_idx) {
     }
     if (env->bot_policy == BOT_RAIKO) {
         bot_raiko_step(env, bot_idx, m);
+        return;
+    }
+    if (env->bot_policy == BOT_DRUSSGT) {
+        bot_drussgt_step(env, bot_idx, m);
         return;
     }
 
