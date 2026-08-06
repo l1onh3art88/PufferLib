@@ -76,21 +76,38 @@ typedef struct {
 } RBRaikoWave;
 
 // DrussGT adaptation sizes / wave type (agent_drussgt.h uses the same names).
+// Sized for a strong in-fight DC gun + go-to surfer without full VCS buffers.
 #ifndef DGT_WAVES
-#define DGT_WAVES        12
-#define DGT_KNN_CAP     256
-#define DGT_GUN_CAP     256
-#define DGT_FEATS         6
+#define DGT_WAVES          16
+#define DGT_GUN_WAVES      24
+#define DGT_KNN_CAP       512
+#define DGT_GUN_CAP       512
+#define DGT_FEATS           8
+#define DGT_HIST           32
 #endif
 typedef struct {
     float ox, oy;
     float head_on;
     float speed;
+    float power;
     int   fire_tick;
     int   lat_sign;
     float feats[DGT_FEATS];
     int   active;
+    int   imaginary;   // gunheat wave (predicted) until confirmed
 } DGTWave;
+
+// Outgoing targeting waves (visit-count GF learning, Raiko/DrussGT style).
+typedef struct {
+    float ox, oy;
+    float abs_bearing;
+    float lat_dir;
+    float speed;
+    float mea;           // max escape angle (deg)
+    float dist_traveled;
+    float feats[DGT_FEATS];
+    int   active;
+} DGTGunWave;
 
 struct BotMem {
     int    tick;
@@ -130,30 +147,41 @@ struct BotMem {
     RBRaikoWave raiko_waves[RAIKO_WAVES];
 
     // DrussGT adaptation (agent_drussgt.h). Only used when bot_policy == BOT_DRUSSGT.
+    // kNN models persist across episodes (like raiko_guess); only per-round
+    // wave/gunheat state is cleared in bot_mems_episode_reset.
     int    dgt_initialized;
     float  dgt_enemy_gunheat;
     float  dgt_enemy_energy;
     float  dgt_enemy_firepower;
-    float  dgt_lat_dir;
-    float  dgt_last_v;
+    float  dgt_lat_dir;              // our lateral sign vs enemy
+    float  dgt_enemy_lat_dir;        // enemy lateral sign vs us
+    float  dgt_last_v;               // our last velocity (accel)
+    float  dgt_enemy_last_v;         // enemy last velocity
+    int    dgt_enemy_dir_change_tick;
+    int    dgt_enemy_decel_tick;
     float  dgt_goto_x, dgt_goto_y;
     int    dgt_wave_head;
     DGTWave dgt_waves[DGT_WAVES];
-    // Surf kNN
+    // Surf kNN (hit + flattener visits)
     int    dgt_surf_n, dgt_surf_head;
     float  dgt_surf_feats[DGT_KNN_CAP][DGT_FEATS];
     float  dgt_surf_gf[DGT_KNN_CAP];
-    // Gun kNN
+    // Gun kNN (wave-pass visit counts + hit boosts)
     int    dgt_gun_n, dgt_gun_head;
     float  dgt_gun_feats[DGT_GUN_CAP][DGT_FEATS];
     float  dgt_gun_gf[DGT_GUN_CAP];
-    int    dgt_bullets_hit, dgt_bullets_passed;
-    int    dgt_last_fire_valid;
-    float  dgt_last_fire_x, dgt_last_fire_y;
-    float  dgt_last_fire_bearing;
-    float  dgt_last_fire_lat_dir;
-    float  dgt_last_fire_mea;
-    float  dgt_last_fire_feats[DGT_FEATS];
+    int    dgt_gun_wave_head;
+    DGTGunWave dgt_gun_waves[DGT_GUN_WAVES];
+    int    dgt_bullets_hit, dgt_bullets_fired;
+    int    dgt_hits_taken, dgt_waves_passed;
+    // Enemy position history for dist-last-N feature
+    int    dgt_hist_n, dgt_hist_head;
+    float  dgt_hist_x[DGT_HIST];
+    float  dgt_hist_y[DGT_HIST];
+    // Self lateral velocity history for surf feature
+    float  dgt_lat_hist[10];
+    int    dgt_lat_hist_i;
+    float  dgt_current_gf;           // latest enemy GF for gun attribute
 };
 
 #include "agent_hawk_on_fire.h"
@@ -192,10 +220,16 @@ static inline void bot_mems_episode_reset(Robocode* env) {
         m->raiko_bearing_dir = m->raiko_bearing_dir == 0.0f ? 1.0f : m->raiko_bearing_dir;
         for (int wi = 0; wi < WS_NUM_WAVES; wi++) m->waves[wi].active = 0;
         for (int wi = 0; wi < RAIKO_WAVES; wi++) m->raiko_waves[wi].active = 0;
-        // DrussGT: clear wave / fire snapshot; keep kNN models across episodes.
+        // DrussGT: clear per-round wave/gunheat state; keep kNN models
+        // (and hit counters) across episodes — same idea as raiko_guess.
         m->dgt_initialized = 0;
-        m->dgt_last_fire_valid = 0;
         for (int wi = 0; wi < DGT_WAVES; wi++) m->dgt_waves[wi].active = 0;
+        for (int wi = 0; wi < DGT_GUN_WAVES; wi++) m->dgt_gun_waves[wi].active = 0;
+        m->dgt_hist_n = 0;
+        m->dgt_hist_head = 0;
+        m->dgt_lat_hist_i = 0;
+        for (int hi = 0; hi < 10; hi++) m->dgt_lat_hist[hi] = 0.0f;
+        m->dgt_current_gf = 0.0f;
     }
 }
 
