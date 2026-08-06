@@ -408,9 +408,16 @@ static void bot_drussgt_step(Robocode* env, int bot_idx, BotMem* m) {
     float max_escape = asinf(fminf(8.0f / bspeed, 1.0f)) * RB_R2D;
     float gf = dgt_gun_best_gf(gfeats, m->dgt_gun_feats, m->dgt_gun_gf, m->dgt_gun_n);
     float aim = abs_bearing + m->dgt_lat_dir * gf * max_escape;
-    // Blend a little linear lead when gun is cold (early fight).
+    // Blend linear lead from *last scan only* when gun kNN is cold.
+    // (Live env->robots[target] would cheat between scans.)
     if (m->dgt_gun_n < 8) {
-        aim = 0.65f * aim + 0.35f * rb_linear_aim_deg(bot, &env->robots[target_idx], bspeed);
+        float dt = dist / fmaxf(bspeed, 0.1f);
+        float tvx = cos_deg(m->last_heading) * m->last_v;
+        float tvy = sin_deg(m->last_heading) * m->last_v;
+        float lead = rb_abs_bearing_deg(
+            bot->x, bot->y,
+            m->last_x + tvx * dt, m->last_y + tvy * dt);
+        aim = 0.65f * aim + 0.35f * lead;
     }
     float gun_delta = rb_turn_gun_to(bot, aim);
     if (fabsf(gun_delta) < 2.5f && bot->gun_heat <= 0.0f && bot->energy > 1.0f

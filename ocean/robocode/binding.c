@@ -55,6 +55,11 @@ void my_init(Env* env, Dict* kwargs) {
     DictItem* dr_item = dict_get_unsafe(kwargs, "dr");
     env->dr = dr_item ? (float)dr_item->value : 0.0f;
     env->bot_policy = dict_get(kwargs, "bot_policy")->value;
+    {
+        DictItem* bp1 = dict_get_unsafe(kwargs, "bot_policy_1");
+        env->bot_policy_1 = bp1 ? (int)bp1->value : -1;
+    }
+    env->bot_match_winner = -2;
     init(env);
 }
 

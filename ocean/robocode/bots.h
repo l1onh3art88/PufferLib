@@ -267,6 +267,16 @@ static inline void ws_add_sample(BotMem* m, const float feats[WS_NUM_FEATS], flo
     if (m->knn_n < WS_KNN_CAP) m->knn_n++;
 }
 
+// Resolve which scripted policy this bot row runs. Supports bot-vs-bot with
+// two different policies via bot_policy / bot_policy_1 when num_agents == 0.
+static inline int bot_policy_for(Robocode* env, int bot_idx) {
+    int bi = bot_idx - env->num_agents;
+    if (env->num_agents == 0 && bi == 1 && env->bot_policy_1 >= 0) {
+        return env->bot_policy_1;
+    }
+    return env->bot_policy;
+}
+
 // ---- onHitByBullet ----------------------------------------------------------
 // Called from c_step when an enemy bullet hits a bot. The bullet's heading and
 // power are provided — same info Robocode's onHitByBullet event delivers.
@@ -276,11 +286,13 @@ static void bot_on_hit_by_bullet(Robocode* env, int bot_idx,
                                  float bullet_heading, float bullet_power) {
     if (env->bot_mems == NULL) return;
     BotMem* m = &env->bot_mems[bot_idx - env->num_agents];
-    if (env->bot_policy == BOT_DRUSSGT) {
+    // bot_idx is absolute robot index; resolve policy for multi-policy bouts.
+    int pol = bot_policy_for(env, bot_idx);
+    if (pol == BOT_DRUSSGT) {
         dgt_on_hit_by_bullet(m, bullet_heading, bullet_power);
         return;
     }
-    if (env->bot_policy != BOT_WAVE_SURFER) return;
+    if (pol != BOT_WAVE_SURFER) return;
     float speed = 20.0f - 3.0f * bullet_power;
     WSWave* best = NULL;
     int best_age = -1;
@@ -312,21 +324,22 @@ static void bot_step(Robocode* env, int bot_idx) {
     if (bot->energy < 0) return;
     if (bot->energy == 0) { bot->v = 0; return; }
     if (bot->gun_heat > 0) bot->gun_heat -= 0.1f;
-    if (env->bot_policy == BOT_STATIONARY) return;
+    int policy = bot_policy_for(env, bot_idx);
+    if (policy == BOT_STATIONARY) return;
 
     BotMem* m = &env->bot_mems[bot_idx - env->num_agents];
     m->tick++;
     if (m->orbit_dir == 0) m->orbit_dir = 1;
 
-    if (env->bot_policy == BOT_HAWK_ON_FIRE) {
+    if (policy == BOT_HAWK_ON_FIRE) {
         bot_hawk_on_fire_step(env, bot_idx, m);
         return;
     }
-    if (env->bot_policy == BOT_RAIKO) {
+    if (policy == BOT_RAIKO) {
         bot_raiko_step(env, bot_idx, m);
         return;
     }
-    if (env->bot_policy == BOT_DRUSSGT) {
+    if (policy == BOT_DRUSSGT) {
         bot_drussgt_step(env, bot_idx, m);
         return;
     }
@@ -399,10 +412,13 @@ static void bot_step(Robocode* env, int bot_idx) {
         // Detect target fire from energy drop BEFORE overwriting last_energy_seen.
         float drop = m->last_scan_tick > 0 ? (m->last_energy_seen - tgt->energy) : 0.0f;
         bool fired = (drop > 0.0f && drop <= 3.0f);
-        if (env->bot_policy == BOT_SURFER && fired) {
+        // policy already resolved for this bot_step call via outer switch for
+        // special bots; remaining shared path uses env->bot_policy (single-bot).
+        int pol = bot_policy_for(env, bot_idx);
+        if (pol == BOT_SURFER && fired) {
             m->orbit_dir = -m->orbit_dir;
             m->last_dir_change_tick = m->tick;
-        } else if (env->bot_policy == BOT_WAVE_SURFER && fired) {
+        } else if (pol == BOT_WAVE_SURFER && fired) {
             // Wave origin = target's PREVIOUS scanned position (where they
             // were the tick before they fired). speed inferred from drop.
             WSWave* w = &m->waves[m->wave_head];
@@ -429,7 +445,7 @@ static void bot_step(Robocode* env, int bot_idx) {
     if (m->last_scan_tick == 0) return;  // still hunting for first contact
 
     // ---- Wave-surfer: expire missed waves, then choose orbit direction ---
-    if (env->bot_policy == BOT_WAVE_SURFER) {
+    if (bot_policy_for(env, bot_idx) == BOT_WAVE_SURFER) {
         for (int wi = 0; wi < WS_NUM_WAVES; wi++) {
             WSWave* w = &m->waves[wi];
             if (!w->active) continue;

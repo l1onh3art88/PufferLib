@@ -141,7 +141,9 @@ struct Robocode {
     float reward_damage_taken_slot_1;
     float reward_range_damage_inflicted_slot_1;
     float dr;
-    int bot_policy;
+    int bot_policy;          // policy for bot index 0 (and sole bot when num_bots==1)
+    int bot_policy_1;        // policy for bot index 1 (bot-vs-bot tournaments)
+    int bot_match_winner;    // last pure-bot episode: 0/1 winner, -1 draw, -2 none
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
 
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
@@ -637,7 +639,12 @@ void c_step(Robocode* env) {
     // Timeout: all agents step in lockstep, so logs[0].episode_length is shared.
     env->tick += 1;
     if (env->tick > env->max_ticks) {
-        end_episode(env, 0);  // draw
+        if (env->num_agents == 0) {
+            env->bot_match_winner = -1;  // pure bot-vs-bot draw
+            c_reset(env);
+        } else {
+            end_episode(env, 0);  // draw
+        }
         return;
     }
 
@@ -722,14 +729,15 @@ void c_step(Robocode* env) {
 
                 bool s_agent = shooter < env->num_agents;
                 bool t_agent = j < env->num_agents;
-                if (!t_agent && s_agent) {
+                // onHitByBullet for scripted bot targets (agent→bot or bot→bot).
+                if (!t_agent) {
                     bot_on_hit_by_bullet(env, j, bullet->heading, bullet->firepower);
                 }
-                // DrussGT gun learning: bot's bullet hit an agent.
-                if (!s_agent && t_agent && env->bot_policy == BOT_DRUSSGT
-                        && env->bot_mems != NULL) {
+                // DrussGT gun learning when a bot's bullet hits anyone.
+                if (!s_agent && env->bot_mems != NULL) {
                     int bmem = shooter - env->num_agents;
-                    if (bmem >= 0 && bmem < env->num_bots) {
+                    if (bmem >= 0 && bmem < env->num_bots
+                            && bot_policy_for(env, shooter) == BOT_DRUSSGT) {
                         dgt_on_bullet_hit(&env->bot_mems[bmem], target->x, target->y);
                     }
                 }
@@ -834,8 +842,30 @@ void c_step(Robocode* env) {
             }
         }
         if (!any_bot_alive) {
-            end_episode(env, +1);
+            // All bots dead: agent wipe (if agents present) or bot-vs-bot draw.
+            if (env->num_agents == 0) {
+                env->bot_match_winner = -1;
+                c_reset(env);
+            } else {
+                end_episode(env, +1);
+            }
             return;
+        }
+        // Pure bot-vs-bot: end when only one bot remains.
+        if (env->num_agents == 0 && env->num_bots >= 2) {
+            int alive = 0;
+            int winner = -1;
+            for (int b = 0; b < env->num_bots; b++) {
+                if (env->robots[b].energy > 0.0f) {
+                    alive++;
+                    winner = b;
+                }
+            }
+            if (alive <= 1) {
+                env->bot_match_winner = (alive == 1) ? winner : -1;
+                c_reset(env);
+                return;
+            }
         }
     }
     compute_observations(env);
