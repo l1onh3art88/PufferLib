@@ -76,14 +76,15 @@ typedef struct {
 } RBRaikoWave;
 
 // DrussGT adaptation sizes / wave type (agent_drussgt.h uses the same names).
-// Sized for a strong in-fight DC gun + go-to surfer without full VCS buffers.
+// Sized for train SPS: short path-sim go-to + visit-count DC gun (not full
+// mega VCS). Caps stay moderate so agent-vs-bot stays >1M SPS.
 #ifndef DGT_WAVES
-#define DGT_WAVES          16
-#define DGT_GUN_WAVES      24
-#define DGT_KNN_CAP       512
-#define DGT_GUN_CAP       512
+#define DGT_WAVES          10
+#define DGT_GUN_WAVES      14
+#define DGT_KNN_CAP        96
+#define DGT_GUN_CAP       160
 #define DGT_FEATS           8
-#define DGT_HIST           32
+#define DGT_HIST           16
 #endif
 typedef struct {
     float ox, oy;
