@@ -93,5 +93,8 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "slot_1_score", log->slot_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
     dict_set(out, "bot_cl_noise", log->bot_cl_noise);
+    // CL-adjusted winrate: E[win_credit * (1 - noise_faced)]. Max 1 only when
+    // always winning with bot_cl_noise annealed to 0. Prefer as Protein metric.
+    dict_set(out, "cl_perf", log->cl_perf);
     dict_set(out, "n", log->n);
 }
