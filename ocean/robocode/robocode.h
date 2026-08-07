@@ -67,6 +67,8 @@ struct Log {
     float slot_0_score;
     float slot_1_score;
     float draw_rate;
+    // Curriculum: bot random-action probability at episode end (for logging).
+    float bot_cl_noise;
     float n;
 };
 
@@ -144,6 +146,13 @@ struct Robocode {
     int bot_policy;          // policy for bot index 0 (and sole bot when num_bots==1)
     int bot_policy_1;        // policy for bot index 1 (bot-vs-bot tournaments)
     int bot_match_winner;    // last pure-bot episode: 0/1 winner, -1 draw, -2 none
+    // Curriculum learning vs scripted bots: each bot tick, with probability
+    // bot_cl_noise, replace the bot policy with random discrete actions
+    // (same action tables as agents). On agent win (outcome +1) noise decays
+    // by bot_cl_decay until 0 = full-strength bot. Per-env so vectorized
+    // workers diversify difficulty as they win.
+    float bot_cl_noise;      // current random-action probability in [0, 1]
+    float bot_cl_decay;      // subtract from bot_cl_noise on each agent win
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
 
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
@@ -207,6 +216,7 @@ void add_log(Robocode* env) {
         env->log.melee_damage_inflicted  += env->logs[i].melee_damage_inflicted;
         env->log.damage_taken            += env->logs[i].damage_taken;
         env->log.range_damage_inflicted  += env->logs[i].range_damage_inflicted;
+        env->log.bot_cl_noise            += env->logs[i].bot_cl_noise;
         env->log.n                       += 1.0f;
     }
 }
@@ -629,6 +639,16 @@ static inline void end_episode(Robocode* env, int outcome) {
         env->log.hist_score                += s0_score;
         env->log.hist_n                    += 1.0f;
         env->boundary_reached = 1;
+    }
+    // Curriculum: agent beat the bot → harden bot (lower random action rate).
+    if (outcome > 0 && env->num_bots > 0 && env->bot_cl_decay > 0.0f
+            && env->bot_cl_noise > 0.0f) {
+        env->bot_cl_noise -= env->bot_cl_decay;
+        if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
+    }
+    // Snapshot noise level into per-agent logs for metrics (mean over episodes).
+    for (int a = 0; a < env->num_agents; a++) {
+        env->logs[a].bot_cl_noise = env->bot_cl_noise;
     }
     for (int a = 0; a < env->num_agents; a++) *env->terminal_ptr[a] = 1.0f;
     add_log(env);

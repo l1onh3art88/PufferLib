@@ -351,6 +351,41 @@ static void bot_on_hit_by_bullet(Robocode* env, int bot_idx,
     best->active = 0;
 }
 
+// Curriculum random bot: sample from the same discrete action tables agents use.
+// Called when rand_unit(env) < env->bot_cl_noise instead of the scripted policy.
+static void bot_random_step(Robocode* env, int bot_idx) {
+    Robot* bot = &env->robots[bot_idx];
+    float move_atn = ACCEL_VALUES[rand_r(&env->rng) % 4];
+    move(env, bot, move_atn);
+
+    float turn_atn = TURN_VALUES[rand_r(&env->rng) % 9];
+    float max_turn = 10.0f - 0.75f * fabsf(bot->v);
+    if (max_turn < 0.0f) max_turn = 0.0f;
+    float body = turn(&bot->heading, turn_atn, max_turn, 0.0f);
+
+    float gun_atn = GUN_TURN_VALUES[rand_r(&env->rng) % 11];
+    float gun = turn(&bot->gun_heading, gun_atn, 20.0f, body);
+
+    float radar_atn = RADAR_TURN_VALUES[rand_r(&env->rng) % 11];
+    bot->radar_heading_prev = bot->radar_heading;
+    turn(&bot->radar_heading, radar_atn, 45.0f, body + gun);
+
+    float firepower = FIREPOWER_VALUES[rand_r(&env->rng) % 6];
+    if (firepower > 0.0f) {
+        fire(env, bot, bot_idx, firepower);
+    }
+
+    float px = bot->x, py = bot->y;
+    bot->x = fmaxf(16.0f, fminf(bot->x, env->width - 16.0f));
+    bot->y = fmaxf(16.0f, fminf(bot->y, env->height - 16.0f));
+    if (bot->x != px || bot->y != py) {
+        float wall_dmg = fabsf(bot->v) * 0.5f - 1.0f;
+        if (wall_dmg < 0.0f) wall_dmg = 0.0f;
+        bot->energy -= wall_dmg;
+        bot->v = 0.0f;
+    }
+}
+
 // ---- Main entry -------------------------------------------------------------
 static void bot_step(Robocode* env, int bot_idx) {
     Robot* bot = &env->robots[bot_idx];
@@ -365,6 +400,12 @@ static void bot_step(Robocode* env, int bot_idx) {
     BotMem* m = &env->bot_mems[bot_idx - env->num_agents];
     m->tick++;
     if (m->orbit_dir == 0) m->orbit_dir = 1;
+
+    // Curriculum: randomly replace scripted policy with discrete noise.
+    if (env->bot_cl_noise > 0.0f && rand_unit(env) < env->bot_cl_noise) {
+        bot_random_step(env, bot_idx);
+        return;
+    }
 
     if (policy == BOT_HAWK_ON_FIRE) {
         bot_hawk_on_fire_step(env, bot_idx, m);

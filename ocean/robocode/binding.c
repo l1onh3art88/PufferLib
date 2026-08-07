@@ -59,6 +59,13 @@ void my_init(Env* env, Dict* kwargs) {
         DictItem* bp1 = dict_get_unsafe(kwargs, "bot_policy_1");
         env->bot_policy_1 = bp1 ? (int)bp1->value : -1;
     }
+    // Curriculum vs bots: fraction of ticks with random bot actions, decays
+    // by bot_cl_decay on each agent win until 0 (full bot). Defaults off.
+    env->bot_cl_noise = dict_get_float_default(kwargs, "bot_cl_noise", 0.0f);
+    if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
+    if (env->bot_cl_noise > 1.0f) env->bot_cl_noise = 1.0f;
+    env->bot_cl_decay = dict_get_float_default(kwargs, "bot_cl_decay", 0.0f);
+    if (env->bot_cl_decay < 0.0f) env->bot_cl_decay = 0.0f;
     env->bot_match_winner = -2;
     init(env);
 }
@@ -85,5 +92,6 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "slot_0_score", log->slot_0_score);
     dict_set(out, "slot_1_score", log->slot_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
+    dict_set(out, "bot_cl_noise", log->bot_cl_noise);
     dict_set(out, "n", log->n);
 }
