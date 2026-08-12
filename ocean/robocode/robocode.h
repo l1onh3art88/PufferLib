@@ -175,7 +175,9 @@ struct Robocode {
 
     // Opponent mix (option 2): heterogeneous envs in one vec.
     // mix_enabled=0 → use num_agents/num_bots/bot_policy from kwargs as today.
-    // mix_enabled=1 → my_init assigns BOT / SP / HIST from env index (rng at init).
+    // mix_enabled=1 → my_init assigns BOT / SP / HIST from mix_id (env index
+    // hash). mix_id is separate from rng so composition never consumes or
+    // reseeds the episode RNG stream (matches stock vecenv: seed = env index).
     int mix_enabled;
     int mix_mode;            // ROBOCODE_MIX_* for this env
     int mix_bot_pct;         // percent of envs that are agent-vs-bot [0,100]
@@ -184,6 +186,8 @@ struct Robocode {
     int mix_bot_policy_a;    // e.g. 3
     int mix_bot_policy_b;    // e.g. 6
     int mix_bot_a_pct;       // percent of *bot envs* using policy_a (rest policy_b)
+    // Set by my_vec_init before my_init; used only for mix composition hash.
+    unsigned int mix_id;
 
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
     // policy). tag = 1..ROBOCODE_MAX_BANKS means historical: slot 0 = primary,
