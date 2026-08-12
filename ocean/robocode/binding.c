@@ -234,12 +234,20 @@ void my_log(Log* log, Dict* out) {
     // CL-adjusted winrate: E[win_credit * (1 - noise_faced)]. Max 1 only when
     // always winning with bot_cl_noise annealed to 0. Prefer as Protein metric.
     dict_set(out, "cl_perf", log->cl_perf);
-    // Opponent-mix WR: use score/n (ratio invariant under aggregate /N).
+    // Opponent-mix accumulators (ratio score/n invariant under aggregate /N).
     dict_set(out, "mix_bot_score", log->mix_bot_score);
     dict_set(out, "mix_bot_n", log->mix_bot_n);
     dict_set(out, "mix_sp_score", log->mix_sp_score);
     dict_set(out, "mix_sp_n", log->mix_sp_n);
     dict_set(out, "mix_hist_score", log->mix_hist_score);
     dict_set(out, "mix_hist_n", log->mix_hist_n);
+    // Bot-only winrate for sweep/Protein: not a Log field (would break under /n).
+    // score/n after aggregate equals raw sum_score/sum_n.
+    {
+        float mix_bot_wr = 0.0f;
+        if (log->mix_bot_n > 1e-12f)
+            mix_bot_wr = log->mix_bot_score / log->mix_bot_n;
+        dict_set(out, "mix_bot_wr", mix_bot_wr);
+    }
     dict_set(out, "n", log->n);
 }
