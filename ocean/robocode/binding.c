@@ -71,19 +71,25 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     while (agents_created < primary_cap) {
         int remaining = primary_cap - agents_created;
         unsigned int seed = (unsigned int)num_envs;
-        // Last primary slot: force bot composition (id 0) so we take 1 agent
-        // instead of a 2-agent SP/hist that would overshoot. Episode seed stays
-        // `seed` after my_init (see restore below).
+        // Composition id for mix hash (read as env->rng inside my_init).
+        // Must equal env index for bit-parity with hardcode (rng % 10)==0.
+        // ONLY override when the last primary seat would become a 2-agent
+        // SP/hist env (r >= bot_pct) — force bot bucket so we fit 1 agent.
+        // Bug in prior refactor: always compose=0 when remaining==1 under mix,
+        // which remapped the last env to index 0 (wrong bot policy / stream).
         unsigned int compose = seed;
         if (mix_on && remaining == 1) {
-            if (bot_pct <= 0) break;
-            compose = 0;
+            int r = (int)(seed % 100u);
+            if (r >= bot_pct) {
+                if (bot_pct <= 0) break;  // pure 2-agent, cannot fill 1 seat
+                compose = 0;              // force bot (1 agent)
+            }
         }
 
         srand((int)seed);
         envs[num_envs].rng = compose;
         my_init(&envs[num_envs], env_kwargs);
-        envs[num_envs].rng = seed;  // stock episode seed (no-op if compose==seed)
+        envs[num_envs].rng = seed;  // episode seed = env index (stock)
 
         int n_ag = envs[num_envs].num_agents;
         if (n_ag < 1) n_ag = 1;
