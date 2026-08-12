@@ -163,6 +163,36 @@ def evict(pool, max_size):
     return pool[:half:2] + pool[half:]
 
 
+def mix_env_mode(env_idx, mix_bot_pct, mix_hist_pct):
+    '''Mirror ocean/robocode/binding.c mix_enabled composition (env index hash).
+
+    Returns 'bot' | 'hist' | 'sp'.'''
+    r = int(env_idx) % 100
+    bot_pct = max(0, min(100, int(mix_bot_pct)))
+    hist_pct = max(0, min(100 - bot_pct, int(mix_hist_pct)))
+    if r < bot_pct:
+        return 'bot'
+    if r < bot_pct + hist_pct:
+        return 'hist'
+    return 'sp'
+
+
+def simulate_mix_layout(total_agents, mix_bot_pct, mix_hist_pct):
+    '''Replay my_vec_init packing: create envs until agents_created >= total_agents.
+
+    Matches binding.c mix_enabled + vecenv my_vec_init loop.'''
+    envs = []
+    agents = 0
+    idx = 0
+    while agents < total_agents:
+        mode = mix_env_mode(idx, mix_bot_pct, mix_hist_pct)
+        n_ag = 1 if mode == 'bot' else 2
+        envs.append({'idx': idx, 'mode': mode, 'num_agents': n_ag})
+        agents += n_ag
+        idx += 1
+    return envs, agents
+
+
 def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_sizes, num_envs):
     '''Build env-slot -> rollout-row routing and per-env bank tag.
 
@@ -229,6 +259,97 @@ def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_sizes
                 h_within_buffer += 1
             env_idx += 1
     num_hist_envs_per_bank = [n * num_buffers for n in hist_envs_per_bank_per_buffer]
+    return perm, tags, num_hist_envs_per_bank
+
+
+def build_perm_tags_mixed(num_buffers, agents_per_buffer, env_specs, frozen_sizes):
+    '''Perm/tags for heterogeneous robocode mix (1-agent bot + 2-agent SP/hist).
+
+    env_specs: list of dicts with keys mode ('bot'|'sp'|'hist') and num_agents.
+    Order matches env creation order. Physical slots match vecenv packing:
+    within each buffer, envs are laid out at buf_start + offset (not a single
+    global contiguous pack across buffers). Identity routing by default; hist
+    envs' slot 1 is remapped into frozen banks (team_size=1).
+
+    Bot and live-SP envs keep tag=0. Hist envs get tag=bank+1. If there are
+    more hist envs than frozen capacity, extras are demoted to live SP (tag=0).
+    '''
+    num_envs = len(env_specs)
+    total_agents = num_buffers * agents_per_buffer
+    team_size = 1
+    num_banks = max(1, len(frozen_sizes))
+    total_frozen = sum(frozen_sizes) if frozen_sizes else 0
+    hist_cap_per_buffer = [max(0, fs // team_size) for fs in frozen_sizes] if frozen_sizes else [0]
+    hist_cap_total_per_buffer = sum(hist_cap_per_buffer)
+    primary_per_buffer = agents_per_buffer - total_frozen
+    if primary_per_buffer < 1:
+        primary_per_buffer = agents_per_buffer
+
+    # Assign envs to buffers (mirror binding.c / vecenv: pack by agent count
+    # against primary_per_buffer, not full agents_per_buffer).
+    env_buffer = [0] * num_envs
+    buf = 0
+    buf_agents = 0
+    for i, spec in enumerate(env_specs):
+        env_buffer[i] = buf
+        buf_agents += int(spec['num_agents'])
+        if buf_agents >= primary_per_buffer and buf < num_buffers - 1:
+            buf += 1
+            buf_agents = 0
+
+    # Slot base within each buffer (buf_start + local offset).
+    slot_base = [0] * num_envs
+    local_off = [0] * num_buffers
+    for i, spec in enumerate(env_specs):
+        b = env_buffer[i]
+        slot_base[i] = b * agents_per_buffer + local_off[b]
+        local_off[b] += int(spec['num_agents'])
+
+    perm = np.arange(total_agents, dtype=np.int32)
+    tags = np.zeros(num_envs, dtype=np.int32)
+
+    h_count = [0] * num_buffers
+    bank_h_count = [[0] * num_banks for _ in range(num_buffers)]
+    num_hist_envs_per_bank = [0] * num_banks
+
+    for i, spec in enumerate(env_specs):
+        mode = spec['mode']
+        n_ag = int(spec['num_agents'])
+        b_buf = env_buffer[i]
+        base = slot_base[i]
+        for s in range(n_ag):
+            perm[base + s] = base + s
+
+        if mode != 'hist' or n_ag < 2 or total_frozen <= 0:
+            tags[i] = 0
+            continue
+
+        if h_count[b_buf] >= hist_cap_total_per_buffer:
+            tags[i] = 0
+            continue
+
+        bank_idx = 0
+        while (bank_idx < num_banks - 1
+               and bank_h_count[b_buf][bank_idx] >= hist_cap_per_buffer[bank_idx]):
+            bank_idx += 1
+        if bank_h_count[b_buf][bank_idx] >= hist_cap_per_buffer[bank_idx]:
+            tags[i] = 0
+            continue
+
+        h_in_bank = bank_h_count[b_buf][bank_idx]
+        buf_start = b_buf * agents_per_buffer
+        bank_offset = buf_start + agents_per_buffer - total_frozen
+        for b in range(bank_idx):
+            bank_offset += frozen_sizes[b]
+        team_b_phys = bank_offset + h_in_bank * team_size
+
+        perm[base + 1] = team_b_phys
+        tags[i] = bank_idx + 1
+
+        bank_h_count[b_buf][bank_idx] += 1
+        h_count[b_buf] += 1
+        num_hist_envs_per_bank[bank_idx] += 1
+
     return perm, tags, num_hist_envs_per_bank
 
 
@@ -372,13 +493,8 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
     agents_per_buffer = total_agents // num_buffers
 
     num_envs = backend.num_envs(pufferl)
-    agents_per_env = total_agents // num_envs
-    if agents_per_env % 2 != 0:
-        raise RuntimeError(f'agents_per_env ({agents_per_env}) must be even (two equal teams)')
-    if agents_per_buffer % agents_per_env != 0:
-        raise RuntimeError(f'agents_per_buffer ({agents_per_buffer}) must be divisible by '
-                           f'agents_per_env ({agents_per_env})')
-    team_size = agents_per_env // 2
+    env_cfg = args.get('env', {})
+    mix_enabled = bool(int(float(env_cfg.get('mix_enabled', 0) or 0)))
 
     num_banks = int(args['vec'].get('num_frozen_banks', 1))
     if num_banks <= 0:
@@ -386,23 +502,104 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
     if num_banks > 8:
         raise RuntimeError(f'num_frozen_banks {num_banks} exceeds chess.h CHESS_MAX_BANKS=8')
 
-    # frozen_bank_pct is per-bank (matches C-side: pufferlib.cu:2069). Each bank
-    # gets floor(apb * pct) agents, total historical = num_banks * frozen_size.
-    frozen_size = int(agents_per_buffer * float(args['vec']['frozen_bank_pct']))
-    frozen_size -= frozen_size % team_size
-    if frozen_size <= 0:
-        raise RuntimeError('selfplay.enabled but frozen_bank_pct rounds to 0 slots '
-                           f'after team-size ({team_size}) alignment')
-    total_frozen = frozen_size * num_banks
-    if total_frozen >= agents_per_buffer // 2:
-        raise RuntimeError(f'total_frozen {total_frozen} (= num_banks {num_banks} '
-                           f'* per_bank {frozen_size}) >= apb/2 {agents_per_buffer//2}')
+    if mix_enabled:
+        # Heterogeneous robocode mix: 1-agent bot envs + 2-agent SP/hist.
+        mix_bot_pct = int(float(env_cfg.get('mix_bot_pct', 20) or 0))
+        mix_hist_pct = int(float(env_cfg.get('mix_hist_pct', 30) or 0))
+        frozen_size = int(agents_per_buffer * float(args['vec'].get('frozen_bank_pct', 0) or 0))
+        frozen_size = max(0, frozen_size)
+        team_size = 1
+        frozen_size -= frozen_size % team_size
+        if mix_hist_pct > 0 and frozen_size <= 0:
+            raise RuntimeError(
+                'mix_hist_pct > 0 requires vec.frozen_bank_pct > 0 and '
+                'num_frozen_banks >= 1 so historical envs have frozen opponents')
+        # No hist demand → no frozen banks (bot + live SP only).
+        if mix_hist_pct <= 0:
+            frozen_size = 0
+            num_banks = 0
+        frozen_sizes = [frozen_size] * max(num_banks, 1) if frozen_size > 0 else [0]
+        total_frozen = sum(frozen_sizes) if frozen_size > 0 else 0
+        if total_frozen >= agents_per_buffer // 2 and mix_hist_pct > 0:
+            raise RuntimeError(
+                f'total_frozen {total_frozen} (>= apb/2={agents_per_buffer//2}); '
+                f'lower frozen_bank_pct or num_frozen_banks')
 
-    frozen_sizes = [frozen_size] * num_banks
-    perm, tags, num_hist_envs_per_bank = build_perm_tags(
-        num_buffers, agents_per_buffer, agents_per_env, frozen_sizes, num_envs)
-    backend.set_agent_perm(pufferl, perm)
-    backend.set_env_tags(pufferl, tags)
+        # Replay C packing into primary capacity only.
+        primary_per_buffer = agents_per_buffer - total_frozen
+        if primary_per_buffer < 1:
+            primary_per_buffer = agents_per_buffer
+        primary_cap = primary_per_buffer * num_buffers
+        env_specs = []
+        agents_created = 0
+        idx = 0
+        while agents_created < primary_cap:
+            remaining = primary_cap - agents_created
+            id_for_mode = idx
+            if remaining == 1:
+                if mix_bot_pct > 0:
+                    id_for_mode = 0
+                else:
+                    break
+            mode = mix_env_mode(id_for_mode, mix_bot_pct, mix_hist_pct)
+            n_ag = 1 if mode == 'bot' else 2
+            if agents_created + n_ag > primary_cap:
+                break
+            env_specs.append({'idx': idx, 'mode': mode, 'num_agents': n_ag})
+            agents_created += n_ag
+            idx += 1
+
+        if len(env_specs) != num_envs:
+            raise RuntimeError(
+                f'mix layout mismatch: python simulated {len(env_specs)} envs, '
+                f'backend has {num_envs}. Check mix_* config matches binding.c.')
+
+        perm, tags, num_hist_envs_per_bank = build_perm_tags_mixed(
+            num_buffers, agents_per_buffer, env_specs,
+            frozen_sizes if frozen_size > 0 else [0])
+        backend.set_agent_perm(pufferl, perm)
+        backend.set_env_tags(pufferl, tags)
+        team_size = 1
+        if frozen_size <= 0:
+            # Bot + live SP only: no frozen banks to load.
+            num_hist_envs_per_bank = [0]
+            # Fall through to pool_state with empty banks — skip frozen loads.
+            num_banks = 0
+        n_bot = sum(1 for e in env_specs if e['mode'] == 'bot')
+        n_hist = int((tags > 0).sum())
+        n_sp = num_envs - n_bot - n_hist
+        print(f'[mix] envs={num_envs} bot={n_bot} live_sp≈{n_sp} hist={n_hist} '
+              f'(bot_pct={mix_bot_pct} hist_pct={mix_hist_pct})')
+    else:
+        agents_per_env = total_agents // num_envs
+        if agents_per_env % 2 != 0:
+            raise RuntimeError(
+                f'agents_per_env ({agents_per_env}) must be even (two equal teams)')
+        if agents_per_buffer % agents_per_env != 0:
+            raise RuntimeError(
+                f'agents_per_buffer ({agents_per_buffer}) must be divisible by '
+                f'agents_per_env ({agents_per_env})')
+        team_size = agents_per_env // 2
+
+        # frozen_bank_pct is per-bank (matches C-side: pufferlib.cu:2069). Each bank
+        # gets floor(apb * pct) agents, total historical = num_banks * frozen_size.
+        frozen_size = int(agents_per_buffer * float(args['vec']['frozen_bank_pct']))
+        frozen_size -= frozen_size % team_size
+        if frozen_size <= 0:
+            raise RuntimeError(
+                'selfplay.enabled but frozen_bank_pct rounds to 0 slots '
+                f'after team-size ({team_size}) alignment')
+        total_frozen = frozen_size * num_banks
+        if total_frozen >= agents_per_buffer // 2:
+            raise RuntimeError(
+                f'total_frozen {total_frozen} (= num_banks {num_banks} '
+                f'* per_bank {frozen_size}) >= apb/2 {agents_per_buffer//2}')
+
+        frozen_sizes = [frozen_size] * num_banks
+        perm, tags, num_hist_envs_per_bank = build_perm_tags(
+            num_buffers, agents_per_buffer, agents_per_env, frozen_sizes, num_envs)
+        backend.set_agent_perm(pufferl, perm)
+        backend.set_env_tags(pufferl, tags)
 
     pool_dir = os.path.join(args['checkpoint_dir'], args['env_name'], run_id, 'pool')
     state_path = shared_state_path(pool_dir)

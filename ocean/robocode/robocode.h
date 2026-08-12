@@ -73,8 +73,22 @@ struct Log {
     // After /n this is mean winrate discounted by noise. Max=1 only when
     // always winning against a fully annealed bot (noise=0). Protein target.
     float cl_perf;
+    // Opponent-mix win rates (ratio score/n is invariant under aggregate /N).
+    // BOT = agent vs scripted; SP = live selfplay; HIST = vs frozen bank.
+    float mix_bot_score;
+    float mix_bot_n;
+    float mix_sp_score;
+    float mix_sp_n;
+    float mix_hist_score;
+    float mix_hist_n;
     float n;
 };
+
+// mix_mode values (also used as env->mix_mode)
+#define ROBOCODE_MIX_OFF   0
+#define ROBOCODE_MIX_BOT   1
+#define ROBOCODE_MIX_SP    2
+#define ROBOCODE_MIX_HIST  3
 
 typedef struct Bullet Bullet;
 struct Bullet {
@@ -159,11 +173,24 @@ struct Robocode {
     float bot_cl_decay;      // subtract from bot_cl_noise on each agent win
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
 
+    // Opponent mix (option 2): heterogeneous envs in one vec.
+    // mix_enabled=0 → use num_agents/num_bots/bot_policy from kwargs as today.
+    // mix_enabled=1 → my_init assigns BOT / SP / HIST from env index (rng at init).
+    int mix_enabled;
+    int mix_mode;            // ROBOCODE_MIX_* for this env
+    int mix_bot_pct;         // percent of envs that are agent-vs-bot [0,100]
+    int mix_hist_pct;        // percent of envs that are agent-vs-historical
+    // remaining percent = live selfplay (agent vs agent)
+    int mix_bot_policy_a;    // e.g. 3
+    int mix_bot_policy_b;    // e.g. 6
+    int mix_bot_a_pct;       // percent of *bot envs* using policy_a (rest policy_b)
+
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
     // policy). tag = 1..ROBOCODE_MAX_BANKS means historical: slot 0 = primary,
     // slot 1 = frozen historical opponent from bank (tag - 1). boundary_reached
     // is set on game-end so Python can detect when historical envs have all
     // completed at least one game since the last swap arm.
+    // Bot-mix envs keep tag=0 (no frozen opponent).
     int tag;
     int boundary_reached;
 
@@ -645,6 +672,17 @@ static inline void end_episode(Robocode* env, int outcome) {
     env->log.slot_1_score += (1.0f - s0_score) * env->num_agents;
     env->log.cl_perf += cl_credit * env->num_agents;
     if (outcome == 0) env->log.draw_rate += env->num_agents;
+    // Per-opponent-mode WR (use score/n ratio after aggregate).
+    if (env->mix_mode == ROBOCODE_MIX_BOT || (env->num_bots > 0 && env->num_agents == 1)) {
+        env->log.mix_bot_score += s0_score;
+        env->log.mix_bot_n += 1.0f;
+    } else if (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS) {
+        env->log.mix_hist_score += s0_score;
+        env->log.mix_hist_n += 1.0f;
+    } else if (env->num_agents >= 2 && env->num_bots == 0) {
+        env->log.mix_sp_score += s0_score;
+        env->log.mix_sp_n += 1.0f;
+    }
     if (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS) {
         int bank_idx = env->tag - 1;
         env->log.hist_score_bank[bank_idx] += s0_score;
