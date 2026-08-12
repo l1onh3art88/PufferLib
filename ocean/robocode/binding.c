@@ -32,135 +32,58 @@ static inline float dict_get_float_default(Dict* kwargs, const char* key, float 
 
 void my_init(Env* env, Dict* kwargs);
 
-// Fill buffer_env_starts / buffer_env_counts for a packed primary width.
-static void robocode_fill_buffer_info(Env* envs, int num_envs, int num_buffers,
-                                      int primary_per_buffer,
-                                      int* buffer_env_starts, int* buffer_env_counts) {
-    for (int i = 0; i < num_buffers; i++) {
-        buffer_env_starts[i] = 0;
-        buffer_env_counts[i] = 0;
-    }
-    int buf = 0;
-    int buf_agents = 0;
-    buffer_env_starts[0] = 0;
-    for (int i = 0; i < num_envs; i++) {
-        buf_agents += envs[i].num_agents;
-        buffer_env_counts[buf]++;
-        if (buf_agents >= primary_per_buffer && buf < num_buffers - 1) {
-            buf++;
-            buffer_env_starts[buf] = i + 1;
-            buffer_env_counts[buf] = 0;
-            buf_agents = 0;
-        }
-    }
-}
-
-// Stock-identical packing (copy of vecenv.h default my_vec_init). Used when
-// mix_enabled=0 so pure agent-vs-bot is bit-compatible with pre-mix commits.
-static Env* robocode_vec_init_stock(int* num_envs_out, int* buffer_env_starts,
-                                    int* buffer_env_counts,
-                                    Dict* vec_kwargs, Dict* env_kwargs) {
-    int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
-    int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
-    int agents_per_buffer = total_agents / num_buffers;
-
-    Env* envs = (Env*)calloc((size_t)total_agents, sizeof(Env));
-    int num_envs = 0;
-    int agents_created = 0;
-    while (agents_created < total_agents) {
-        srand(num_envs);
-        envs[num_envs].rng = (unsigned int)num_envs;
-        my_init(&envs[num_envs], env_kwargs);
-        agents_created += envs[num_envs].num_agents;
-        num_envs++;
-    }
-    envs = (Env*)realloc(envs, (size_t)num_envs * sizeof(Env));
-    robocode_fill_buffer_info(envs, num_envs, num_buffers, agents_per_buffer,
-                              buffer_env_starts, buffer_env_counts);
-    *num_envs_out = num_envs;
-    return envs;
-}
-
-// Custom env packing for opponent mix: only fill primary agent rows so frozen
-// bank slices (end of each buffer) stay free for historical opponents.
-// When mix hist demand is 0, do not carve frozen seats (matches Python
-// selfplay.setup and pure agent-vs-bot packing = full total_agents).
+// One packing path for all cases. Stock-equivalent seeding:
+//   srand(i); rng = i; my_init; leave rng (mix only *reads* rng as env index).
+// Frozen primary carve only when mix_enabled && mix_hist_pct > 0.
 Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_counts,
                  Dict* vec_kwargs, Dict* env_kwargs) {
-    int mix_enabled = (int)dict_get_float_default(env_kwargs, "mix_enabled", 0.0f);
-    // Critical: mix off must not take a different packing/RNG path than pre-mix.
-    if (!mix_enabled) {
-        return robocode_vec_init_stock(num_envs_out, buffer_env_starts,
-                                       buffer_env_counts, vec_kwargs, env_kwargs);
-    }
-
     int total_agents = (int)dict_get(vec_kwargs, "total_agents")->value;
     int num_buffers = (int)dict_get(vec_kwargs, "num_buffers")->value;
     int agents_per_buffer = total_agents / num_buffers;
 
-    int mix_bot_pct = (int)dict_get_float_default(env_kwargs, "mix_bot_pct", 20.0f);
-    int mix_hist_pct = (int)dict_get_float_default(env_kwargs, "mix_hist_pct", 30.0f);
-    if (mix_bot_pct < 0) mix_bot_pct = 0;
-    if (mix_hist_pct < 0) mix_hist_pct = 0;
-    if (mix_bot_pct + mix_hist_pct > 100) mix_hist_pct = 100 - mix_bot_pct;
+    int mix_on = (int)dict_get_float_default(env_kwargs, "mix_enabled", 0.0f);
+    int bot_pct = (int)dict_get_float_default(env_kwargs, "mix_bot_pct", 20.0f);
+    int hist_pct = (int)dict_get_float_default(env_kwargs, "mix_hist_pct", 30.0f);
+    if (bot_pct < 0) bot_pct = 0;
+    if (hist_pct < 0) hist_pct = 0;
+    if (bot_pct + hist_pct > 100) hist_pct = 100 - bot_pct;
 
-    int num_frozen_banks = 0;
-    float frozen_bank_pct = 0.0f;
-    DictItem* nb = dict_get_unsafe(vec_kwargs, "num_frozen_banks");
-    if (nb) num_frozen_banks = (int)nb->value;
-    DictItem* fp = dict_get_unsafe(vec_kwargs, "frozen_bank_pct");
-    if (fp) frozen_bank_pct = (float)fp->value;
-
-    int frozen_per_bank = (int)(agents_per_buffer * frozen_bank_pct);
-    if (frozen_per_bank < 0) frozen_per_bank = 0;
-    // Reserve frozen rows only when hist envs are requested.
-    int frozen_per_buffer = 0;
-    if (mix_hist_pct > 0 && num_frozen_banks > 0 && frozen_per_bank > 0) {
-        frozen_per_buffer = frozen_per_bank * num_frozen_banks;
-    }
-    int primary_per_buffer = agents_per_buffer - frozen_per_buffer;
-    if (primary_per_buffer < 1) primary_per_buffer = agents_per_buffer;
-    int primary_cap = primary_per_buffer * num_buffers;
-
-    // Bot-only mix (100% bot, no hist): same packing as stock — one agent per
-    // env filling total_agents. Only mix_id differs for policy a/b assignment.
-    if (mix_bot_pct >= 100 && mix_hist_pct <= 0) {
-        Env* envs = (Env*)calloc((size_t)total_agents, sizeof(Env));
-        int num_envs = 0;
-        int agents_created = 0;
-        while (agents_created < total_agents) {
-            srand(num_envs);
-            envs[num_envs].rng = (unsigned int)num_envs;
-            envs[num_envs].mix_id = (unsigned int)num_envs;
-            my_init(&envs[num_envs], env_kwargs);
-            agents_created += envs[num_envs].num_agents;
-            num_envs++;
+    int primary_per_buffer = agents_per_buffer;
+    if (mix_on && hist_pct > 0) {
+        int n_banks = 0;
+        float frozen_pct = 0.0f;
+        DictItem* nb = dict_get_unsafe(vec_kwargs, "num_frozen_banks");
+        if (nb) n_banks = (int)nb->value;
+        DictItem* fp = dict_get_unsafe(vec_kwargs, "frozen_bank_pct");
+        if (fp) frozen_pct = (float)fp->value;
+        int frozen = (int)(agents_per_buffer * frozen_pct);
+        if (frozen < 0) frozen = 0;
+        if (n_banks > 0 && frozen > 0) {
+            primary_per_buffer = agents_per_buffer - frozen * n_banks;
+            if (primary_per_buffer < 1) primary_per_buffer = agents_per_buffer;
         }
-        envs = (Env*)realloc(envs, (size_t)num_envs * sizeof(Env));
-        robocode_fill_buffer_info(envs, num_envs, num_buffers, agents_per_buffer,
-                                  buffer_env_starts, buffer_env_counts);
-        *num_envs_out = num_envs;
-        return envs;
     }
+    int primary_cap = primary_per_buffer * num_buffers;
 
     Env* envs = (Env*)calloc((size_t)total_agents, sizeof(Env));
     int num_envs = 0;
     int agents_created = 0;
     while (agents_created < primary_cap) {
         int remaining = primary_cap - agents_created;
-        // Composition id only. Episode RNG seed stays env index (stock parity).
-        unsigned int mix_id = (unsigned int)num_envs;
-        if (remaining == 1) {
-            if (mix_bot_pct > 0) {
-                mix_id = 0;  // r=0 → bot bucket
-            } else {
-                break;
-            }
+        unsigned int seed = (unsigned int)num_envs;
+        // Last primary slot: force bot composition (id 0) so we take 1 agent
+        // instead of a 2-agent SP/hist that would overshoot. Episode seed stays
+        // `seed` after my_init (see restore below).
+        unsigned int compose = seed;
+        if (mix_on && remaining == 1) {
+            if (bot_pct <= 0) break;
+            compose = 0;
         }
-        srand(num_envs);
-        envs[num_envs].rng = (unsigned int)num_envs;
-        envs[num_envs].mix_id = mix_id;
+
+        srand((int)seed);
+        envs[num_envs].rng = compose;
         my_init(&envs[num_envs], env_kwargs);
+        envs[num_envs].rng = seed;  // stock episode seed (no-op if compose==seed)
 
         int n_ag = envs[num_envs].num_agents;
         if (n_ag < 1) n_ag = 1;
@@ -177,8 +100,23 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
     }
 
     envs = (Env*)realloc(envs, (size_t)num_envs * sizeof(Env));
-    robocode_fill_buffer_info(envs, num_envs, num_buffers, primary_per_buffer,
-                              buffer_env_starts, buffer_env_counts);
+
+    for (int i = 0; i < num_buffers; i++) {
+        buffer_env_starts[i] = 0;
+        buffer_env_counts[i] = 0;
+    }
+    int buf = 0, buf_agents = 0;
+    buffer_env_starts[0] = 0;
+    for (int i = 0; i < num_envs; i++) {
+        buf_agents += envs[i].num_agents;
+        buffer_env_counts[buf]++;
+        if (buf_agents >= primary_per_buffer && buf < num_buffers - 1) {
+            buf++;
+            buffer_env_starts[buf] = i + 1;
+            buffer_env_counts[buf] = 0;
+            buf_agents = 0;
+        }
+    }
     *num_envs_out = num_envs;
     return envs;
 }
@@ -213,69 +151,46 @@ void my_init(Env* env, Dict* kwargs) {
         DictItem* bp1 = dict_get_unsafe(kwargs, "bot_policy_1");
         env->bot_policy_1 = bp1 ? (int)bp1->value : -1;
     }
-    // Curriculum vs bots: fraction of ticks with random bot actions, decays
-    // by bot_cl_decay on each agent win until 0 (full bot). Defaults off.
     env->bot_cl_noise = dict_get_float_default(kwargs, "bot_cl_noise", 0.0f);
     if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
     if (env->bot_cl_noise > 1.0f) env->bot_cl_noise = 1.0f;
     env->bot_cl_decay = dict_get_float_default(kwargs, "bot_cl_decay", 0.0f);
     if (env->bot_cl_decay < 0.0f) env->bot_cl_decay = 0.0f;
 
-    // Opponent mix (option 2). Composition uses env->mix_id only (set by
-    // my_vec_init). env->rng is the episode seed and must not be used for mix.
-    env->mix_enabled = (int)dict_get_float_default(kwargs, "mix_enabled", 0.0f);
-    env->mix_bot_pct = (int)dict_get_float_default(kwargs, "mix_bot_pct", 20.0f);
-    env->mix_hist_pct = (int)dict_get_float_default(kwargs, "mix_hist_pct", 30.0f);
-    env->mix_bot_policy_a = (int)dict_get_float_default(kwargs, "mix_bot_policy_a", 3.0f);
-    env->mix_bot_policy_b = (int)dict_get_float_default(kwargs, "mix_bot_policy_b", 6.0f);
-    env->mix_bot_a_pct = (int)dict_get_float_default(kwargs, "mix_bot_a_pct", 20.0f);
-    if (env->mix_bot_pct < 0) env->mix_bot_pct = 0;
-    if (env->mix_hist_pct < 0) env->mix_hist_pct = 0;
-    if (env->mix_bot_pct + env->mix_hist_pct > 100) {
-        env->mix_hist_pct = 100 - env->mix_bot_pct;
-    }
-    if (env->mix_bot_a_pct < 0) env->mix_bot_a_pct = 0;
-    if (env->mix_bot_a_pct > 100) env->mix_bot_a_pct = 100;
-    env->mix_mode = ROBOCODE_MIX_OFF;
+    // Opponent mix: read-only use of rng as env-index seed (set by my_vec_init).
+    // Does not call rand_r — same as prior hardcode:
+    //   bot_policy = ((env->rng % 10) == 0) ? 3 : 6;
+    if ((int)dict_get_float_default(kwargs, "mix_enabled", 0.0f)) {
+        int bot_pct = (int)dict_get_float_default(kwargs, "mix_bot_pct", 20.0f);
+        int hist_pct = (int)dict_get_float_default(kwargs, "mix_hist_pct", 30.0f);
+        int a_pct = (int)dict_get_float_default(kwargs, "mix_bot_a_pct", 20.0f);
+        int pol_a = (int)dict_get_float_default(kwargs, "mix_bot_policy_a", 3.0f);
+        int pol_b = (int)dict_get_float_default(kwargs, "mix_bot_policy_b", 6.0f);
+        if (bot_pct < 0) bot_pct = 0;
+        if (hist_pct < 0) hist_pct = 0;
+        if (bot_pct + hist_pct > 100) hist_pct = 100 - bot_pct;
+        if (a_pct < 0) a_pct = 0;
+        if (a_pct > 100) a_pct = 100;
 
-    if (env->mix_enabled) {
-        // Deterministic mix_id hash into BOT / HIST / SP (does not touch rng).
-        unsigned int id = env->mix_id;
+        unsigned int id = env->rng;
         int r = (int)(id % 100u);
-        if (r < env->mix_bot_pct) {
-            env->mix_mode = ROBOCODE_MIX_BOT;
+        if (r < bot_pct) {
             env->num_agents = 1;
             env->num_bots = 1;
-            // Interleaved policy_a/b — must NOT use (id/100)%100, which clusters
-            // ~1000 consecutive envs onto policy_a (max_run≈1000) and diverges
-            // hard from the original hardcode:
-            //   bot_policy = (env_idx % 10 == 0) ? 3 : 6;   // 10% a, evenly
-            // When a_pct divides 100: stride = 100/a_pct, a on (id % stride)==0.
-            // a_pct=10 → stride 10 → exact match of that hardcode.
-            int a_pct = env->mix_bot_a_pct;
+            // a_pct=10 → (id % 10)==0, matches hardcode above.
             int use_a = 0;
-            if (a_pct >= 100) {
-                use_a = 1;
-            } else if (a_pct > 0) {
-                if (100 % a_pct == 0) {
-                    unsigned int stride = (unsigned int)(100 / a_pct);
-                    use_a = (id % stride) == 0u;
-                } else {
-                    // Fallback: first a_pct residues of each 100 (max_run=a_pct).
-                    use_a = (int)(id % 100u) < a_pct;
-                }
-            }
-            env->bot_policy = use_a
-                ? env->mix_bot_policy_a : env->mix_bot_policy_b;
-        } else if (r < env->mix_bot_pct + env->mix_hist_pct) {
-            env->mix_mode = ROBOCODE_MIX_HIST;
+            if (a_pct >= 100) use_a = 1;
+            else if (a_pct > 0 && 100 % a_pct == 0)
+                use_a = (id % (unsigned int)(100 / a_pct)) == 0u;
+            else if (a_pct > 0)
+                use_a = (int)(id % 100u) < a_pct;
+            env->bot_policy = use_a ? pol_a : pol_b;
+        } else if (r < bot_pct + hist_pct) {
             env->num_agents = 2;
             env->num_bots = 0;
-            // CL noise only applies to scripted bots.
             env->bot_cl_noise = 0.0f;
             env->bot_cl_decay = 0.0f;
         } else {
-            env->mix_mode = ROBOCODE_MIX_SP;
             env->num_agents = 2;
             env->num_bots = 0;
             env->bot_cl_noise = 0.0f;
