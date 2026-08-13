@@ -568,10 +568,12 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
     args.setdefault('env', {})['dr'] = 0.0
     args['env']['num_agents'] = 1
     args['env']['num_bots'] = 1
-    # Single-bot eval must not use train-time opponent mix.
+    # Single-bot eval must not use train-time opponent mix / curriculum noise.
     args['env']['mix_enabled'] = 0
     args['env']['bot_cl_noise'] = 0.0
     args['env']['bot_cl_decay'] = 0.0
+    args['env']['hist_cl_noise'] = 0.0
+    args['env']['hist_cl_decay'] = 0.0
     if bot_policy >= 0:
         args['env']['bot_policy'] = bot_policy
     if max_ticks > 0:

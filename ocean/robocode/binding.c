@@ -162,6 +162,12 @@ void my_init(Env* env, Dict* kwargs) {
     if (env->bot_cl_noise > 1.0f) env->bot_cl_noise = 1.0f;
     env->bot_cl_decay = dict_get_float_default(kwargs, "bot_cl_decay", 0.0f);
     if (env->bot_cl_decay < 0.0f) env->bot_cl_decay = 0.0f;
+    // Frozen-hist curriculum (tag > 0, slot 1). Defaults off.
+    env->hist_cl_noise = dict_get_float_default(kwargs, "hist_cl_noise", 0.0f);
+    if (env->hist_cl_noise < 0.0f) env->hist_cl_noise = 0.0f;
+    if (env->hist_cl_noise > 1.0f) env->hist_cl_noise = 1.0f;
+    env->hist_cl_decay = dict_get_float_default(kwargs, "hist_cl_decay", 0.0f);
+    if (env->hist_cl_decay < 0.0f) env->hist_cl_decay = 0.0f;
 
     // Opponent mix: read-only use of rng as env-index seed (set by my_vec_init).
     // Does not call rand_r — same as prior hardcode:
@@ -231,8 +237,9 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "slot_1_score", log->slot_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
     dict_set(out, "bot_cl_noise", log->bot_cl_noise);
+    dict_set(out, "hist_cl_noise", log->hist_cl_noise);
     // CL-adjusted winrate: E[win_credit * (1 - noise_faced)]. Max 1 only when
-    // always winning with bot_cl_noise annealed to 0. Prefer as Protein metric.
+    // always winning with bot/hist noise annealed to 0. Prefer as Protein metric.
     dict_set(out, "cl_perf", log->cl_perf);
     // Opponent-mix accumulators (ratio score/n invariant under aggregate /N).
     dict_set(out, "mix_bot_score", log->mix_bot_score);

@@ -69,9 +69,12 @@ struct Log {
     float draw_rate;
     // Curriculum: bot random-action probability faced this episode (pre-decay).
     float bot_cl_noise;
-    // CL-adjusted win credit: episode_score * (1 - bot_cl_noise_faced).
+    // Curriculum: hist/frozen opponent random-action probability (pre-decay).
+    float hist_cl_noise;
+    // CL-adjusted win credit: episode_score * (1 - noise_faced).
+    // noise = bot_cl on bot games, hist_cl on hist games, 0 on live SP.
     // After /n this is mean winrate discounted by noise. Max=1 only when
-    // always winning against a fully annealed bot (noise=0). Protein target.
+    // always winning against a fully annealed opponent (noise=0). Protein target.
     float cl_perf;
     // Opponent-mix win rates (ratio score/n is invariant under aggregate /N).
     // BOT = agent vs scripted; SP = live selfplay; HIST = vs frozen bank.
@@ -166,6 +169,11 @@ struct Robocode {
     // workers diversify difficulty as they win.
     float bot_cl_noise;      // current random-action probability in [0, 1]
     float bot_cl_decay;      // subtract from bot_cl_noise on each agent win
+    // Same idea for frozen historical opponents (tag > 0): with probability
+    // hist_cl_noise, overwrite slot-1 (frozen) discrete actions with uniform
+    // random before they execute. Anneal on primary (slot-0) win.
+    float hist_cl_noise;
+    float hist_cl_decay;
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
 
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
@@ -233,6 +241,7 @@ void add_log(Robocode* env) {
         env->log.damage_taken            += env->logs[i].damage_taken;
         env->log.range_damage_inflicted  += env->logs[i].range_damage_inflicted;
         env->log.bot_cl_noise            += env->logs[i].bot_cl_noise;
+        env->log.hist_cl_noise           += env->logs[i].hist_cl_noise;
         env->log.n                       += 1.0f;
     }
 }
@@ -642,12 +651,15 @@ static inline int agent_terminal_outcome(Robocode* env) {
 // 0 draw. Historical accounting only applies when env->tag > 0.
 static inline void end_episode(Robocode* env, int outcome) {
     float s0_score = (outcome > 0) ? 1.0f : (outcome < 0) ? 0.0f : 0.5f;
-    // Noise faced during this episode (before win-decay). Clamp for safety.
-    float noise = env->bot_cl_noise;
+    // Noise faced this episode (pre-decay). Bot vs scripted, hist vs frozen, else 0.
+    float noise = 0.0f;
+    if (env->num_bots > 0 && env->num_agents == 1)
+        noise = env->bot_cl_noise;
+    else if (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS)
+        noise = env->hist_cl_noise;
     if (noise < 0.0f) noise = 0.0f;
     if (noise > 1.0f) noise = 1.0f;
     // CL-adjusted win credit: full credit only for wins at noise=0.
-    // win@noise=0 → 1, win@noise=0.5 → 0.5, loss → 0, draw@noise=0 → 0.5.
     float cl_credit = s0_score * (1.0f - noise);
 
     // Scale by num_agents so that (slot_0_score / n) where n increments by
@@ -660,7 +672,6 @@ static inline void end_episode(Robocode* env, int outcome) {
     // Per-opponent-mode WR (layout is fixed at my_init; no mix_mode field).
     if (env->num_bots > 0 && env->num_agents == 1) {
         env->log.mix_bot_score += s0_score;
-        // Same noise discount as cl_perf, but only on bot episodes (sweep metric).
         env->log.mix_bot_cl_score += cl_credit;
         env->log.mix_bot_n += 1.0f;
     } else if (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS) {
@@ -680,13 +691,21 @@ static inline void end_episode(Robocode* env, int outcome) {
     }
     // Snapshot pre-decay noise for metrics (what the agent actually faced).
     for (int a = 0; a < env->num_agents; a++) {
-        env->logs[a].bot_cl_noise = noise;
+        env->logs[a].bot_cl_noise = (env->num_bots > 0 && env->num_agents == 1)
+            ? noise : 0.0f;
+        env->logs[a].hist_cl_noise = (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS)
+            ? noise : 0.0f;
     }
-    // Curriculum: agent beat the bot → harden bot (lower random action rate).
+    // Curriculum: primary win → harden bot / frozen opp (lower random rate).
     if (outcome > 0 && env->num_bots > 0 && env->bot_cl_decay > 0.0f
             && env->bot_cl_noise > 0.0f) {
         env->bot_cl_noise -= env->bot_cl_decay;
         if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
+    }
+    if (outcome > 0 && env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS
+            && env->hist_cl_decay > 0.0f && env->hist_cl_noise > 0.0f) {
+        env->hist_cl_noise -= env->hist_cl_decay;
+        if (env->hist_cl_noise < 0.0f) env->hist_cl_noise = 0.0f;
     }
     for (int a = 0; a < env->num_agents; a++) *env->terminal_ptr[a] = 1.0f;
     add_log(env);
@@ -832,6 +851,20 @@ void c_step(Robocode* env) {
         if (robot->energy <= 0.0f) {
             robot->v = 0;
             continue;
+        }
+
+        // Hist curriculum: slot 1 is frozen opponent when tag > 0. With prob
+        // hist_cl_noise, replace its discrete action heads with uniform random
+        // (same tables as bot_cl_noise). Does not touch GPU logprobs — frozen
+        // rows have zero advantages so training is unaffected.
+        if (i == 1 && env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS
+                && env->hist_cl_noise > 0.0f
+                && rand_unit(env) < env->hist_cl_noise) {
+            atn[0] = (float)(rand_r(&env->rng) % 4);
+            atn[1] = (float)(rand_r(&env->rng) % 9);
+            atn[2] = (float)(rand_r(&env->rng) % 11);
+            atn[3] = (float)(rand_r(&env->rng) % 11);
+            atn[4] = (float)(rand_r(&env->rng) % 6);
         }
 
         // Cool down gun
