@@ -236,17 +236,20 @@ void my_log(Log* log, Dict* out) {
     dict_set(out, "cl_perf", log->cl_perf);
     // Opponent-mix accumulators (ratio score/n invariant under aggregate /N).
     dict_set(out, "mix_bot_score", log->mix_bot_score);
+    dict_set(out, "mix_bot_cl_score", log->mix_bot_cl_score);
     dict_set(out, "mix_bot_n", log->mix_bot_n);
     dict_set(out, "mix_sp_score", log->mix_sp_score);
     dict_set(out, "mix_sp_n", log->mix_sp_n);
     dict_set(out, "mix_hist_score", log->mix_hist_score);
     dict_set(out, "mix_hist_n", log->mix_hist_n);
-    // Bot-only winrate for sweep/Protein: not a Log field (would break under /n).
-    // score/n after aggregate equals raw sum_score/sum_n.
+    // Bot-only CL winrate for sweep/Protein (not a Log field — would break under /n):
+    //   mix_bot_wr = E[win * (1 - noise) | bot episode]
+    // Same discount as cl_perf, but only agent-vs-bot (ignores SP/hist).
+    // Max 1 only when always beating a fully annealed bot (noise=0).
     {
         float mix_bot_wr = 0.0f;
         if (log->mix_bot_n > 1e-12f)
-            mix_bot_wr = log->mix_bot_score / log->mix_bot_n;
+            mix_bot_wr = log->mix_bot_cl_score / log->mix_bot_n;
         dict_set(out, "mix_bot_wr", mix_bot_wr);
     }
     dict_set(out, "n", log->n);

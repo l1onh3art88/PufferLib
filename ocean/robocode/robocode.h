@@ -75,7 +75,8 @@ struct Log {
     float cl_perf;
     // Opponent-mix win rates (ratio score/n is invariant under aggregate /N).
     // BOT = agent vs scripted; SP = live selfplay; HIST = vs frozen bank.
-    float mix_bot_score;
+    float mix_bot_score;     // raw bot win credit (no noise discount)
+    float mix_bot_cl_score;  // bot win * (1 - noise_faced); for mix_bot_wr
     float mix_bot_n;
     float mix_sp_score;
     float mix_sp_n;
@@ -659,6 +660,8 @@ static inline void end_episode(Robocode* env, int outcome) {
     // Per-opponent-mode WR (layout is fixed at my_init; no mix_mode field).
     if (env->num_bots > 0 && env->num_agents == 1) {
         env->log.mix_bot_score += s0_score;
+        // Same noise discount as cl_perf, but only on bot episodes (sweep metric).
+        env->log.mix_bot_cl_score += cl_credit;
         env->log.mix_bot_n += 1.0f;
     } else if (env->tag > 0 && env->tag <= ROBOCODE_MAX_BANKS) {
         env->log.mix_hist_score += s0_score;
