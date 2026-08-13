@@ -204,6 +204,7 @@ def build_perm_tags(num_buffers, agents_per_buffer, agents_per_env, frozen_sizes
         [apb - 2F,    apb - F)                        primary — historical envs' team A
         [apb - F,     apb - F + frozen_sizes[0])      bank 0  — historical envs' team B
         [apb - F + frozen_sizes[0], ... + ...[1])     bank 1  — ... etc.
+    F may equal apb//2 (then SP range is empty — 100% hist). F > apb//2 is invalid.
 
     Env order within a buffer: selfplay envs first (tag=0), then historical
     envs assigned to banks in block order — the first `frozen_sizes[0]/team_size`
@@ -520,10 +521,12 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
             num_banks = 0
         frozen_sizes = [frozen_size] * max(num_banks, 1) if frozen_size > 0 else [0]
         total_frozen = sum(frozen_sizes) if frozen_size > 0 else 0
-        if total_frozen >= agents_per_buffer // 2 and mix_hist_pct > 0:
+        # Layout needs 2F slots (hist team A + frozen team B). F == apb/2 is
+        # valid (100% hist, no live SP); only F > apb/2 overflows the buffer.
+        if total_frozen > agents_per_buffer // 2 and mix_hist_pct > 0:
             raise RuntimeError(
-                f'total_frozen {total_frozen} (>= apb/2={agents_per_buffer//2}); '
-                f'lower frozen_bank_pct or num_frozen_banks')
+                f'total_frozen {total_frozen} (> apb/2={agents_per_buffer//2}); '
+                f'lower frozen_bank_pct or num_frozen_banks (max frozen_bank_pct=0.5)')
 
         # Replay C packing into primary capacity only.
         primary_per_buffer = agents_per_buffer - total_frozen
@@ -590,10 +593,12 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
                 'selfplay.enabled but frozen_bank_pct rounds to 0 slots '
                 f'after team-size ({team_size}) alignment')
         total_frozen = frozen_size * num_banks
-        if total_frozen >= agents_per_buffer // 2:
+        # 2F slots needed (primary hist + frozen bank). F == apb//2 → all hist.
+        if total_frozen > agents_per_buffer // 2:
             raise RuntimeError(
                 f'total_frozen {total_frozen} (= num_banks {num_banks} '
-                f'* per_bank {frozen_size}) >= apb/2 {agents_per_buffer//2}')
+                f'* per_bank {frozen_size}) > apb/2 {agents_per_buffer//2} '
+                f'(max frozen_bank_pct=0.5 with one bank)')
 
         frozen_sizes = [frozen_size] * num_banks
         perm, tags, num_hist_envs_per_bank = build_perm_tags(
