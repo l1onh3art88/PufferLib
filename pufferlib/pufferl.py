@@ -219,6 +219,58 @@ def _sync_frozen_bank_arch_to_policy(args):
         vec['frozen_bank_num_layers'] = int(round(float(policy['num_layers'])))
 
 
+def _parse_sweep_bot_list(spec, default=(3, 4, 5, 6)):
+    '''Parse sweep.bot_eval_bots: '3,4,5,6' / [3,4,5,6] / default 3–6.'''
+    if spec is None or spec == '' or spec is False:
+        return list(default)
+    if isinstance(spec, (list, tuple)):
+        return [int(x) for x in spec]
+    if isinstance(spec, (int, float)):
+        return [int(spec)]
+    text = str(spec).strip().strip("'\"")
+    if not text:
+        return list(default)
+    return [int(x.strip()) for x in text.split(',') if x.strip()]
+
+
+def _sweep_uses_bot_eval_metric(args, sweep_obj):
+    '''End-of-trial mean eval_bot WR as Protein score (not in-train env logs).'''
+    if sweep_obj is None:
+        return False
+    if bool(args.get('sweep', {}).get('league', False)):
+        return False
+    sw = args.get('sweep') or {}
+    metric = str(sw.get('metric', '') or '')
+    if metric == 'bot_eval_wr':
+        return True
+    return bool(int(float(sw.get('bot_eval_metric', 0) or 0)))
+
+
+def _trial_bot_eval_mean(env_name, policy_path, args, bots=None, num_games=2048,
+        verbose=False):
+    '''Run eval_bot vs each bot; return (mean_wr, {bot: wr}).'''
+    bots = bots if bots is not None else [3, 4, 5, 6]
+    num_games = int(num_games)
+    per_bot = {}
+    for b in bots:
+        eval_args = deepcopy(args)
+        eval_args['skip_match_close'] = False
+        # Keep this worker's GPU; strip multi-rank train state.
+        eval_args['world_size'] = 1
+        eval_args['rank'] = 0
+        logs = eval_bot(
+            env_name,
+            policy_path=policy_path,
+            num_games=num_games,
+            bot_policy=int(b),
+            args=eval_args,
+            verbose=verbose,
+        )
+        per_bot[int(b)] = float(logs.get('env/slot_0_score', 0.0))
+    mean_wr = float(np.mean(list(per_bot.values()))) if per_bot else 0.0
+    return mean_wr, per_bot
+
+
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     backend = _resolve_backend(args)
@@ -244,7 +296,12 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             settings=wandb.Settings(console="off"),
         )
 
-    target_key = f'env/{args["sweep"]["metric"]}'
+    use_bot_eval_metric = _sweep_uses_bot_eval_metric(args, sweep_obj)
+    # Protein observes env/{metric}. bot_eval_wr is filled only at trial end.
+    # During train, collect/early-stop on env/score so logging still works.
+    sweep_metric = str((args.get('sweep') or {}).get('metric', 'score') or 'score')
+    target_key = f'env/{sweep_metric}'
+    train_target_key = 'env/score' if use_bot_eval_metric else target_key
     total_timesteps = _local_total_timesteps(args)
     all_logs = []
 
@@ -338,7 +395,10 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         if verbose:
             print_dashboard(args, model_size, flat_logs)
 
-        if target_key not in flat_logs and not league_mode:
+        # During bot_eval_wr sweeps, train logs may lack env/bot_eval_wr until
+        # the end-of-trial suite; use train_target_key for mid-run collection.
+        log_key = train_target_key if use_bot_eval_metric else target_key
+        if log_key not in flat_logs and not league_mode:
             continue
 
         if args['wandb'] and artifact_owner:
@@ -349,6 +409,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
             if (sweep_obj is not None
                     and not league_mode
+                    and not use_bot_eval_metric
                     and pufferl.global_step > min(0.20*total_timesteps, 100_000_000) and
                     sweep_obj.early_stop(flat_logs, target_key)):
                 break
@@ -363,6 +424,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         backend.save_weights(pufferl, model_path)
         smerl.save_sidecar(pufferl, backend, model_path)
 
+    # Sweep bot-eval metric needs a final checkpoint even when sweep skips
+    # interval saves (sweep_obj is not None disables should_save above).
+    if (use_bot_eval_metric and artifact_owner and not model_path
+            and not league_mode):
+        model_path = os.path.join(checkpoint_dir, f'{pufferl.global_step:016d}.bin')
+        backend.save_weights(pufferl, model_path)
+        smerl.save_sidecar(pufferl, backend, model_path)
+
     if league_mode and artifact_owner:
         league.finish_trial(args, run_id, model_path, all_logs, flat_logs, result_queue)
         if result_queue is None:
@@ -371,16 +440,26 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     backend.close(pufferl)
 
-    if target_key not in flat_logs and not league_mode:
-        if artifact_owner and result_queue is not None:
-            result_queue.put((args['gpu_id'], None, None, None))
-        return
-
     if not artifact_owner:
         return
 
+    if not all_logs and not use_bot_eval_metric:
+        if result_queue is not None:
+            result_queue.put((args['gpu_id'], None, None, None))
+        return
+
+    if not all_logs:
+        # Bot-eval-only scoring with no train log points (shouldn't happen if
+        # env/score is logged). Fabricate a minimal final point for cost/steps.
+        all_logs = [dict(flat_logs) if flat_logs else {
+            'agent_steps': float(total_timesteps),
+            'uptime': 0.0,
+            'env/score': 0.0,
+        }]
+
     # This version has the training perf logs and eval env logs
-    all_logs.append(flat_logs)
+    if flat_logs:
+        all_logs.append(flat_logs)
 
     # Downsample results. Log keys can appear late, e.g. env/perf only after
     # eval epochs. For downsample=1, keep exactly the final point.
@@ -426,12 +505,51 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
                     reduced = metrics[k][-2]
                 metrics[k][-1] = reduced
 
+    # End-of-trial scripted-bot suite → single Protein score (mean WR bots 3–6).
+    bot_eval_detail = None
+    if use_bot_eval_metric:
+        sw = args.get('sweep') or {}
+        bots = _parse_sweep_bot_list(sw.get('bot_eval_bots', '3,4,5,6'))
+        games = int(float(sw.get('bot_eval_games', 2048) or 2048))
+        try:
+            mean_wr, per_bot = _trial_bot_eval_mean(
+                env_name, model_path, args, bots=bots, num_games=games,
+                verbose=verbose)
+        except Exception as e:
+            print(f'WARNING: trial bot_eval failed: {e}')
+            mean_wr, per_bot = 0.0, {}
+        bot_eval_detail = {'mean': mean_wr, 'per_bot': per_bot, 'bots': bots,
+                           'games': games, 'policy_path': model_path}
+        # One observe point: final bot-eval mean (not mid-train env series).
+        metrics['env/bot_eval_wr'] = [float(mean_wr)]
+        for b, wr in per_bot.items():
+            metrics[f'env/bot_eval_wr_{b}'] = [float(wr)]
+        # Align cost/steps to a single final observation.
+        up = metrics.get('uptime') or [0.0]
+        steps = metrics.get('agent_steps') or [float(total_timesteps)]
+        metrics['uptime'] = [float(up[-1])]
+        metrics['agent_steps'] = [float(steps[-1])]
+        detail = ' '.join(f'bot{b}={wr:.4f}' for b, wr in sorted(per_bot.items()))
+        print(f'[sweep bot_eval] mean_wr={mean_wr:.4f}  {detail}')
+        if args.get('wandb'):
+            try:
+                import wandb
+                if wandb.run is not None:
+                    payload = {'env/bot_eval_wr': mean_wr}
+                    payload.update({f'env/bot_eval_wr_{b}': wr for b, wr in per_bot.items()})
+                    wandb.log(payload, step=int(metrics['agent_steps'][-1]))
+            except Exception:
+                pass
+
     # Save own log: config + downsampled results
     if artifact_owner:
         log_dir = os.path.join(args['log_dir'], args['env_name'])
         os.makedirs(log_dir, exist_ok=True)
+        out = {**args, 'metrics': metrics}
+        if bot_eval_detail is not None:
+            out['bot_eval'] = bot_eval_detail
         with open(os.path.join(log_dir, run_id + '.json'), 'w') as f:
-            json.dump({**args, 'metrics': metrics}, f)
+            json.dump(out, f)
 
     if args['wandb'] and artifact_owner:
         if sweep_obj is None and model_path: # Don't spam uploads during sweeps
@@ -442,7 +560,16 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.run.finish()
 
     if artifact_owner and result_queue is not None:
-        result_queue.put((args['gpu_id'], metrics[target_key], metrics['uptime'], metrics['agent_steps']))
+        score_key = 'env/bot_eval_wr' if use_bot_eval_metric else target_key
+        if score_key not in metrics:
+            result_queue.put((args['gpu_id'], None, None, None))
+        else:
+            result_queue.put((
+                args['gpu_id'],
+                metrics[score_key],
+                metrics['uptime'],
+                metrics['agent_steps'],
+            ))
 
 
 def train(env_name, args=None, gpus=None, **kwargs):
