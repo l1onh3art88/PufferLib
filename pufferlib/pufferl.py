@@ -205,6 +205,20 @@ def _train_worker(args):
 
     backend.close(pufferl)
 
+def _sync_frozen_bank_arch_to_policy(args):
+    '''Point frozen-bank arch at this trial's policy.hidden_size / num_layers.
+
+    Used for non-league Protein sweeps with selfplay: pool snapshots and loads
+    must match the trial arch. Leave frozen_bank_* alone for plain `train`
+    (external fixed-arch opponent pools).'''
+    policy = args.get('policy') or {}
+    vec = args.setdefault('vec', {})
+    if 'hidden_size' in policy:
+        vec['frozen_bank_hidden_size'] = int(float(policy['hidden_size']))
+    if 'num_layers' in policy:
+        vec['frozen_bank_num_layers'] = int(round(float(policy['num_layers'])))
+
+
 def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     '''Single-GPU training worker. Process target for both DDP ranks and sweep trials.'''
     backend = _resolve_backend(args)
@@ -217,6 +231,10 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         # part of the rollout rows and their episodes leak into env/* metrics.
         args['vec']['num_frozen_banks'] = 0
         args['vec']['frozen_bank_pct'] = 0.0
+    elif sweep_obj is not None:
+        # Sweep trial: keep frozen bank arch locked to this trial's policy so
+        # Protein hidden_size / num_layers suggestions stay load-compatible.
+        _sync_frozen_bank_arch_to_policy(args)
 
     if args['wandb'] and artifact_owner:
         import wandb
