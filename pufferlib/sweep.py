@@ -148,6 +148,8 @@ def _params_from_puffer_sweep(sweep_config, only_include=None):
     for name, param in sweep_config.items():
         if name in ('method', 'metric', 'metric_distribution', 'goal', 'downsample', 'use_gpu', 'prune_pareto',
                     'sweep_only', 'max_suggestion_cost', 'early_stop_quantile', 'gpus', 'max_runs',
+                    # End-of-trial scripted bot eval as Protein score (not search spaces)
+                    'bot_eval_metric', 'bot_eval_bots', 'bot_eval_games',
                     *league.SWEEP_CONTROL_KEYS):
             continue
 

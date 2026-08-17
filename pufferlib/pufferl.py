@@ -247,27 +247,111 @@ def _sweep_uses_bot_eval_metric(args, sweep_obj):
 
 
 def _trial_bot_eval_mean(env_name, policy_path, args, bots=None, num_games=2048,
-        verbose=False):
-    '''Run eval_bot vs each bot; return (mean_wr, {bot: wr}).'''
-    bots = bots if bots is not None else [3, 4, 5, 6]
+        verbose=True):
+    '''Run eval_bot vs each bot; return (mean_wr, {bot: wr}).
+
+    Shells out to a fresh `python -m pufferlib.pufferl eval_bot` process per
+    bot — same path as the working CLI loop. In-process re-create after train
+    frequently fails on CUDA (empty per_bot / silent 0.0 mean). Raises on any
+    failure so Protein sees is_failure instead of a fake 0.0 score.
+    '''
+    import subprocess
+    import tempfile
+
+    if not policy_path or not os.path.isfile(policy_path):
+        raise FileNotFoundError(f'trial bot_eval: missing weights {policy_path!r}')
+    policy_path = os.path.abspath(policy_path)
+    if os.path.getsize(policy_path) <= 0:
+        raise RuntimeError(f'trial bot_eval: empty weights file {policy_path}')
+    bots = list(bots if bots is not None else [3, 4, 5, 6])
     num_games = int(num_games)
+    if not bots:
+        raise ValueError('trial bot_eval: empty bot list')
+
+    gpu_id = int(args.get('gpu_id', 0) or 0)
+    policy = args.get('policy') or {}
+    try:
+        hidden = int(float(policy.get('hidden_size', 256)))
+    except (TypeError, ValueError):
+        hidden = 256
+    try:
+        layers = int(round(float(policy.get('num_layers', 4))))
+    except (TypeError, ValueError):
+        layers = 4
+    try:
+        expansion = int(float(policy.get('expansion_factor', 1)))
+    except (TypeError, ValueError):
+        expansion = 1
+
+    # Package root so configs + editable install resolve like the CLI.
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     per_bot = {}
-    for b in bots:
-        eval_args = deepcopy(args)
-        eval_args['skip_match_close'] = False
-        # Keep this worker's GPU; strip multi-rank train state.
-        eval_args['world_size'] = 1
-        eval_args['rank'] = 0
-        logs = eval_bot(
-            env_name,
-            policy_path=policy_path,
-            num_games=num_games,
-            bot_policy=int(b),
-            args=eval_args,
-            verbose=verbose,
+    with tempfile.TemporaryDirectory(prefix='puffer_bot_eval_') as tmp:
+        for b in bots:
+            out_path = os.path.join(tmp, f'bot_{int(b)}.json')
+            # CUDA_VISIBLE_DEVICES remaps the trial GPU to local device 0 so
+            # multi-GPU sweeps don't fight over cuda:0 or pick the wrong card.
+            cmd = [
+                sys.executable, '-m', 'pufferlib.pufferl', 'eval_bot', env_name,
+                '--load-model-path', policy_path,
+                '--env.bot-policy', str(int(b)),
+                '--num-games', str(num_games),
+                '--eval-output', out_path,
+                '--policy.hidden-size', str(hidden),
+                '--policy.num-layers', str(layers),
+                '--policy.expansion-factor', str(expansion),
+                '--gpu-id', '0',
+            ]
+            env = os.environ.copy()
+            env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            env['PYTHONPATH'] = (
+                pkg_root + (os.pathsep + env['PYTHONPATH']
+                            if env.get('PYTHONPATH') else '')
+            )
+            print(
+                f'[sweep bot_eval] subprocess eval vs bot_policy={int(b)}  '
+                f'games={num_games}  gpu={gpu_id}  ckpt={policy_path}'
+            )
+            # Stream child stdout when verbose so sweep workers still show
+            # progress; otherwise capture for the failure message.
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                cwd=pkg_root,
+                stdout=None if verbose else subprocess.PIPE,
+                stderr=subprocess.STDOUT if not verbose else None,
+                text=True,
+            )
+            if proc.returncode != 0:
+                tail = ''
+                if not verbose and proc.stdout:
+                    tail = '\n' + proc.stdout[-4000:]
+                raise RuntimeError(
+                    f'trial bot_eval: eval_bot bot={b} exited '
+                    f'{proc.returncode}{tail}'
+                )
+            if not os.path.isfile(out_path):
+                raise RuntimeError(
+                    f'trial bot_eval: bot {b} wrote no eval_output at {out_path}'
+                )
+            with open(out_path) as f:
+                payload = json.load(f)
+            logs = payload.get('logs') or {}
+            wr = float(logs.get('env/slot_0_score', 0.0))
+            n = float(logs.get('env/n', 0.0))
+            if n <= 0:
+                raise RuntimeError(
+                    f'trial bot_eval: bot {b} returned env/n={n} '
+                    f'(no games scored); payload={payload!r}'
+                )
+            per_bot[int(b)] = wr
+            print(f'[sweep bot_eval] bot_policy={int(b)}  wr={wr:.4f}  n={n:.0f}')
+
+    if len(per_bot) != len(bots):
+        raise RuntimeError(
+            f'trial bot_eval: expected {len(bots)} bots, got {sorted(per_bot)}'
         )
-        per_bot[int(b)] = float(logs.get('env/slot_0_score', 0.0))
-    mean_wr = float(np.mean(list(per_bot.values()))) if per_bot else 0.0
+    mean_wr = float(np.mean(list(per_bot.values())))
     return mean_wr, per_bot
 
 
@@ -507,39 +591,71 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
 
     # End-of-trial scripted-bot suite → single Protein score (mean WR bots 3–6).
     bot_eval_detail = None
+    bot_eval_failed = False
     if use_bot_eval_metric:
         sw = args.get('sweep') or {}
         bots = _parse_sweep_bot_list(sw.get('bot_eval_bots', '3,4,5,6'))
         games = int(float(sw.get('bot_eval_games', 2048) or 2048))
-        try:
-            mean_wr, per_bot = _trial_bot_eval_mean(
-                env_name, model_path, args, bots=bots, num_games=games,
-                verbose=verbose)
-        except Exception as e:
-            print(f'WARNING: trial bot_eval failed: {e}')
-            mean_wr, per_bot = 0.0, {}
-        bot_eval_detail = {'mean': mean_wr, 'per_bot': per_bot, 'bots': bots,
-                           'games': games, 'policy_path': model_path}
-        # One observe point: final bot-eval mean (not mid-train env series).
-        metrics['env/bot_eval_wr'] = [float(mean_wr)]
-        for b, wr in per_bot.items():
-            metrics[f'env/bot_eval_wr_{b}'] = [float(wr)]
-        # Align cost/steps to a single final observation.
+        # Align cost/steps to a single final observation for Protein.
         up = metrics.get('uptime') or [0.0]
         steps = metrics.get('agent_steps') or [float(total_timesteps)]
-        metrics['uptime'] = [float(up[-1])]
-        metrics['agent_steps'] = [float(steps[-1])]
-        detail = ' '.join(f'bot{b}={wr:.4f}' for b, wr in sorted(per_bot.items()))
-        print(f'[sweep bot_eval] mean_wr={mean_wr:.4f}  {detail}')
-        if args.get('wandb'):
-            try:
-                import wandb
-                if wandb.run is not None:
-                    payload = {'env/bot_eval_wr': mean_wr}
-                    payload.update({f'env/bot_eval_wr_{b}': wr for b, wr in per_bot.items()})
-                    wandb.log(payload, step=int(metrics['agent_steps'][-1]))
-            except Exception:
-                pass
+        try:
+            up_f = float(up[-1] if isinstance(up, (list, tuple)) else up)
+        except (TypeError, ValueError, IndexError):
+            up_f = 0.0
+        try:
+            steps_f = float(steps[-1] if isinstance(steps, (list, tuple)) else steps)
+        except (TypeError, ValueError, IndexError):
+            steps_f = float(total_timesteps)
+        metrics['uptime'] = [up_f]
+        metrics['agent_steps'] = [steps_f]
+        try:
+            # Always verbose so sweep workers (verbose=False train) still show eval.
+            mean_wr, per_bot = _trial_bot_eval_mean(
+                env_name, model_path, args, bots=bots, num_games=games,
+                verbose=True)
+            bot_eval_detail = {
+                'ok': True,
+                'mean': float(mean_wr),
+                'per_bot': {str(k): float(v) for k, v in per_bot.items()},
+                'bots': list(bots),
+                'games': games,
+                'policy_path': model_path,
+            }
+            metrics['env/bot_eval_wr'] = [float(mean_wr)]
+            for b, wr in per_bot.items():
+                metrics[f'env/bot_eval_wr_{b}'] = [float(wr)]
+            detail = ' '.join(
+                f'bot{b}={wr:.4f}' for b, wr in sorted(per_bot.items()))
+            print(f'[sweep bot_eval] mean_wr={mean_wr:.4f}  {detail}')
+            if args.get('wandb'):
+                try:
+                    import wandb
+                    if wandb.run is not None:
+                        payload = {'env/bot_eval_wr': float(mean_wr)}
+                        payload.update({
+                            f'env/bot_eval_wr_{b}': float(wr)
+                            for b, wr in per_bot.items()
+                        })
+                        wandb.log(payload, step=int(steps_f))
+                except Exception:
+                    pass
+        except Exception as e:
+            import traceback
+            bot_eval_failed = True
+            print(f'WARNING: trial bot_eval failed: {e}')
+            traceback.print_exc()
+            bot_eval_detail = {
+                'ok': False,
+                'mean': None,
+                'per_bot': {},
+                'bots': list(bots),
+                'games': games,
+                'policy_path': model_path,
+                'error': str(e),
+            }
+            # Do not invent a 0.0 success score — Protein should see a failure.
+            metrics.pop('env/bot_eval_wr', None)
 
     # Save own log: config + downsampled results
     if artifact_owner:
@@ -560,16 +676,27 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         wandb.run.finish()
 
     if artifact_owner and result_queue is not None:
-        score_key = 'env/bot_eval_wr' if use_bot_eval_metric else target_key
-        if score_key not in metrics:
-            result_queue.put((args['gpu_id'], None, None, None))
+        if use_bot_eval_metric:
+            if bot_eval_failed or 'env/bot_eval_wr' not in metrics:
+                # Parent treats falsy scores as is_failure=True
+                result_queue.put((args['gpu_id'], None, None, None))
+            else:
+                result_queue.put((
+                    args['gpu_id'],
+                    metrics['env/bot_eval_wr'],
+                    metrics['uptime'],
+                    metrics['agent_steps'],
+                ))
         else:
-            result_queue.put((
-                args['gpu_id'],
-                metrics[score_key],
-                metrics['uptime'],
-                metrics['agent_steps'],
-            ))
+            if target_key not in metrics:
+                result_queue.put((args['gpu_id'], None, None, None))
+            else:
+                result_queue.put((
+                    args['gpu_id'],
+                    metrics[target_key],
+                    metrics['uptime'],
+                    metrics['agent_steps'],
+                ))
 
 
 def train(env_name, args=None, gpus=None, **kwargs):
@@ -644,10 +771,9 @@ def sweep(env_name, args=None, pareto=False):
                 sweep_obj.observe(done_args, 0, 0, is_failure=True)
             else:
                 completed += 1
-
-            for s, c, t in zip(scores, costs, timesteps):
-                done_args['train']['total_timesteps'] = t
-                sweep_obj.observe(done_args, s, c, is_failure=False)
+                for s, c, t in zip(scores, costs, timesteps):
+                    done_args['train']['total_timesteps'] = t
+                    sweep_obj.observe(done_args, s, c, is_failure=False)
 
         idx = completed + len(active)
         if idx >= num_experiments:
