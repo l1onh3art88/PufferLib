@@ -458,6 +458,9 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     flat_logs = {}
     train_epochs = int(total_timesteps // (args['vec']['total_agents'] * args['train']['horizon']))
     eval_epochs = 0 if league_mode else train_epochs // 2
+    # Dashboard/wandb throttle only — must NOT gate selfplay.step (snapshots /
+    # opponent swaps are step-based; wall-clock gating broke multi-GPU determinism).
+    last_dashboard_time = 0.0
     for epoch in range(train_epochs + eval_epochs):
         if epoch < train_epochs:
             selfplay.sync(pufferl, backend, pool_state)
@@ -480,15 +483,21 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             backend.save_weights(pufferl, model_path)
             smerl.save_sidecar(pufferl, backend, model_path)
 
-        if (time.time() < pufferl.last_log_time + 0.6
-                and epoch < train_epochs - 1):
-            continue
-
-        logs = backend.eval_log(pufferl) if epoch >= train_epochs else backend.log(pufferl)
-        flat_logs = {**flat_logs, **dict(unroll_nested_dict(logs))}
+        # Selfplay / SMERL advance every train epoch on the step clock.
         if epoch < train_epochs:
+            logs = dict(unroll_nested_dict(backend.log(pufferl)))
+            flat_logs = {**flat_logs, **logs}
             selfplay.step(pufferl, backend, pool_state, flat_logs, epoch)
             smerl.step(pufferl, backend, args, smerl_state, flat_logs)
+
+        now = time.time()
+        if (now < last_dashboard_time + 0.6 and epoch < train_epochs - 1):
+            continue
+        last_dashboard_time = now
+
+        if epoch >= train_epochs:
+            logs = dict(unroll_nested_dict(backend.eval_log(pufferl)))
+            flat_logs = {**flat_logs, **logs}
 
         if verbose:
             print_dashboard(args, model_size, flat_logs)
