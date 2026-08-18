@@ -115,6 +115,7 @@ struct Robot {
     int bullet_idx;
     float gun_heat;
     float energy;
+    float start_energy;  // episode start; damage_received uses this (energy_dr)
 };
 
 typedef struct Client Client;
@@ -159,6 +160,14 @@ struct Robocode {
     float reward_damage_taken_slot_1;
     float reward_range_damage_inflicted_slot_1;
     float dr;
+    // Episode-level domain randomization (physics/arena), sampled in c_reset.
+    // base_width/height are the configured defaults; width/height may change
+    // each episode when arena_dr > 0. Obs already normalize by width/height.
+    int base_width;
+    int base_height;
+    float arena_dr;    // multiplicative size jitter around base (0 = fixed)
+    float spawn_dr;    // P(structured spawn) vs uniform; headings always random
+    float energy_dr;   // start energy jitter around 100; independent per robot
     int bot_policy;          // policy for bot index 0 (and sole bot when num_bots==1)
     int bot_policy_1;        // policy for bot index 1 (bot-vs-bot tournaments)
     int bot_match_winner;    // last pure-bot episode: 0/1 winner, -1 draw, -2 none
@@ -231,7 +240,8 @@ void add_log(Robocode* env) {
     // Called at episode end. Finalize damage_received from current energy,
     // then fold per-agent running logs into the aggregate env->log.
     for (int i = 0; i < env->num_agents; i++) {
-        env->logs[i].damage_received = 100.0f - (float)env->robots[i].energy;
+        env->logs[i].damage_received =
+            env->robots[i].start_energy - (float)env->robots[i].energy;
         env->log.perf            += env->logs[i].perf;
         env->log.episode_return  += env->logs[i].episode_return;
         env->log.episode_length  += env->logs[i].episode_length;
@@ -574,51 +584,157 @@ void compute_observations(Robocode* env){
         obs[off + 7] = 1.0f;
     }
 }
+static inline float sample_mult_range(Robocode* env, float dr) {
+    if (dr <= 0.0f) return 1.0f;
+    float upper = 1.0f + dr;
+    float lower = 1.0f / upper;
+    return lower + (upper - lower) * rand_unit(env);
+}
+
+static inline void sample_episode_arena(Robocode* env) {
+    int bw = env->base_width > 0 ? env->base_width : env->width;
+    int bh = env->base_height > 0 ? env->base_height : env->height;
+    if (bw < 64) bw = 64;
+    if (bh < 64) bh = 64;
+    if (env->arena_dr <= 0.0f) {
+        env->width = bw;
+        env->height = bh;
+        return;
+    }
+    // Independent multiplicative jitter → aspect ratio varies too.
+    float sw = sample_mult_range(env, env->arena_dr);
+    float sh = sample_mult_range(env, env->arena_dr);
+    int w = (int)lroundf((float)bw * sw);
+    int h = (int)lroundf((float)bh * sh);
+    if (w < 400) w = 400;
+    if (h < 400) h = 400;
+    if (w > 1600) w = 1600;
+    if (h > 1600) h = 1600;
+    env->width = w;
+    env->height = h;
+}
+
+// Fill xs[0..n) ys[0..n) with spawn positions. Returns 1 on success.
+static inline int sample_spawn_positions(Robocode* env, int n, float* xs, float* ys) {
+    const float margin = 48.0f;
+    float w = (float)env->width;
+    float h = (float)env->height;
+    if (w < 2.0f * margin + 64.0f || h < 2.0f * margin + 64.0f) return 0;
+
+    int structured = (n == 2 && env->spawn_dr > 0.0f && rand_unit(env) < env->spawn_dr);
+    if (!structured) {
+        for (int i = 0; i < n; i++) {
+            int tries = 0;
+            for (;;) {
+                float x = margin + rand_unit(env) * (w - 2.0f * margin);
+                float y = margin + rand_unit(env) * (h - 2.0f * margin);
+                int ok = 1;
+                for (int j = 0; j < i; j++) {
+                    if (fabsf(x - xs[j]) <= 32.0f && fabsf(y - ys[j]) <= 32.0f) {
+                        ok = 0;
+                        break;
+                    }
+                }
+                if (ok || ++tries > 64) {
+                    xs[i] = x;
+                    ys[i] = y;
+                    break;
+                }
+            }
+        }
+        return 1;
+    }
+
+    // Structured 1v1 layouts — forces distance / angle variety beyond uniform.
+    int mode = (int)(rand_r(&env->rng) % 4u);
+    float flip = rand_unit(env) < 0.5f ? 1.0f : -1.0f;
+    if (mode == 0) {
+        // Opposite corners.
+        xs[0] = margin;           ys[0] = margin;
+        xs[1] = w - margin;       ys[1] = h - margin;
+        if (flip < 0.0f) { xs[0] = w - margin; ys[0] = margin; xs[1] = margin; ys[1] = h - margin; }
+    } else if (mode == 1) {
+        // Opposite mid-walls (east-west duel).
+        xs[0] = margin;           ys[0] = h * 0.5f;
+        xs[1] = w - margin;       ys[1] = h * 0.5f;
+        if (flip < 0.0f) { float t = xs[0]; xs[0] = xs[1]; xs[1] = t; }
+    } else if (mode == 2) {
+        // Opposite mid-walls (north-south duel).
+        xs[0] = w * 0.5f;         ys[0] = margin;
+        xs[1] = w * 0.5f;         ys[1] = h - margin;
+        if (flip < 0.0f) { float t = ys[0]; ys[0] = ys[1]; ys[1] = t; }
+    } else {
+        // Close-range knife fight near a random point.
+        float cx = margin + 0.25f * (w - 2.0f * margin) + 0.5f * (w - 2.0f * margin) * rand_unit(env);
+        float cy = margin + 0.25f * (h - 2.0f * margin) + 0.5f * (h - 2.0f * margin) * rand_unit(env);
+        float ang = rand_unit(env) * 6.2831853f;
+        float sep = 40.0f + 80.0f * rand_unit(env);
+        xs[0] = cx + sep * cosf(ang);
+        ys[0] = cy + sep * sinf(ang);
+        xs[1] = cx - sep * cosf(ang);
+        ys[1] = cy - sep * sinf(ang);
+        for (int i = 0; i < 2; i++) {
+            if (xs[i] < margin) xs[i] = margin;
+            if (xs[i] > w - margin) xs[i] = w - margin;
+            if (ys[i] < margin) ys[i] = margin;
+            if (ys[i] > h - margin) ys[i] = h - margin;
+        }
+    }
+    return 1;
+}
+
 void c_reset(Robocode* env) {
     env->tick = 0;
     // boundary_reached is owned by selfplay.py alignment; do not clear it here.
     int total_robots = env->num_agents + env->num_bots;
     memset(env->bullets, 0, NUM_BULLETS * total_robots * sizeof(Bullet));
-    int idx = 0;
-    float x, y;
-    while (idx < total_robots) {
-        Robot* robot = &env->robots[idx];
-        x = 16 + rand_r(&env->rng) % (env->width-32);
-        y = 16 + rand_r(&env->rng) % (env->height-32);
-        bool collided = false;
-        for (int j = 0; j < idx; j++) {
-            Robot* other = &env->robots[j];
-            float abs_x = fabsf(x - other->x);
-            float abs_y = fabsf(y - other->y);
-            if(abs_x <= 32.0f && abs_y <= 32.0f){
-                collided = true;
-                break;
-            }
+
+    sample_episode_arena(env);
+
+    float xs[16];
+    float ys[16];
+    if (total_robots > 16) total_robots = 16;
+    if (!sample_spawn_positions(env, total_robots, xs, ys)) {
+        // Fallback: center line.
+        for (int i = 0; i < total_robots; i++) {
+            xs[i] = (float)env->width * (0.25f + 0.5f * (float)i / (float)total_robots);
+            ys[i] = (float)env->height * 0.5f;
         }
-        if (!collided) {
-            robot->x = x;
-            robot->y = y;
-            robot->v = 0;
-            robot->heading = 0;
-            robot->gun_heading = 0;
-            robot->radar_heading = 0;
-            robot->radar_heading_prev = 0;
-            robot->energy = 100.0f;
-            robot->gun_heat = 3;
-            robot->bullet_idx = 0;
-            if (idx < env->num_agents) {
-                sample_agent_multipliers(env, robot);
-                assign_agent_reward_coefficients(env, robot, idx);
-                env->logs[idx] = (Log){0};
-            } else {
-                robot->speed_mult = 1.0f;
-                robot->handling_mult = 1.0f;
-                robot->power_mult = 1.0f;
-                robot->reward_melee_damage_inflicted = 0.0f;
-                robot->reward_damage_taken = 0.0f;
-                robot->reward_range_damage_inflicted = 0.0f;
-            }
-            idx += 1;
+    }
+
+    for (int idx = 0; idx < total_robots; idx++) {
+        Robot* robot = &env->robots[idx];
+        robot->x = xs[idx];
+        robot->y = ys[idx];
+        robot->v = 0;
+        // Random pose when spawn_dr>0 (train). Eval forces spawn_dr=0 → heading 0
+        // for a fixed testbed. Previously headings were always 0.
+        float hdg = (env->spawn_dr > 0.0f) ? (rand_unit(env) * 360.0f) : 0.0f;
+        robot->heading = hdg;
+        robot->gun_heading = hdg;
+        robot->radar_heading = hdg;
+        robot->radar_heading_prev = hdg;
+        float em = sample_mult_range(env, env->energy_dr);
+        float energy = 100.0f * em;
+        if (energy < 30.0f) energy = 30.0f;
+        if (energy > 200.0f) energy = 200.0f;
+        robot->energy = energy;
+        robot->start_energy = energy;
+        // Occasional warm gun so first-shot timing isn't identical every ep.
+        robot->gun_heat = (env->energy_dr > 0.0f && rand_unit(env) < 0.35f)
+            ? (3.0f * rand_unit(env)) : 3.0f;
+        robot->bullet_idx = 0;
+        if (idx < env->num_agents) {
+            sample_agent_multipliers(env, robot);
+            assign_agent_reward_coefficients(env, robot, idx);
+            env->logs[idx] = (Log){0};
+        } else {
+            robot->speed_mult = 1.0f;
+            robot->handling_mult = 1.0f;
+            robot->power_mult = 1.0f;
+            robot->reward_melee_damage_inflicted = 0.0f;
+            robot->reward_damage_taken = 0.0f;
+            robot->reward_range_damage_inflicted = 0.0f;
         }
     }
     bot_mems_episode_reset(env);
@@ -968,7 +1084,17 @@ struct Client {
 };
 
 Client* make_client(Robocode* env) {
-    InitWindow(env->width+100, env->height+100, "PufferLib Ray Robocode");
+    // Window sized for the largest arena arena_dr can produce (see sample_episode_arena).
+    int bw = env->base_width > 0 ? env->base_width : env->width;
+    int bh = env->base_height > 0 ? env->base_height : env->height;
+    float adr = env->arena_dr > 0.0f ? env->arena_dr : 0.0f;
+    int max_w = (int)lroundf((float)bw * (1.0f + adr));
+    int max_h = (int)lroundf((float)bh * (1.0f + adr));
+    if (max_w < bw) max_w = bw;
+    if (max_h < bh) max_h = bh;
+    if (max_w > 1600) max_w = 1600;
+    if (max_h > 1600) max_h = 1600;
+    InitWindow(max_w + 80, max_h + 80, "PufferLib Ray Robocode");
     SetTargetFPS(60);
     Client* client = (Client*)calloc(1, sizeof(Client));
     client->atlas = LoadTexture("resources/robocode/robocode.png");
@@ -988,13 +1114,22 @@ void c_render(Robocode* env) {
     BeginDrawing();
     ClearBackground((Color){6, 24, 24, 255});
 
-    // Center the world inside the padded window.
+    // Fit the *current* episode arena (post arena_dr) into the window.
+    float pad = 24.0f;
+    float view_w = fmaxf(1.0f, (float)GetScreenWidth() - 2.0f * pad);
+    float view_h = fmaxf(1.0f, (float)GetScreenHeight() - 2.0f * pad);
+    float zoom_x = view_w / fmaxf(1.0f, (float)env->width);
+    float zoom_y = view_h / fmaxf(1.0f, (float)env->height);
+    float zoom = fminf(zoom_x, zoom_y);
+    if (zoom <= 0.0f) zoom = 1.0f;
+
     Camera2D camera = {0};
-    camera.offset = (Vector2){(GetScreenWidth() - env->width)/2.0f,
-                              (GetScreenHeight() - env->height)/2.0f};
-    camera.zoom = 1.0f;
+    camera.target = (Vector2){env->width * 0.5f, env->height * 0.5f};
+    camera.offset = (Vector2){GetScreenWidth() * 0.5f, GetScreenHeight() * 0.5f};
+    camera.zoom = zoom;
     BeginMode2D(camera);
 
+    // Floor tiles across the full current map.
     for (int x = 0; x < env->width; x+=64) {
         for (int y = 0; y < env->height; y+=64) {
             int src_x = 64 * ((x*33409 + y*30971) % 5);
@@ -1005,6 +1140,9 @@ void c_render(Robocode* env) {
             DrawTexturePro(client->atlas, src_rect, dst_rect, (Vector2){0, 0}, 0, WHITE);
         }
     }
+    // Arena border so resized maps are obvious.
+    DrawRectangleLinesEx((Rectangle){0, 0, (float)env->width, (float)env->height},
+        2.0f / zoom, (Color){0, 187, 187, 255});
 
     int total_robots = env->num_agents + env->num_bots;
     for (int i = 0; i < total_robots; i++) {
@@ -1047,9 +1185,9 @@ void c_render(Robocode* env) {
         DrawCircleV(bullet_pos, 4, WHITE);
     }
 
-    const char* tick_text = TextFormat("%i", env->tick);
-    DrawText(tick_text, 10, 10, 10, WHITE);
-
     EndMode2D();
+    // Screen-space HUD (not affected by arena zoom).
+    DrawText(TextFormat("tick=%i  arena=%ix%i  zoom=%.2f",
+        env->tick, env->width, env->height, zoom), 10, 10, 16, WHITE);
     EndDrawing();
 }

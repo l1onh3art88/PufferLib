@@ -130,6 +130,8 @@ Env* my_vec_init(int* num_envs_out, int* buffer_env_starts, int* buffer_env_coun
 void my_init(Env* env, Dict* kwargs) {
     env->width = dict_get(kwargs, "width")->value;
     env->height = dict_get(kwargs, "height")->value;
+    env->base_width = env->width;
+    env->base_height = env->height;
     env->num_agents = dict_get(kwargs, "num_agents")->value;
     env->num_bots = dict_get(kwargs, "num_bots")->value;
     env->max_ticks = (int)dict_get(kwargs, "max_ticks")->value;
@@ -152,6 +154,16 @@ void my_init(Env* env, Dict* kwargs) {
         "reward_range_damage_inflicted_slot_1", env->reward_range_damage_inflicted);
     DictItem* dr_item = dict_get_unsafe(kwargs, "dr");
     env->dr = dr_item ? (float)dr_item->value : 0.0f;
+    // Arena / spawn / energy episode DR (defaults off for backward compat).
+    env->arena_dr = dict_get_float_default(kwargs, "arena_dr", 0.0f);
+    if (env->arena_dr < 0.0f) env->arena_dr = 0.0f;
+    if (env->arena_dr > 1.5f) env->arena_dr = 1.5f;
+    env->spawn_dr = dict_get_float_default(kwargs, "spawn_dr", 0.0f);
+    if (env->spawn_dr < 0.0f) env->spawn_dr = 0.0f;
+    if (env->spawn_dr > 1.0f) env->spawn_dr = 1.0f;
+    env->energy_dr = dict_get_float_default(kwargs, "energy_dr", 0.0f);
+    if (env->energy_dr < 0.0f) env->energy_dr = 0.0f;
+    if (env->energy_dr > 1.0f) env->energy_dr = 1.0f;
     env->bot_policy = dict_get(kwargs, "bot_policy")->value;
     {
         DictItem* bp1 = dict_get_unsafe(kwargs, "bot_policy_1");

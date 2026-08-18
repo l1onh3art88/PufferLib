@@ -205,18 +205,35 @@ def _train_worker(args):
 
     backend.close(pufferl)
 
+def _policy_arch_ints(policy):
+    '''Match C++ create_pufferl: double→int truncation (not round).
+
+    Protein suggests float num_layers (e.g. 4.35 / 5.97). Primary uses
+    (int)hypers.num_layers → truncate. Frozen bank must use the same cast or
+    pufferl_load_frozen_bank size-mismatches on every pool load.'''
+    policy = policy or {}
+    try:
+        hidden = int(float(policy.get('hidden_size', 256)))
+    except (TypeError, ValueError):
+        hidden = 256
+    try:
+        layers = int(float(policy.get('num_layers', 4)))  # truncate like C
+    except (TypeError, ValueError):
+        layers = 4
+    return hidden, layers
+
+
 def _sync_frozen_bank_arch_to_policy(args):
     '''Point frozen-bank arch at this trial's policy.hidden_size / num_layers.
 
-    Used for non-league Protein sweeps with selfplay: pool snapshots and loads
-    must match the trial arch. Leave frozen_bank_* alone for plain `train`
-    (external fixed-arch opponent pools).'''
+    Used when the frozen pool is this run's own snapshots (sweep hist-SP, or
+    train without an external opponent_pool). Leave frozen_bank_* alone when
+    loading a fixed-arch external opponent_pool.'''
     policy = args.get('policy') or {}
     vec = args.setdefault('vec', {})
-    if 'hidden_size' in policy:
-        vec['frozen_bank_hidden_size'] = int(float(policy['hidden_size']))
-    if 'num_layers' in policy:
-        vec['frozen_bank_num_layers'] = int(round(float(policy['num_layers'])))
+    hidden, layers = _policy_arch_ints(policy)
+    vec['frozen_bank_hidden_size'] = hidden
+    vec['frozen_bank_num_layers'] = layers
 
 
 def _parse_sweep_bot_list(spec, default=(3, 4, 5, 6)):
@@ -270,14 +287,7 @@ def _trial_bot_eval_mean(env_name, policy_path, args, bots=None, num_games=2048,
 
     gpu_id = int(args.get('gpu_id', 0) or 0)
     policy = args.get('policy') or {}
-    try:
-        hidden = int(float(policy.get('hidden_size', 256)))
-    except (TypeError, ValueError):
-        hidden = 256
-    try:
-        layers = int(round(float(policy.get('num_layers', 4))))
-    except (TypeError, ValueError):
-        layers = 4
+    hidden, layers = _policy_arch_ints(policy)
     try:
         expansion = int(float(policy.get('expansion_factor', 1)))
     except (TypeError, ValueError):
@@ -367,10 +377,14 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         # part of the rollout rows and their episodes leak into env/* metrics.
         args['vec']['num_frozen_banks'] = 0
         args['vec']['frozen_bank_pct'] = 0.0
-    elif sweep_obj is not None:
-        # Sweep trial: keep frozen bank arch locked to this trial's policy so
-        # Protein hidden_size / num_layers suggestions stay load-compatible.
-        _sync_frozen_bank_arch_to_policy(args)
+    else:
+        # Own-pool hist SP (sweep or train): bank must match primary arch so
+        # bootstrap/snapshots load. External opponent_pool keeps frozen_bank_*
+        # as configured (fixed enemy arch).
+        sp = args.get('selfplay') or {}
+        has_external_pool = bool(str(sp.get('opponent_pool', '') or '').strip())
+        if sweep_obj is not None or not has_external_pool:
+            _sync_frozen_bank_arch_to_policy(args)
 
     if args['wandb'] and artifact_owner:
         import wandb
@@ -596,19 +610,16 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
         sw = args.get('sweep') or {}
         bots = _parse_sweep_bot_list(sw.get('bot_eval_bots', '3,4,5,6'))
         games = int(float(sw.get('bot_eval_games', 2048) or 2048))
-        # Align cost/steps to a single final observation for Protein.
-        up = metrics.get('uptime') or [0.0]
-        steps = metrics.get('agent_steps') or [float(total_timesteps)]
-        try:
-            up_f = float(up[-1] if isinstance(up, (list, tuple)) else up)
-        except (TypeError, ValueError, IndexError):
-            up_f = 0.0
-        try:
-            steps_f = float(steps[-1] if isinstance(steps, (list, tuple)) else steps)
-        except (TypeError, ValueError, IndexError):
-            steps_f = float(total_timesteps)
-        metrics['uptime'] = [up_f]
-        metrics['agent_steps'] = [steps_f]
+        def _series_last(series, default=0.0):
+            try:
+                if isinstance(series, (list, tuple)):
+                    return float(series[-1]) if series else float(default)
+                return float(series)
+            except (TypeError, ValueError, IndexError):
+                return float(default)
+
+        up_f = _series_last(metrics.get('uptime'), 0.0)
+        steps_f = _series_last(metrics.get('agent_steps'), total_timesteps)
         try:
             # Always verbose so sweep workers (verbose=False train) still show eval.
             mean_wr, per_bot = _trial_bot_eval_mean(
@@ -622,6 +633,13 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
                 'games': games,
                 'policy_path': model_path,
             }
+            # Collapse every series to the final point so Protein + constellation
+            # see one observation with matching lengths (incl. bot_eval_wr).
+            for k, v in list(metrics.items()):
+                if isinstance(v, list):
+                    metrics[k] = [_series_last(v)]
+            metrics['uptime'] = [up_f]
+            metrics['agent_steps'] = [steps_f]
             metrics['env/bot_eval_wr'] = [float(mean_wr)]
             for b, wr in per_bot.items():
                 metrics[f'env/bot_eval_wr_{b}'] = [float(wr)]
@@ -656,6 +674,8 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             }
             # Do not invent a 0.0 success score — Protein should see a failure.
             metrics.pop('env/bot_eval_wr', None)
+            for b in bots:
+                metrics.pop(f'env/bot_eval_wr_{b}', None)
 
     # Save own log: config + downsampled results
     if artifact_owner:
@@ -836,7 +856,11 @@ def eval_bot(env_name, policy_path=None, num_games=16384, eval_agents=0, burnin_
     args['vec']['num_frozen_banks'] = 0
     args['vec']['frozen_bank_pct'] = 0.0
     args.setdefault('selfplay', {})['enabled'] = 0
+    # Fixed testbed: zero every train-time domain-randomization knob.
     args.setdefault('env', {})['dr'] = 0.0
+    args['env']['arena_dr'] = 0.0
+    args['env']['spawn_dr'] = 0.0
+    args['env']['energy_dr'] = 0.0
     args['env']['num_agents'] = 1
     args['env']['num_bots'] = 1
     # Single-bot eval must not use train-time opponent mix / curriculum noise.
