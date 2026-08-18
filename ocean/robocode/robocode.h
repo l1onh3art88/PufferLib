@@ -166,7 +166,7 @@ struct Robocode {
     int base_width;
     int base_height;
     float arena_dr;    // multiplicative size jitter around base (0 = fixed)
-    float spawn_dr;    // P(structured spawn) vs uniform; headings always random
+    float spawn_dr;    // P(structured spawn) vs uniform; headings when spawn_dr>0
     float energy_dr;   // start energy jitter around 100; independent per robot
     int bot_policy;          // policy for bot index 0 (and sole bot when num_bots==1)
     int bot_policy_1;        // policy for bot index 1 (bot-vs-bot tournaments)
@@ -452,16 +452,14 @@ static inline void sample_dr_triplet(Robocode* env, float* a, float* b, float* c
     float width = upper - lower;
     if (width <= 0.0f) return;
 
-    for (int tries = 0; tries < 64; tries++) {
-        float first = lower + width * rand_unit(env);
-        float second = lower + width * rand_unit(env);
-        float third = 3.0f - first - second;
-        if (third >= lower && third <= upper) {
-            *a = first;
-            *b = second;
-            *c = third;
-            return;
-        }
+    // Fixed exactly 2 draws (no rejection loop). Invalid third → identity.
+    float first = lower + width * rand_unit(env);
+    float second = lower + width * rand_unit(env);
+    float third = 3.0f - first - second;
+    if (third >= lower && third <= upper) {
+        *a = first;
+        *b = second;
+        *c = third;
     }
 }
 
@@ -584,11 +582,19 @@ void compute_observations(Robocode* env){
         obs[off + 7] = 1.0f;
     }
 }
+// Fixed-count integer draw in [0, n). n must be > 0.
+static inline unsigned int rand_int(Robocode* env, unsigned int n) {
+    return rand_r(&env->rng) % n;
+}
+
+// Multiplicative factor in [1/(1+dr), 1+dr] via fixed one-draw integer lerp.
 static inline float sample_mult_range(Robocode* env, float dr) {
-    if (dr <= 0.0f) return 1.0f;
+    if (!(dr > 0.0f)) return 1.0f;
     float upper = 1.0f + dr;
     float lower = 1.0f / upper;
-    return lower + (upper - lower) * rand_unit(env);
+    // Always exactly one rand_r — no rejection.
+    float u = (float)rand_int(env, 10000u) / 9999.0f;
+    return lower + (upper - lower) * u;
 }
 
 static inline void sample_episode_arena(Robocode* env) {
@@ -596,12 +602,12 @@ static inline void sample_episode_arena(Robocode* env) {
     int bh = env->base_height > 0 ? env->base_height : env->height;
     if (bw < 64) bw = 64;
     if (bh < 64) bh = 64;
-    if (env->arena_dr <= 0.0f) {
+    if (!(env->arena_dr > 0.0f)) {
         env->width = bw;
         env->height = bh;
         return;
     }
-    // Independent multiplicative jitter → aspect ratio varies too.
+    // Always two draws (w and h), even if clamped afterward.
     float sw = sample_mult_range(env, env->arena_dr);
     float sh = sample_mult_range(env, env->arena_dr);
     int w = (int)lroundf((float)bw * sw);
@@ -614,73 +620,81 @@ static inline void sample_episode_arena(Robocode* env) {
     env->height = h;
 }
 
-// Fill xs[0..n) ys[0..n) with spawn positions. Returns 1 on success.
-static inline int sample_spawn_positions(Robocode* env, int n, float* xs, float* ys) {
-    const float margin = 48.0f;
-    float w = (float)env->width;
-    float h = (float)env->height;
-    if (w < 2.0f * margin + 64.0f || h < 2.0f * margin + 64.0f) return 0;
+// Fixed RNG budget spawn (no collision-retry loops that desync the stream).
+static inline void sample_spawn_positions(Robocode* env, int n, float* xs, float* ys) {
+    const int margin = 48;
+    int w = env->width;
+    int h = env->height;
+    int span_x = w - 2 * margin;
+    int span_y = h - 2 * margin;
+    if (span_x < 1) span_x = 1;
+    if (span_y < 1) span_y = 1;
 
-    int structured = (n == 2 && env->spawn_dr > 0.0f && rand_unit(env) < env->spawn_dr);
-    if (!structured) {
-        for (int i = 0; i < n; i++) {
-            int tries = 0;
-            for (;;) {
-                float x = margin + rand_unit(env) * (w - 2.0f * margin);
-                float y = margin + rand_unit(env) * (h - 2.0f * margin);
-                int ok = 1;
-                for (int j = 0; j < i; j++) {
-                    if (fabsf(x - xs[j]) <= 32.0f && fabsf(y - ys[j]) <= 32.0f) {
-                        ok = 0;
-                        break;
-                    }
-                }
-                if (ok || ++tries > 64) {
-                    xs[i] = x;
-                    ys[i] = y;
-                    break;
-                }
-            }
-        }
-        return 1;
+    // Coin-flip always drawn when n==2 so stream length does not depend on
+    // whether structured spawn is chosen (still gated on spawn_dr>0).
+    int structured = 0;
+    if (n == 2 && env->spawn_dr > 0.0f) {
+        // Compare in integer space: P = spawn_dr.
+        unsigned int thr = (unsigned int)(env->spawn_dr * 10000.0f);
+        if (thr > 10000u) thr = 10000u;
+        structured = rand_int(env, 10000u) < thr;
     }
 
-    // Structured 1v1 layouts — forces distance / angle variety beyond uniform.
-    int mode = (int)(rand_r(&env->rng) % 4u);
-    float flip = rand_unit(env) < 0.5f ? 1.0f : -1.0f;
+    if (!structured || n != 2) {
+        for (int i = 0; i < n; i++) {
+            // Exactly 2 draws per robot; push apart deterministically if overlap.
+            int x = margin + (int)rand_int(env, (unsigned)span_x);
+            int y = margin + (int)rand_int(env, (unsigned)span_y);
+            for (int j = 0; j < i; j++) {
+                if (abs(x - (int)xs[j]) <= 32 && abs(y - (int)ys[j]) <= 32) {
+                    x = margin + (x + 47 + 53 * j) % span_x;
+                    y = margin + (y + 59 + 61 * j) % span_y;
+                }
+            }
+            xs[i] = (float)x;
+            ys[i] = (float)y;
+        }
+        return;
+    }
+
+    // Structured 1v1: always burn mode+flip+4 knife draws so stream length
+    // does not depend on which mode is selected.
+    int mode = (int)rand_int(env, 4u);
+    int flip = (int)rand_int(env, 2u);
+    float W = (float)w, H = (float)h, M = (float)margin;
+    float k0 = (float)rand_int(env, 10000u) / 9999.f;
+    float k1 = (float)rand_int(env, 10000u) / 9999.f;
+    float k2 = (float)rand_int(env, 10000u) / 9999.f;
+    float k3 = (float)rand_int(env, 10000u) / 9999.f;
     if (mode == 0) {
-        // Opposite corners.
-        xs[0] = margin;           ys[0] = margin;
-        xs[1] = w - margin;       ys[1] = h - margin;
-        if (flip < 0.0f) { xs[0] = w - margin; ys[0] = margin; xs[1] = margin; ys[1] = h - margin; }
+        xs[0] = M;       ys[0] = M;
+        xs[1] = W - M;   ys[1] = H - M;
+        if (flip) { xs[0] = W - M; ys[0] = M; xs[1] = M; ys[1] = H - M; }
     } else if (mode == 1) {
-        // Opposite mid-walls (east-west duel).
-        xs[0] = margin;           ys[0] = h * 0.5f;
-        xs[1] = w - margin;       ys[1] = h * 0.5f;
-        if (flip < 0.0f) { float t = xs[0]; xs[0] = xs[1]; xs[1] = t; }
+        xs[0] = M;       ys[0] = H * 0.5f;
+        xs[1] = W - M;   ys[1] = H * 0.5f;
+        if (flip) { float t = xs[0]; xs[0] = xs[1]; xs[1] = t; }
     } else if (mode == 2) {
-        // Opposite mid-walls (north-south duel).
-        xs[0] = w * 0.5f;         ys[0] = margin;
-        xs[1] = w * 0.5f;         ys[1] = h - margin;
-        if (flip < 0.0f) { float t = ys[0]; ys[0] = ys[1]; ys[1] = t; }
+        xs[0] = W * 0.5f; ys[0] = M;
+        xs[1] = W * 0.5f; ys[1] = H - M;
+        if (flip) { float t = ys[0]; ys[0] = ys[1]; ys[1] = t; }
     } else {
-        // Close-range knife fight near a random point.
-        float cx = margin + 0.25f * (w - 2.0f * margin) + 0.5f * (w - 2.0f * margin) * rand_unit(env);
-        float cy = margin + 0.25f * (h - 2.0f * margin) + 0.5f * (h - 2.0f * margin) * rand_unit(env);
-        float ang = rand_unit(env) * 6.2831853f;
-        float sep = 40.0f + 80.0f * rand_unit(env);
+        // Knife fight uses the 4 pre-drawn uniforms (cx, cy, ang, sep).
+        float cx = M + 0.25f * (W - 2.f * M) + 0.5f * (W - 2.f * M) * k0;
+        float cy = M + 0.25f * (H - 2.f * M) + 0.5f * (H - 2.f * M) * k1;
+        float ang = k2 * 6.2831853f;
+        float sep = 40.f + 80.f * k3;
         xs[0] = cx + sep * cosf(ang);
         ys[0] = cy + sep * sinf(ang);
         xs[1] = cx - sep * cosf(ang);
         ys[1] = cy - sep * sinf(ang);
         for (int i = 0; i < 2; i++) {
-            if (xs[i] < margin) xs[i] = margin;
-            if (xs[i] > w - margin) xs[i] = w - margin;
-            if (ys[i] < margin) ys[i] = margin;
-            if (ys[i] > h - margin) ys[i] = h - margin;
+            if (xs[i] < M) xs[i] = M;
+            if (xs[i] > W - M) xs[i] = W - M;
+            if (ys[i] < M) ys[i] = M;
+            if (ys[i] > H - M) ys[i] = H - M;
         }
     }
-    return 1;
 }
 
 void c_reset(Robocode* env) {
@@ -689,12 +703,9 @@ void c_reset(Robocode* env) {
     int total_robots = env->num_agents + env->num_bots;
     memset(env->bullets, 0, NUM_BULLETS * total_robots * sizeof(Bullet));
 
-    // Eval (and any DR-off run) must keep the legacy reset bit-identical:
-    // same rand_r/% spawn stream, heading=0, energy=100, gun_heat=3.
-    // The float spawn path below changes RNG consumption and broke deterministic
-    // eval_bot WRs across identical configs.
-    int dr_off = (env->arena_dr <= 0.0f && env->spawn_dr <= 0.0f
-                  && env->energy_dr <= 0.0f);
+    // Eval / DR-off: legacy bit-identical spawn (continues env->rng).
+    int dr_off = !(env->arena_dr > 0.0f) && !(env->spawn_dr > 0.0f)
+                 && !(env->energy_dr > 0.0f);
     if (dr_off) {
         if (env->base_width > 0) env->width = env->base_width;
         if (env->base_height > 0) env->height = env->base_height;
@@ -752,31 +763,39 @@ void c_reset(Robocode* env) {
     float ys[16];
     int nplace = total_robots;
     if (nplace > 16) nplace = 16;
-    if (!sample_spawn_positions(env, nplace, xs, ys)) {
-        for (int i = 0; i < nplace; i++) {
-            xs[i] = (float)env->width * (0.25f + 0.5f * (float)i / (float)nplace);
-            ys[i] = (float)env->height * 0.5f;
-        }
-    }
+    sample_spawn_positions(env, nplace, xs, ys);
 
     for (int idx = 0; idx < nplace; idx++) {
         Robot* robot = &env->robots[idx];
         robot->x = xs[idx];
         robot->y = ys[idx];
         robot->v = 0;
-        float hdg = (env->spawn_dr > 0.0f) ? (rand_unit(env) * 360.0f) : 0.0f;
+        // Fixed 1 draw when spawn_dr on; else heading 0 (no draw).
+        float hdg = 0.0f;
+        if (env->spawn_dr > 0.0f) {
+            hdg = (float)rand_int(env, 360u);
+        }
         robot->heading = hdg;
         robot->gun_heading = hdg;
         robot->radar_heading = hdg;
         robot->radar_heading_prev = hdg;
-        float em = sample_mult_range(env, env->energy_dr);
-        float energy = 100.0f * em;
-        if (energy < 30.0f) energy = 30.0f;
-        if (energy > 200.0f) energy = 200.0f;
+        // Always 1 energy draw when energy_dr on; always 2 gun-heat draws
+        // (use second only if warm) so stream length is fixed.
+        float energy = 100.0f;
+        if (env->energy_dr > 0.0f) {
+            energy = 100.0f * sample_mult_range(env, env->energy_dr);
+            if (energy < 30.0f) energy = 30.0f;
+            if (energy > 200.0f) energy = 200.0f;
+        }
         robot->energy = energy;
         robot->start_energy = energy;
-        robot->gun_heat = (env->energy_dr > 0.0f && rand_unit(env) < 0.35f)
-            ? (3.0f * rand_unit(env)) : 3.0f;
+        if (env->energy_dr > 0.0f) {
+            unsigned int warm = rand_int(env, 100u);      // draw #1 always
+            unsigned int heat = rand_int(env, 300u);      // draw #2 always
+            robot->gun_heat = (warm < 35u) ? (heat / 100.0f) : 3.0f;
+        } else {
+            robot->gun_heat = 3;
+        }
         robot->bullet_idx = 0;
         if (idx < env->num_agents) {
             sample_agent_multipliers(env, robot);
