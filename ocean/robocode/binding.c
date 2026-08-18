@@ -155,14 +155,16 @@ void my_init(Env* env, Dict* kwargs) {
     DictItem* dr_item = dict_get_unsafe(kwargs, "dr");
     env->dr = dr_item ? (float)dr_item->value : 0.0f;
     // Arena / spawn / energy episode DR (defaults off for backward compat).
+    // Always assign (never leave uninitialized) — garbage spawn_dr breaks
+    // deterministic eval by taking the float-spawn RNG path.
     env->arena_dr = dict_get_float_default(kwargs, "arena_dr", 0.0f);
-    if (env->arena_dr < 0.0f) env->arena_dr = 0.0f;
+    if (!(env->arena_dr > 0.0f)) env->arena_dr = 0.0f;  // also catches NaN
     if (env->arena_dr > 1.5f) env->arena_dr = 1.5f;
     env->spawn_dr = dict_get_float_default(kwargs, "spawn_dr", 0.0f);
-    if (env->spawn_dr < 0.0f) env->spawn_dr = 0.0f;
+    if (!(env->spawn_dr > 0.0f)) env->spawn_dr = 0.0f;
     if (env->spawn_dr > 1.0f) env->spawn_dr = 1.0f;
     env->energy_dr = dict_get_float_default(kwargs, "energy_dr", 0.0f);
-    if (env->energy_dr < 0.0f) env->energy_dr = 0.0f;
+    if (!(env->energy_dr > 0.0f)) env->energy_dr = 0.0f;
     if (env->energy_dr > 1.0f) env->energy_dr = 1.0f;
     env->bot_policy = dict_get(kwargs, "bot_policy")->value;
     {

@@ -689,26 +689,81 @@ void c_reset(Robocode* env) {
     int total_robots = env->num_agents + env->num_bots;
     memset(env->bullets, 0, NUM_BULLETS * total_robots * sizeof(Bullet));
 
+    // Eval (and any DR-off run) must keep the legacy reset bit-identical:
+    // same rand_r/% spawn stream, heading=0, energy=100, gun_heat=3.
+    // The float spawn path below changes RNG consumption and broke deterministic
+    // eval_bot WRs across identical configs.
+    int dr_off = (env->arena_dr <= 0.0f && env->spawn_dr <= 0.0f
+                  && env->energy_dr <= 0.0f);
+    if (dr_off) {
+        if (env->base_width > 0) env->width = env->base_width;
+        if (env->base_height > 0) env->height = env->base_height;
+        int idx = 0;
+        float x, y;
+        while (idx < total_robots) {
+            Robot* robot = &env->robots[idx];
+            x = 16 + rand_r(&env->rng) % (env->width - 32);
+            y = 16 + rand_r(&env->rng) % (env->height - 32);
+            bool collided = false;
+            for (int j = 0; j < idx; j++) {
+                Robot* other = &env->robots[j];
+                float abs_x = fabsf(x - other->x);
+                float abs_y = fabsf(y - other->y);
+                if (abs_x <= 32.0f && abs_y <= 32.0f) {
+                    collided = true;
+                    break;
+                }
+            }
+            if (!collided) {
+                robot->x = x;
+                robot->y = y;
+                robot->v = 0;
+                robot->heading = 0;
+                robot->gun_heading = 0;
+                robot->radar_heading = 0;
+                robot->radar_heading_prev = 0;
+                robot->energy = 100.0f;
+                robot->start_energy = 100.0f;
+                robot->gun_heat = 3;
+                robot->bullet_idx = 0;
+                if (idx < env->num_agents) {
+                    sample_agent_multipliers(env, robot);
+                    assign_agent_reward_coefficients(env, robot, idx);
+                    env->logs[idx] = (Log){0};
+                } else {
+                    robot->speed_mult = 1.0f;
+                    robot->handling_mult = 1.0f;
+                    robot->power_mult = 1.0f;
+                    robot->reward_melee_damage_inflicted = 0.0f;
+                    robot->reward_damage_taken = 0.0f;
+                    robot->reward_range_damage_inflicted = 0.0f;
+                }
+                idx += 1;
+            }
+        }
+        bot_mems_episode_reset(env);
+        compute_observations(env);
+        return;
+    }
+
     sample_episode_arena(env);
 
     float xs[16];
     float ys[16];
-    if (total_robots > 16) total_robots = 16;
-    if (!sample_spawn_positions(env, total_robots, xs, ys)) {
-        // Fallback: center line.
-        for (int i = 0; i < total_robots; i++) {
-            xs[i] = (float)env->width * (0.25f + 0.5f * (float)i / (float)total_robots);
+    int nplace = total_robots;
+    if (nplace > 16) nplace = 16;
+    if (!sample_spawn_positions(env, nplace, xs, ys)) {
+        for (int i = 0; i < nplace; i++) {
+            xs[i] = (float)env->width * (0.25f + 0.5f * (float)i / (float)nplace);
             ys[i] = (float)env->height * 0.5f;
         }
     }
 
-    for (int idx = 0; idx < total_robots; idx++) {
+    for (int idx = 0; idx < nplace; idx++) {
         Robot* robot = &env->robots[idx];
         robot->x = xs[idx];
         robot->y = ys[idx];
         robot->v = 0;
-        // Random pose when spawn_dr>0 (train). Eval forces spawn_dr=0 → heading 0
-        // for a fixed testbed. Previously headings were always 0.
         float hdg = (env->spawn_dr > 0.0f) ? (rand_unit(env) * 360.0f) : 0.0f;
         robot->heading = hdg;
         robot->gun_heading = hdg;
@@ -720,7 +775,6 @@ void c_reset(Robocode* env) {
         if (energy > 200.0f) energy = 200.0f;
         robot->energy = energy;
         robot->start_energy = energy;
-        // Occasional warm gun so first-shot timing isn't identical every ep.
         robot->gun_heat = (env->energy_dr > 0.0f && rand_unit(env) < 0.35f)
             ? (3.0f * rand_unit(env)) : 3.0f;
         robot->bullet_idx = 0;
