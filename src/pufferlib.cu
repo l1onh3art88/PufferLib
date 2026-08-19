@@ -1967,8 +1967,13 @@ extern "C" void pufferl_load_frozen_bank(PuffeRL* pufferl, int bank_idx, const c
     long file_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (file_size != nbytes) {
-        fprintf(stderr, "pufferl_load_frozen_bank: size mismatch (expected %lld, got %ld)\n",
-            (long long)nbytes, file_size);
+        fprintf(stderr,
+            "pufferl_load_frozen_bank: size mismatch (expected %lld, got %ld) "
+            "path=%s bank_arch=h%d/L%d — usually policy.num_layers float cast "
+            "vs frozen_bank_num_layers (use truncate, not round) or wrong "
+            "opponent_pool arch\n",
+            (long long)nbytes, file_size, path,
+            bank->hidden_size, bank->num_layers);
         fclose(f);
         return;
     }
@@ -2407,4 +2412,17 @@ void close_impl(PuffeRL& pufferl) {
     if (pufferl.nccl_comm != nullptr) {
         ncclCommDestroy(pufferl.nccl_comm);
     }
+}
+
+// No-op on single GPU. After rank-0 pool writes so all ranks see the same file.
+// AllReduce(1 float) as barrier — this NCCL build has no ncclBarrier().
+extern "C" void pufferl_nccl_barrier(PuffeRL* pufferl) {
+    if (pufferl->nccl_comm == nullptr) return;
+    float* buf;
+    cudaMalloc(&buf, sizeof(float));
+    cudaMemsetAsync(buf, 0, sizeof(float), pufferl->default_stream);
+    ncclAllReduce(buf, buf, 1, ncclFloat, ncclSum,
+                  pufferl->nccl_comm, pufferl->default_stream);
+    cudaStreamSynchronize(pufferl->default_stream);
+    cudaFree(buf);
 }

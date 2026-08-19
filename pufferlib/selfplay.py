@@ -3,24 +3,17 @@ snapshot, the rest are pure selfplay. Used by `_train` in pufferl.py — gated o
 `selfplay.enabled` (config section).
 
 Pool growth and opponent swaps are decoupled:
-  - snapshot_interval: every N global steps, each rank saves primary weights
-    into its own pool dir (post-allreduce weights match; no cross-rank file sync).
-  - opp_timeout_steps: every N global steps per bank, ranks sample new opponents
-    on a fixed cadence and load them after all historical envs reach an episode
-    boundary. 0 disables fixed-interval swapping.
+  - snapshot_interval: every N global steps, rank 0 saves primary weights into
+    a shared pool/ dir (atomic save_weights). NCCL barrier so all ranks see it.
+  - opp_timeout_steps: every N global steps per bank, each rank samples an
+    opponent via f(seed, rank, draw_slot) and loads after hist envs align.
+    draw_slot = agent_step // opp_timeout_steps. 0 disables interval swapping.
 
-Opponent sampling is configurable:
-  - sample = uniform: equal probability over pool entries
-  - sample = pfsp: prioritized fictitious self-play — weight opponents by how
-    hard they are for the current learner (from per-checkpoint matchup stats).
-    Snapshot/swap timing is still fixed; winrate only affects *who* is sampled.
-
-Each rank owns `.../pool/rank_{rank}/`. Sampling is f(seed, rank, draw_slot)
-with draw_slot = agent_step // opp_timeout_steps. No shared JSON / publish.
+One shared pool on disk (not per-rank copies). Diversity is in the sample, not
+the files. No shared_opponent.json.
 """
 import glob
 import os
-import shutil
 
 import numpy as np
 
@@ -546,9 +539,9 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
     sp_seed = int(sp.get('seed', 0))
     world_size = max(1, int(args.get('world_size', 1)))
     current_agent_step = int(pufferl.global_step) * world_size
-    # Per-rank local pool — no cross-rank publish/wait.
+    # Shared pool dir — rank 0 writes, all ranks sample from the same files.
     pool_dir = os.path.join(
-        args['checkpoint_dir'], args['env_name'], run_id, 'pool', f'rank_{rank}')
+        args['checkpoint_dir'], args['env_name'], run_id, 'pool')
 
     sample = str(sp.get('sample', 'uniform')).lower()
     pfsp_weighting = str(sp.get('pfsp_weighting', 'linear')).lower()
@@ -571,9 +564,11 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
         os.makedirs(pool_dir, exist_ok=True)
         bootstrap_path = os.path.join(
             pool_dir, f'{pufferl.global_step:016d}.bin')
-        backend.save_weights(pufferl, bootstrap_path)
+        if artifact_owner:
+            backend.save_weights(pufferl, bootstrap_path)
+        backend.nccl_barrier(pufferl)
         expected_nbytes = _file_nbytes(bootstrap_path)
-        assert expected_nbytes > 0, f'empty bootstrap snapshot {bootstrap_path}'
+        assert expected_nbytes > 0, f'missing bootstrap snapshot {bootstrap_path}'
         if external_pool:
             pool = filter_pool_by_nbytes(
                 external_pool, expected_nbytes, label='opponent_pool')
@@ -588,7 +583,6 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
 
     draw_slot = (current_agent_step // opp_timeout) if opp_timeout > 0 else 0
     for b in range(num_banks):
-        # Opening draw: slot + bank index so banks differ without a counter.
         opp_entry = sample_opponent_reproducible(
             pool, sp_seed, rank, draw_slot + b, **sample_kwargs)
         backend.load_frozen_bank(pufferl, b, opp_entry['path'])
@@ -600,6 +594,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
         'pool': pool,
         'seed': sp_seed,
         'rank': rank,
+        'artifact_owner': artifact_owner,
         'max_size': int(sp['max_size']),
         'snapshot_interval': int(sp.get('snapshot_interval', 1_000_000_000)),
         'opp_timeout_steps': opp_timeout,
@@ -618,19 +613,11 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
 
 
 def sync(pufferl, backend, pool_state):
-    # Local pools — nothing to pull from other ranks.
     return
 
 
 def cleanup(pool_state):
-    '''Drop duplicate per-rank pool dirs after train. Keep rank_0 as the archive.'''
-    if not pool_state:
-        return
-    if int(pool_state.get('rank', 0)) == 0:
-        return
-    pool_dir = pool_state.get('pool_dir')
-    if pool_dir:
-        shutil.rmtree(pool_dir, ignore_errors=True)
+    return
 
 
 def step(pufferl, backend, pool_state, flat_logs, epoch):
@@ -655,10 +642,13 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
     if (pool_state['snapshot_interval'] > 0
             and current_agent_step - pool_state['last_snapshot_step']
                 >= pool_state['snapshot_interval']):
-        os.makedirs(pool_state['pool_dir'], exist_ok=True)
         snap_path = os.path.join(pool_state['pool_dir'],
             f'{pufferl.global_step:016d}.bin')
-        backend.save_weights(pufferl, snap_path)
+        if pool_state.get('artifact_owner', True):
+            os.makedirs(pool_state['pool_dir'], exist_ok=True)
+            backend.save_weights(pufferl, snap_path)
+        backend.nccl_barrier(pufferl)
+        # Same path on every rank — diversity is in sample(seed, rank, slot).
         pool_state['pool'].append(make_pool_entry(snap_path))
         pool_state['pool'] = evict(pool_state['pool'], pool_state['max_size'])
         pool_state['last_snapshot_step'] = current_agent_step

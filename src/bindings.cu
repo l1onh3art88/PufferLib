@@ -629,6 +629,9 @@ PYBIND11_MODULE(_C, m) {
     m.def("smerl_enabled", &py_smerl_enabled);
     m.def("add_frozen_bank", &py_add_frozen_bank);
     m.def("load_frozen_bank", &py_load_frozen_bank);
+    m.def("nccl_barrier", [](py::object pufferl_obj) {
+        pufferl_nccl_barrier(&pufferl_obj.cast<PuffeRL&>());
+    });
     m.def("set_agent_perm", &py_set_agent_perm);
     m.def("set_env_tags", &py_set_env_tags);
     m.def("count_aligned", &py_count_aligned);
