@@ -49,8 +49,8 @@ def _file_nbytes(path):
 def filter_pool_by_nbytes(pool, expected_nbytes, label='pool'):
     '''Drop checkpoints whose weight file size != frozen bank / primary size.
 
-    Avoids pufferl_load_frozen_bank size-mismatch spam when opponent_pool (or a
-    shared pool) mixes arches from different Protein trials.'''
+    Avoids pufferl_load_frozen_bank size-mismatch spam when opponent_pool
+    mixes arches from different Protein trials.'''
     if expected_nbytes is None or expected_nbytes <= 0:
         return list(pool or [])
     kept, dropped = [], 0
@@ -573,6 +573,7 @@ def setup(pufferl, backend, args, run_id, artifact_owner=True):
             pool_dir, f'{pufferl.global_step:016d}.bin')
         backend.save_weights(pufferl, bootstrap_path)
         expected_nbytes = _file_nbytes(bootstrap_path)
+        assert expected_nbytes > 0, f'empty bootstrap snapshot {bootstrap_path}'
         if external_pool:
             pool = filter_pool_by_nbytes(
                 external_pool, expected_nbytes, label='opponent_pool')
@@ -689,9 +690,6 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 bank['opp_started_step'] = current_agent_step
                 bank['last_epochs_to_align'] = epoch - bank.get('epoch_armed', epoch)
         elif timed_out:
-            # Local pool is only our own snapshots — no per-swap nbytes filter
-            # (that spammed every rank on timeout when a file was briefly
-            # missing/partial). External arch filter stays in setup only.
             usable = pool_state['pool']
             if not usable:
                 continue

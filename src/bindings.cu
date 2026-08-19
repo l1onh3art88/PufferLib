@@ -190,14 +190,19 @@ void puf_close(pybind11::object pufferl_obj) {
 }
 
 void save_weights(pybind11::object pufferl_obj, const std::string& path) {
+    // Write path.tmp then rename. fopen("wb") truncates immediately; a crash
+    // before fclose left 0-byte files that load_frozen_bank reported as got 0.
     PuffeRL& pufferl = pufferl_obj.cast<PuffeRL&>();
     int64_t nbytes = numel(pufferl.master_weights.shape) * sizeof(float);
     std::vector<char> buf(nbytes);
     cudaMemcpy(buf.data(), pufferl.master_weights.data, nbytes, cudaMemcpyDeviceToHost);
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) throw std::runtime_error("Failed to open " + path + " for writing");
-    fwrite(buf.data(), 1, nbytes, f);
-    fclose(f);
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    assert(f && "save_weights: failed to open tmp");
+    size_t nwritten = fwrite(buf.data(), 1, (size_t)nbytes, f);
+    assert(nwritten == (size_t)nbytes && "save_weights: short fwrite");
+    assert(fclose(f) == 0 && "save_weights: fclose failed");
+    assert(rename(tmp.c_str(), path.c_str()) == 0 && "save_weights: rename failed");
 }
 
 void load_weights(pybind11::object pufferl_obj, const std::string& path) {
