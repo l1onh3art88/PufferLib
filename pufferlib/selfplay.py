@@ -689,9 +689,10 @@ def step(pufferl, backend, pool_state, flat_logs, epoch):
                 bank['opp_started_step'] = current_agent_step
                 bank['last_epochs_to_align'] = epoch - bank.get('epoch_armed', epoch)
         elif timed_out:
-            usable = filter_pool_by_nbytes(
-                pool_state['pool'], pool_state.get('expected_nbytes'),
-                label='swap pool')
+            # Local pool is only our own snapshots — no per-swap nbytes filter
+            # (that spammed every rank on timeout when a file was briefly
+            # missing/partial). External arch filter stays in setup only.
+            usable = pool_state['pool']
             if not usable:
                 continue
             draw_slot = current_agent_step // opp_timeout
