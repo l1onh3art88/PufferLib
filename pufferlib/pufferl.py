@@ -436,6 +436,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             pufferl, backend, args, run_id, artifact_owner=artifact_owner)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
+        selfplay.cleanup(pool_state)
         backend.close(pufferl)
         if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], [], [], []))
@@ -449,6 +450,7 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
             artifact_owner=artifact_owner, pool_state=pool_state)
     except RuntimeError as e:
         print(f'WARNING: {e}, skipping')
+        selfplay.cleanup(pool_state)
         backend.close(pufferl)
         if artifact_owner and result_queue is not None:
             result_queue.put((args['gpu_id'], [], [], []))
@@ -542,9 +544,11 @@ def _train(env_name, args, sweep_obj=None, result_queue=None, verbose=False):
     if league_mode and artifact_owner:
         league.finish_trial(args, run_id, model_path, all_logs, flat_logs, result_queue)
         if result_queue is None:
+            selfplay.cleanup(pool_state)
             backend.close(pufferl)
         return
 
+    selfplay.cleanup(pool_state)
     backend.close(pufferl)
 
     if not artifact_owner:
