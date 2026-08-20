@@ -788,6 +788,15 @@ void puf_step(Robocode* env) {
                 if (!t_agent && s_agent) {
                     bot_on_hit_by_bullet(env, j, bullet->heading, bullet->firepower);
                 }
+                // DrussGT gun learning when a bot's bullet hits anyone.
+                if (!s_agent && env->bot_mems != NULL
+                        && env->bot_policy == BOT_DRUSSGT) {
+                    int bmem = shooter - env->num_agents;
+                    if (bmem >= 0 && bmem < env->num_bots) {
+                        dgt_on_bullet_hit(&env->bot_mems[bmem],
+                                          target->x, target->y);
+                    }
+                }
                 bool killed = target->energy <= 0.0f;
                 if (s_agent) {
                     record_range_damage_inflicted(env, shooter, damage);
