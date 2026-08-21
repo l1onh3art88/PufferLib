@@ -371,6 +371,17 @@ void move(Robocode* env, Robot* robot, float distance) {
         robot->energy -= melee_damage;
         robot->v = 0;
         target->v = 0;   // both robots stop on ramming collision (classic rule)
+        // Mirror bullet kills: +1/-1 terminal reward, perf = bots killed.
+        bool s_agent = robot_idx < env->num_agents;
+        bool t_agent = j < env->num_agents;
+        bool killed = target->energy <= 0.0f;
+        if (s_agent && killed) {
+            add_agent_reward(env, robot_idx, 1.0f);
+            if (!t_agent) env->logs[robot_idx].perf += 1.0f;
+        }
+        if (t_agent && killed) {
+            add_agent_reward(env, j, -1.0f);
+        }
         return;
     }
     
@@ -442,10 +453,6 @@ static inline void sample_dr_triplet(Robocode* env, float* a, float* b, float* c
             return;
         }
     }
-}
-
-static inline void sample_agent_multipliers(Robocode* env, Robot* robot) {
-    sample_dr_triplet(env, &robot->speed_mult, &robot->handling_mult, &robot->power_mult);
 }
 
 static inline void assign_agent_reward_coefficients(Robocode* env, Robot* robot, int agent_idx) {
@@ -568,6 +575,10 @@ void puf_reset(Robocode* env) {
     // boundary_reached is owned by selfplay alignment; do not clear it here.
     int total_robots = env->num_agents + env->num_bots;
     memset(env->bullets, 0, NUM_BULLETS * total_robots * sizeof(Bullet));
+    // One DR draw per episode shared by all agents so selfplay slots stay fair
+    // (independent per-slot draws can make matches unwinnable).
+    float speed_mult = 1.0f, handling_mult = 1.0f, power_mult = 1.0f;
+    sample_dr_triplet(env, &speed_mult, &handling_mult, &power_mult);
     int idx = 0;
     float x, y;
     while (idx < total_robots) {
@@ -596,7 +607,9 @@ void puf_reset(Robocode* env) {
             robot->gun_heat = 3;
             robot->bullet_idx = 0;
             if (idx < env->num_agents) {
-                sample_agent_multipliers(env, robot);
+                robot->speed_mult = speed_mult;
+                robot->handling_mult = handling_mult;
+                robot->power_mult = power_mult;
                 assign_agent_reward_coefficients(env, robot, idx);
                 env->logs[idx] = (Log){0};
             } else {
