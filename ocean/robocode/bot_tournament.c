@@ -1,9 +1,10 @@
 // Round-robin tournament among scripted robocode bots (3,4,5,6).
 //
 // Compile from repo root:
-//   gcc -O2 -Iocean/robocode -Iraylib-5.5_linux_amd64/include \
+//   gcc -O2 -Iocean/robocode -Isrc -Iraylib-5.5_linux_amd64/include \
 //       -o build/bot_tournament ocean/robocode/bot_tournament.c \
-//       -Lraylib-5.5_linux_amd64/lib -lraylib -lm -lpthread -ldl
+//       -Lraylib-5.5_linux_amd64/lib -lraylib -lm -lpthread -ldl \
+//       -Wl,-rpath,$PWD/raylib-5.5_linux_amd64/lib
 //
 // Usage:
 //   ./build/bot_tournament [games_per_pair] [seed]
@@ -42,19 +43,19 @@ static int play_one(int policy_a, int policy_b, int max_ticks, unsigned int seed
     env.dr = 0.0f;
     env.client = NULL;
 
-    allocate_env(&env);
-    c_reset(&env);
+    init(&env);
+    puf_reset(&env);
 
     for (int step = 0; step < max_ticks + 5; step++) {
         env.bot_match_winner = -2;
-        c_step(&env);
+        puf_step(&env);
         if (env.bot_match_winner != -2) {
             int w = env.bot_match_winner;
-            c_close(&env);
+            puf_close(&env);
             return w;
         }
     }
-    c_close(&env);
+    puf_close(&env);
     return -1;
 }
 

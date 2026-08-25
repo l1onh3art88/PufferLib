@@ -60,6 +60,11 @@ struct Log {
     float policy_0_score;
     float policy_1_score;
     float draw_rate;
+    // Opponent action-noise curriculum faced this episode (pre-decay).
+    float bot_cl_noise;
+    float hist_cl_noise;
+    // Win credit * (1 - noise). Full credit only vs annealed (noise=0) opps.
+    float cl_perf;
     float n;
 };
 
@@ -129,7 +134,20 @@ struct Env {
     float reward_range_damage_inflicted_slot_1;
     float dr;
     int bot_policy;
+    // Optional second-bot policy for bot-vs-bot harnesses (num_agents=0).
+    // <0 means both bots use bot_policy (normal train/eval).
+    int bot_policy_1;
+    // Bot-vs-bot result when num_agents==0: -2 ongoing, 0/1 winner idx, -1 draw.
+    int bot_match_winner;
     BotMem* bot_mems;        // per-bot scratch (allocated by bots.h)
+
+    // Opponent action-noise curriculum. With prob bot_cl_noise, scripted bots
+    // take uniform discrete actions; with prob hist_cl_noise, hist slot-1
+    // actions are overwritten. Primary win decays the active noise by *_decay.
+    float bot_cl_noise;
+    float bot_cl_decay;
+    float hist_cl_noise;
+    float hist_cl_decay;
 
     // Selfplay-pool tagging. tag = 0 means pure selfplay (both slots = primary
     // policy). tag > 0 means historical: slot 0 = primary, slot 1 = frozen
@@ -177,6 +195,16 @@ void puf_init(Env* env, Dict* kwargs) {
         "reward_range_damage_inflicted_slot_1", env->reward_range_damage_inflicted);
     env->dr = robocode_get_float(kwargs, "dr", 0.0f);
     env->bot_policy = dict_get(kwargs, "bot_policy");
+    env->bot_policy_1 = (int)robocode_get_float(kwargs, "bot_policy_1", -1.0f);
+    env->bot_match_winner = -2;
+    env->bot_cl_noise = robocode_get_float(kwargs, "bot_cl_noise", 0.0f);
+    env->bot_cl_decay = robocode_get_float(kwargs, "bot_cl_decay", 0.0f);
+    env->hist_cl_noise = robocode_get_float(kwargs, "hist_cl_noise", 0.0f);
+    env->hist_cl_decay = robocode_get_float(kwargs, "hist_cl_decay", 0.0f);
+    if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
+    if (env->bot_cl_noise > 1.0f) env->bot_cl_noise = 1.0f;
+    if (env->hist_cl_noise < 0.0f) env->hist_cl_noise = 0.0f;
+    if (env->hist_cl_noise > 1.0f) env->hist_cl_noise = 1.0f;
     env->agents[0].policy = 0;
     env->agents[1].policy = 1;
     env->agents[0].action_mask = NULL;
@@ -196,6 +224,9 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "policy_0_score", log->policy_0_score);
     dict_set(out, "policy_1_score", log->policy_1_score);
     dict_set(out, "draw_rate", log->draw_rate);
+    dict_set(out, "bot_cl_noise", log->bot_cl_noise);
+    dict_set(out, "hist_cl_noise", log->hist_cl_noise);
+    dict_set(out, "cl_perf", log->cl_perf);
     dict_set(out, "n", log->n);
 }
 
@@ -231,6 +262,8 @@ void add_log(Robocode* env) {
         env->log.melee_damage_inflicted  += env->logs[i].melee_damage_inflicted;
         env->log.damage_taken            += env->logs[i].damage_taken;
         env->log.range_damage_inflicted  += env->logs[i].range_damage_inflicted;
+        env->log.bot_cl_noise            += env->logs[i].bot_cl_noise;
+        env->log.hist_cl_noise           += env->logs[i].hist_cl_noise;
         env->log.n                       += 1.0f;
     }
 }
@@ -653,14 +686,40 @@ static inline int agent_terminal_outcome(Robocode* env) {
 // 0 draw. Historical accounting only applies when env->tag > 0.
 static inline void end_episode(Robocode* env, int outcome) {
     float s0_score = (outcome > 0) ? 1.0f : (outcome < 0) ? 0.0f : 0.5f;
+    // Noise faced this episode (pre-decay). Bot vs scripted, hist vs frozen, else 0.
+    float noise = 0.0f;
+    if (env->num_bots > 0 && env->num_agents == 1)
+        noise = env->bot_cl_noise;
+    else if (env->tag > 0)
+        noise = env->hist_cl_noise;
+    if (noise < 0.0f) noise = 0.0f;
+    if (noise > 1.0f) noise = 1.0f;
     // Scale by num_agents so that (policy_0_score / n) where n increments by
     // num_agents per episode in add_log gives the win rate directly. match()
     // reads this from env/policy_0_score after eval_log divides by n.
     env->log.policy_0_score += s0_score * env->num_agents;
     env->log.policy_1_score += (1.0f - s0_score) * env->num_agents;
+    env->log.cl_perf += s0_score * (1.0f - noise) * env->num_agents;
     if (outcome == 0) env->log.draw_rate += env->num_agents;
     if (env->tag > 0) {
         env->boundary_reached = 1;
+    }
+    // Snapshot pre-decay noise for metrics (what the agent actually faced).
+    for (int a = 0; a < env->num_agents; a++) {
+        env->logs[a].bot_cl_noise = (env->num_bots > 0 && env->num_agents == 1)
+            ? noise : 0.0f;
+        env->logs[a].hist_cl_noise = (env->tag > 0) ? noise : 0.0f;
+    }
+    // Curriculum: primary win → harden bot / frozen opp (lower random rate).
+    if (outcome > 0 && env->num_bots > 0 && env->bot_cl_decay > 0.0f
+            && env->bot_cl_noise > 0.0f) {
+        env->bot_cl_noise -= env->bot_cl_decay;
+        if (env->bot_cl_noise < 0.0f) env->bot_cl_noise = 0.0f;
+    }
+    if (outcome > 0 && env->tag > 0 && env->hist_cl_decay > 0.0f
+            && env->hist_cl_noise > 0.0f) {
+        env->hist_cl_noise -= env->hist_cl_decay;
+        if (env->hist_cl_noise < 0.0f) env->hist_cl_noise = 0.0f;
     }
     for (int a = 0; a < env->num_agents; a++) {
         *env->agents[a].terminals = 1.0f;
@@ -709,10 +768,27 @@ static void robocode_human_controls(Robocode *env) {
     }
 }
 
+static inline void bot_vs_bot_check(Robocode* env) {
+    if (env->num_agents > 0 || env->num_bots <= 0) return;
+    int alive = 0, winner = -1;
+    for (int b = 0; b < env->num_bots; b++) {
+        if (env->robots[b].energy > 0.0f) {
+            alive++;
+            winner = b;
+        }
+    }
+    if (alive == 1) env->bot_match_winner = winner;
+    else if (alive == 0) env->bot_match_winner = -1;
+}
+
 void puf_step(Robocode* env) {
     // Timeout: all agents step in lockstep, so logs[0].episode_length is shared.
     env->tick += 1;
     if (env->tick > env->max_ticks) {
+        if (env->num_agents <= 0) {
+            env->bot_match_winner = -1;
+            return;
+        }
         end_episode(env, 0);  // draw
         return;
     }
@@ -803,7 +879,7 @@ void puf_step(Robocode* env) {
                 }
                 // DrussGT gun learning when a bot's bullet hits anyone.
                 if (!s_agent && env->bot_mems != NULL
-                        && env->bot_policy == BOT_DRUSSGT) {
+                        && bot_policy_for(env, shooter) == BOT_DRUSSGT) {
                     int bmem = shooter - env->num_agents;
                     if (bmem >= 0 && bmem < env->num_bots) {
                         dgt_on_bullet_hit(&env->bot_mems[bmem],
@@ -825,9 +901,15 @@ void puf_step(Robocode* env) {
         }
     }
     if (env->num_bots > 0 && !any_bot_alive) {
+        if (env->num_agents <= 0) {
+            env->bot_match_winner = -1;
+            return;
+        }
         end_episode(env, +1);  // primary wiped all bots
         return;
     }
+    bot_vs_bot_check(env);
+    if (env->num_agents <= 0 && env->bot_match_winner != -2) return;
     agent_outcome = agent_terminal_outcome(env);
     if (agent_outcome != 2) {
         end_episode(env, agent_outcome);
@@ -843,6 +925,16 @@ void puf_step(Robocode* env) {
         if (robot->energy <= 0.0f) {
             robot->v = 0;
             continue;
+        }
+
+        // Hist curriculum: with hist_cl_noise, replace frozen slot actions.
+        if (i > 0 && env->tag > 0 && env->hist_cl_noise > 0.0f
+                && rand_unit(env) < env->hist_cl_noise) {
+            atn[0] = (float)(rand_r(&env->rng) % 4);
+            atn[1] = (float)(rand_r(&env->rng) % 9);
+            atn[2] = (float)(rand_r(&env->rng) % 11);
+            atn[3] = (float)(rand_r(&env->rng) % 11);
+            atn[4] = (float)(rand_r(&env->rng) % 6);
         }
 
         // Cool down gun
@@ -911,9 +1003,15 @@ void puf_step(Robocode* env) {
             }
         }
         if (!any_bot_alive) {
+            if (env->num_agents <= 0) {
+                env->bot_match_winner = -1;
+                return;
+            }
             end_episode(env, +1);
             return;
         }
+        bot_vs_bot_check(env);
+        if (env->num_agents <= 0 && env->bot_match_winner != -2) return;
     }
     compute_observations(env);
 }
