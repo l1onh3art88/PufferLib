@@ -3137,25 +3137,28 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             dict_set(&new_log, "pool/num_hist", selfplay.num_hist);
             dict_set(&new_log, "pool/num_policies", pufferl->num_policies);
         }
-        // Dense keys: replace last_log wholesale.
-        dict_clear(&last_log);
-        dict_copy(&last_log, &new_log);
-        dict_clear(&new_log);
-
+        // n=0 logs omit env/*; keep last complete-episode snapshot.
+        int episodes = dict_get(&new_log, "env/n") > 0;
         if (ctx->artifact_owner) {
-            puf_dashboard_print(ini, pufferl, &last_log, (int)pufferl->epoch);
+            puf_dashboard_print(ini, pufferl, &new_log, (int)pufferl->epoch);
         }
-
+        result.cost = dict_get(&new_log, "uptime");
+        result.steps = dict_get(&new_log, "agent_steps");
+        if (episodes || !last_log.size) {
+            dict_clear(&last_log);
+            dict_copy(&last_log, &new_log);
+        } else {
+            dict_set(&last_log, "uptime", result.cost);
+            dict_set(&last_log, "agent_steps", result.steps);
+        }
         // Wait until the objective appears; do not treat negative values as missing.
-        if (!dict_find(&last_log, target_key)) {
-            continue;
+        if (episodes && dict_find(&new_log, target_key)) {
+            puf_log_history_add(&log_history, &last_log);
         }
-        puf_log_history_add(&log_history, &last_log);
+        dict_clear(&new_log);
     }
 
     // TrainResult curve: bin-mean over log_history (same as artifact metrics).
-    result.cost = dict_get(&last_log, "uptime");
-    result.steps = dict_get(&last_log, "agent_steps");
     DictItem* target = dict_find(&last_log, target_key);
     result.score = target ? (float)target->value : 0;
 
@@ -3260,6 +3263,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     if (ctx->artifact_owner) {
+        assert(log_history.size == 0 || dict_find(&last_log, target_key));
         puf_log_history_add(&log_history, &last_log);
         char log_path[4096];
         snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
@@ -3271,11 +3275,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         puf_ini_write(fp, ini);
         fprintf(fp, "\n[metrics]\n");
 
-        // Dense keys from first history row; bin-mean same as TrainResult curve.
+        // Last snapshot keys (train + selfplay eval overlays).
         if (log_history.size > 0) {
             int metric_points = points;
             double* out = (double*)calloc(metric_points, sizeof(double));
-            Dict* key_src = &log_history.items[0];
+            Dict* key_src = &log_history.items[log_history.size - 1];
             for (int k = 0; k < key_src->size; k++) {
                 const char* key = key_src->items[k].key;
                 if (strncmp(key, "loss/", 5) == 0) {
