@@ -3187,18 +3187,51 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         result.step_points[points - 1] = result.steps;
     }
 
+    long bot_games = use_selfplay ? puf_ini_get(ini, "selfplay", "eval_bot_games") : 0;
     int max_opp = use_selfplay ? puf_ini_get(ini, "selfplay", "eval_pool_size") : 0;
     long pool_games = use_selfplay ? puf_ini_get(ini, "selfplay", "eval_games") : 0;
-    int pool_eval = use_selfplay && max_opp > 0 && pool_games > 0 && final_checkpoint[0];
+    int bot_ladder = use_selfplay && bot_games > 0 && final_checkpoint[0];
+    int pool_eval = !bot_ladder && use_selfplay && max_opp > 0
+        && pool_games > 0 && final_checkpoint[0];
     long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
-    if (ctx->artifact_owner && !pool_eval && eval_episodes > 0) {
+    if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0) {
         EvalResult r = eval_loop(ini, pufferl, EVAL_SCORE, 1, 0, eval_episodes,
             &last_log, (int)pufferl->epoch);
         result.score = result.scores[result.points - 1] = r.score;
     }
     close_pufferl(pufferl);
 
-    if (pool_eval && ctx->artifact_owner) {
+    // Final Protein point (points=1): bot ladder > pool match > train curve.
+    if (bot_ladder && ctx->artifact_owner) {
+        puf_ini_put(ini, "base.load_model_path", final_checkpoint);
+        puf_ini_put(ini, "env.num_agents", "1");
+        puf_ini_put(ini, "env.num_bots", "1");
+        puf_ini_put(ini, "env.dr", "0");
+        puf_ini_put(ini, "env.bot_cl_noise", "0");
+        puf_ini_put(ini, "env.hist_cl_noise", "0");
+        puf_ini_put(ini, "selfplay.enabled", "0");
+        puf_ini_put(ini, "vec.num_policies", "1");
+        puf_ini_put(ini, "vec.hist_policy_percent", "0");
+        int bots[4] = {3, 4, 5, 6};
+        float sum = 0;
+        for (int i = 0; i < 4; i++) {
+            char bbuf[16];
+            snprintf(bbuf, sizeof(bbuf), "%d", bots[i]);
+            puf_ini_put(ini, "env.bot_policy", bbuf);
+            PuffeRL* ep = eval_make(ini, ctx, EVAL_SCORE, 0);
+            EvalResult r = eval_loop(ini, ep, EVAL_SCORE, 0, 0, bot_games, NULL, 0);
+            close_pufferl(ep);
+            sum += r.perf;
+            printf("bot_eval policy=%d games=%d perf=%.4f\n",
+                bots[i], r.games, r.perf);
+        }
+        result.score = result.scores[0] = sum / 4.0f;
+        result.points = 1;
+        result.costs[0] = result.cost;
+        result.step_points[0] = result.steps;
+        dict_set(&last_log, "selfplay/bot_ladder_perf", result.score);
+        printf("bot_eval mean_perf=%.4f\n", result.score);
+    } else if (pool_eval && ctx->artifact_owner) {
         puf_ini_put(ini, "base.load_model_path", final_checkpoint);
         TrainContext eval_ctx = {.world_size = 1, .artifact_owner = 1};
         int n_opp = 0;
