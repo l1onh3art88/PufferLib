@@ -2511,7 +2511,6 @@ typedef struct {
 } Selfplay;
 
 void selfplay_add_checkpoint(Selfplay* sp, const char* path) {
-    while (access(path, R_OK) != 0) usleep(50000);
     for (int i = 0; i < sp->pool_size; i++) {
         if (strcmp(sp->pool[i], path) == 0) return;
     }
@@ -2953,16 +2952,16 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     if (!use_selfplay) {
         puf_ini_put(ini, "vec.num_policies", "1");
         puf_ini_put(ini, "vec.hist_policy_percent", "0");
+    } else {
+        int npol = puf_ini_get(ini, "vec", "num_policies");
+        assert(npol >= 2 && npol <= SELFPLAY_MAX_HIST + 1
+            && "selfplay requires vec.num_policies in 2..SELFPLAY_MAX_HIST+1");
+        assert(puf_ini_get(ini, "vec", "hist_policy_percent") > 0
+            && "selfplay requires vec.hist_policy_percent > 0");
     }
 
     char run_id[64];
-    const char* configured_run_id = puf_ini_get_str(ini, "base", "run_id");
-    if (!configured_run_id[0] || strcmp(configured_run_id, "None") == 0) {
-        snprintf(run_id, sizeof(run_id), "%ld", (long)(1000.0 * wall_clock()));
-        puf_ini_put(ini, "base.run_id", run_id);
-    } else {
-        snprintf(run_id, sizeof(run_id), "%s", configured_run_id);
-    }
+    snprintf(run_id, sizeof(run_id), "%s", puf_ini_get_str(ini, "base", "run_id"));
 
     char checkpoint_dir[2048];
     char log_dir[2048];
@@ -2983,9 +2982,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         char initial_checkpoint[4096];
         snprintf(initial_checkpoint, sizeof(initial_checkpoint),
             "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
-        if (ctx->artifact_owner) {
-            puf_save_weights(pufferl, initial_checkpoint);
-        }
+        puf_save_weights(pufferl, initial_checkpoint);
         selfplay.num_hist = pufferl->num_policies - 1;
         assert(selfplay.num_hist > 0 && selfplay.num_hist <= SELFPLAY_MAX_HIST
             && "selfplay requires num_policies in 2..SELFPLAY_MAX_HIST+1");
@@ -3065,8 +3062,10 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 && (epoch + 1) % checkpoint_interval == 0)) {
             snprintf(saved_checkpoint, sizeof(saved_checkpoint),
                 "%s/%016ld.bin", checkpoint_dir, pufferl->global_step);
-            if (ctx->artifact_owner) {
+            if (ctx->artifact_owner || use_selfplay) {
                 puf_save_weights(pufferl, saved_checkpoint);
+            }
+            if (ctx->artifact_owner) {
                 snprintf(final_checkpoint, sizeof(final_checkpoint),
                     "%s", saved_checkpoint);
             }
@@ -3201,6 +3200,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
 
     if (pool_eval && ctx->artifact_owner) {
         puf_ini_put(ini, "base.load_model_path", final_checkpoint);
+        TrainContext eval_ctx = {.world_size = 1, .artifact_owner = 1};
         int n_opp = 0;
         float sum = 0;
         for (int i = 0; i < selfplay.pool_size && n_opp < max_opp; i++) {
@@ -3208,7 +3208,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
                 continue;
             }
             puf_ini_put(ini, "base.load_enemy_model_path", selfplay.pool[i]);
-            PuffeRL* ep = eval_make(ini, ctx, EVAL_MATCH, 0);
+            PuffeRL* ep = eval_make(ini, &eval_ctx, EVAL_MATCH, 0);
             EvalResult r = eval_loop(ini, ep, EVAL_MATCH, 0, 0, pool_games, NULL, 0);
             close_pufferl(ep);
             sum += r.score;
@@ -3286,6 +3286,13 @@ TrainResult launch_train(Ini* ini) {
         && "vec.total_agents must be divisible by minibatch rows");
     assert(horizon % ADV_VEC_WIDTH == 0
         && "train.horizon must be a multiple of ADV_VEC_WIDTH (4 float / 8 bf16)");
+
+    const char* run_id = puf_ini_get_str(ini, "base", "run_id");
+    if (!run_id[0] || strcmp(run_id, "None") == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%ld", (long)(1000.0 * wall_clock()));
+        puf_ini_put(ini, "base.run_id", buf);
+    }
 
     int nccl_pipe[2] = {-1, -1};
     if (world_size > 1) {
