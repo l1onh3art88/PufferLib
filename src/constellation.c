@@ -328,6 +328,11 @@ static void load_env(const char* env, int full_dataset, Table* out) {
     free(ents);
 
     int steps_col = table_col(out, "agent_steps");
+    for (int r = 0; r < out->rows; r++) {
+        if (steps_col >= 0) {
+            table_set(out, r, steps_col, table_get(out, r, steps_col) / 1e6f);
+        }
+    }
     if (full_dataset || steps_col < 0) {
         return;
     }
@@ -1018,7 +1023,11 @@ void copy_hypers_to_clipboard(Table *table, char* buffer, int row) {
 
         char* suffix = slash + 1;
         double val = table_get(table, row, col);
-        if (val == (long long)val) {
+        // agent_steps is stored in millions for plots; do not write it
+        // over train/total_timesteps (that was the replay-budget bug).
+        if (strcmp(suffix, "agent_steps") == 0) {
+            buffer += sprintf(buffer, "%s = %.0f\n", suffix, val * 1e6);
+        } else if (val == (long long)val) {
             buffer += sprintf(buffer, "%s = %lld\n", suffix, (long long)val);
         } else {
             buffer += sprintf(buffer, "%s = %.17g\n", suffix, val);
@@ -1419,7 +1428,7 @@ int main(void) {
                 float L = table_get(table, j, layers);
                 float params = 3.0f * h * h * L;
                 float flops = 6.0f * params * table_get(table, j, replay)
-                    * table_get(table, j, steps);
+                    * table_get(table, j, steps) * 1e6f;
                 if (params <= 0 || flops <= 0 || flops >= best_flops) {
                     continue;
                 }
