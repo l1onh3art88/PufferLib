@@ -2958,6 +2958,14 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             && "selfplay requires vec.num_policies in 2..SELFPLAY_MAX_HIST+1");
         assert(puf_ini_get(ini, "vec", "hist_policy_percent") > 0
             && "selfplay requires vec.hist_policy_percent > 0");
+        // Pool opps are this run's checkpoints; hist arch must match policy.
+        char hb[32], lb[32];
+        snprintf(hb, sizeof(hb), "%d",
+            (int)puf_ini_get(ini, "policy", "hidden_size"));
+        snprintf(lb, sizeof(lb), "%d",
+            (int)puf_ini_get(ini, "policy", "num_layers"));
+        puf_ini_put(ini, "vec.hist_policy_hidden_size", hb);
+        puf_ini_put(ini, "vec.hist_policy_num_layers", lb);
     }
 
     char run_id[64];
@@ -3204,6 +3212,16 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
     close_pufferl(pufferl);
 
+    char log_path[4096];
+    snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
+    if (ctx->artifact_owner) {
+        FILE* fp = fopen(log_path, "w");
+        assert(fp && "failed to open log for writing");
+        fprintf(fp, "# PufferLib log v1\n");
+        puf_ini_write(fp, ini);
+        fclose(fp);
+    }
+
     // Final Protein point (points=1): bot ladder > pool match > train curve.
     if (bot_ladder && ctx->artifact_owner) {
         puf_ini_put(ini, "base.load_model_path", final_checkpoint);
@@ -3265,14 +3283,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     if (ctx->artifact_owner) {
         assert(log_history.size == 0 || dict_find(&last_log, target_key));
         puf_log_history_add(&log_history, &last_log);
-        char log_path[4096];
-        snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
-
-        FILE* fp = fopen(log_path, "w");
+        FILE* fp = fopen(log_path, "a");
         assert(fp && "failed to open log for writing");
-
-        fprintf(fp, "# PufferLib log v1\n");
-        puf_ini_write(fp, ini);
         fprintf(fp, "\n[metrics]\n");
 
         // Last snapshot keys (train + selfplay eval overlays).
