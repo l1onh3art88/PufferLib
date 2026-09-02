@@ -3251,12 +3251,14 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         puf_ini_put(ini, "selfplay.enabled", "0");
         puf_ini_put(ini, "vec.num_policies", "1");
         puf_ini_put(ini, "vec.hist_policy_percent", "0");
-        // Env-owned overrides (curriculum noise, domain randomization, ...) so
-        // core stays env-agnostic. Re-fetch: puf_ini_put moves ini->sections if
-        // an override names a section the config does not have yet.
-        for (int i = 0; i < puf_ini_section(ini, "bot_eval", 1)->size; i++) {
-            DictItem* over = &puf_ini_section(ini, "bot_eval", 0)->items[i];
-            puf_ini_put(ini, over->key, over->str);
+        // [bot_eval] keys are [env] names (dr, not env.dr). Dotted keys break
+        // sweep argv, which flattens as section.key and splits on the last dot.
+        Dict* bot_eval = puf_ini_section(ini, "bot_eval", 1);
+        for (int i = 0; i < bot_eval->size; i++) {
+            DictItem* over = &bot_eval->items[i];
+            char ek[PUF_DICT_MAX_KEY + 8];
+            snprintf(ek, sizeof(ek), "env.%s", over->key);
+            puf_ini_put(ini, ek, over->str);
         }
         // One finished 1v1 per eval env; ignore swept train total_agents.
         char nbuf[32];
