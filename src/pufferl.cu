@@ -1198,24 +1198,39 @@ static void* vec_thread_main(void* arg) {
     }
 }
 
-static void env_start(PuffeRL* p) {
+// Fresh episodes + zero RNN carry. Workers sit in BUF_WAITING between rollouts.
+static void env_restart(PuffeRL* p) {
+    VecEnv* vec = p->vec;
     if (PUF_BACKEND == PUF_GPU) {
-        puf_reset(p->vec->envs);
-        cudaDeviceSynchronize();
+        puf_reset(vec->envs);
+    } else {
+        #pragma omp parallel for schedule(static) num_threads(vec->num_workers)
+        for (int i = 0; i < vec->size; i++) {
+            puf_reset(&vec->envs[i]);
+        }
+        cpu_upload(p, 0, vec->total_agents, p->default_stream);
+    }
+    for (int b = 0; b < p->num_policies; b++) {
+        for (int i = 0; i < vec->buffers; i++) {
+            Prec* st = &p->policies[b].buffer_states[i];
+            cudaMemset(st->data, 0, numel(st->shape) * sizeof(precision_t));
+        }
+    }
+    cudaDeviceSynchronize();
+}
+
+static void env_start(PuffeRL* p) {
+    VecEnv* vec = p->vec;
+    if (PUF_BACKEND == PUF_GPU) {
+        env_restart(p);
         return;
     }
-    VecEnv* vec = p->vec;
     vec->worker_state = (int*)calloc(1, vec->buffers * sizeof(int));
     vec->threads = (pthread_t*)calloc(1, vec->buffers * sizeof(pthread_t));
     VecThreadArg* args = (VecThreadArg*)calloc(1,
         vec->buffers * sizeof(VecThreadArg));
     vec->accum = (float*)calloc(1, vec->buffers * NUM_PROF * sizeof(float));
-    #pragma omp parallel for schedule(static) num_threads(vec->num_workers)
-    for (int i = 0; i < vec->size; i++) {
-        puf_reset(&vec->envs[i]);
-    }
-    cpu_upload(p, 0, vec->total_agents, p->default_stream);
-    cudaDeviceSynchronize();
+    env_restart(p);
     for (int i = 0; i < vec->buffers; i++) {
         args[i].pufferl = p;
         args[i].buf = i;
@@ -2492,6 +2507,7 @@ typedef struct {
 #define EVAL_MATCH 2
 
 #define SELFPLAY_MAX_HIST 8
+#define SELFPLAY_MAX_LADDER 16
 #define SELFPLAY_PATH_MAX 4096
 
 // One historical opponent ↔ policies[policy_idx] (env tag == policy_idx).
@@ -2966,6 +2982,11 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             (int)puf_ini_get(ini, "policy", "num_layers"));
         puf_ini_put(ini, "vec.hist_policy_hidden_size", hb);
         puf_ini_put(ini, "vec.hist_policy_num_layers", lb);
+        double ladder[SELFPLAY_MAX_LADDER];
+        assert((puf_ini_get(ini, "selfplay", "eval_bot_games") <= 0
+            || puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
+                SELFPLAY_MAX_LADDER) > 0)
+            && "selfplay.eval_bot_games requires selfplay.eval_bots");
     }
 
     char run_id[64];
@@ -3227,30 +3248,41 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         puf_ini_put(ini, "base.load_model_path", final_checkpoint);
         puf_ini_put(ini, "env.num_agents", "1");
         puf_ini_put(ini, "env.num_bots", "1");
-        puf_ini_put(ini, "env.dr", "0");
-        puf_ini_put(ini, "env.bot_cl_noise", "0");
-        puf_ini_put(ini, "env.hist_cl_noise", "0");
         puf_ini_put(ini, "selfplay.enabled", "0");
         puf_ini_put(ini, "vec.num_policies", "1");
         puf_ini_put(ini, "vec.hist_policy_percent", "0");
+        // Env-owned overrides (curriculum noise, domain randomization, ...) so
+        // core stays env-agnostic. Re-fetch: puf_ini_put moves ini->sections if
+        // an override names a section the config does not have yet.
+        for (int i = 0; i < puf_ini_section(ini, "bot_eval", 1)->size; i++) {
+            DictItem* over = &puf_ini_section(ini, "bot_eval", 0)->items[i];
+            puf_ini_put(ini, over->key, over->str);
+        }
         // One finished 1v1 per eval env; ignore swept train total_agents.
         char nbuf[32];
         snprintf(nbuf, sizeof(nbuf), "%ld", bot_games);
         puf_ini_put(ini, "vec.total_agents", nbuf);
-        int bots[4] = {3, 4, 5, 6};
+        double ladder[SELFPLAY_MAX_LADDER];
+        int rungs = puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
+            SELFPLAY_MAX_LADDER);
+        // One PuffeRL for the whole ladder. close_pufferl frees nothing, so a
+        // trainer per rung is a leak. Swap bot_policy and restart instead.
+        PuffeRL* ep = eval_make(ini, ctx, EVAL_SCORE, 0);
         float sum = 0;
-        for (int i = 0; i < 4; i++) {
-            char bbuf[16];
-            snprintf(bbuf, sizeof(bbuf), "%d", bots[i]);
-            puf_ini_put(ini, "env.bot_policy", bbuf);
-            PuffeRL* ep = eval_make(ini, ctx, EVAL_SCORE, 0);
+        for (int i = 0; i < rungs; i++) {
+            if (PUF_BACKEND != PUF_GPU) {
+                for (int e = 0; e < ep->vec->size; e++) {
+                    puf_set_bot_policy(&ep->vec->envs[e], (int)ladder[i]);
+                }
+            }
+            env_restart(ep);
             EvalResult r = eval_loop(ini, ep, EVAL_SCORE, 0, 0, bot_games, NULL, 0);
-            close_pufferl(ep);
             sum += r.perf;
             printf("bot_eval policy=%d games=%d perf=%.4f\n",
-                bots[i], r.games, r.perf);
+                (int)ladder[i], r.games, r.perf);
         }
-        result.score = result.scores[0] = sum / 4.0f;
+        close_pufferl(ep);
+        result.score = result.scores[0] = sum / rungs;
         result.points = 1;
         result.costs[0] = result.cost;
         result.step_points[0] = result.steps;

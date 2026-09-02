@@ -6,6 +6,7 @@
 #include <math.h>
 #include "raylib.h"
 typedef float obs_t;
+#define PUF_HAS_BOT_POLICY
 #include "pufferenv.h"
 
 #define NUM_ACTIONS 5
@@ -158,6 +159,10 @@ struct Env {
 
     unsigned int rng;
 };
+
+static inline void puf_set_bot_policy(Env* env, int bot_policy) {
+    env->bot_policy = bot_policy;
+}
 
 void init(Robocode* env);
 
