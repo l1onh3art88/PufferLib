@@ -49,6 +49,8 @@ struct Log {
     float episode_length;
     float score;            // damage dealt this episode
     float damage_received;  // starting energy - current energy at episode end
+    // Mean spawn energy. Below 100 only where the historical handicap applies.
+    float start_energy;
     float melee_damage_inflicted;
     float damage_taken;
     float range_damage_inflicted;
@@ -96,6 +98,9 @@ struct Robot {
     int bullet_idx;
     float gun_heat;
     float energy;
+    // Energy this robot spawned with. Not always 100: historical envs handicap
+    // the learner, and damage_received is measured against this, not a constant.
+    float start_energy;
 };
 
 typedef struct Client Client;
@@ -134,6 +139,11 @@ struct Env {
     float reward_damage_taken_slot_1;
     float reward_range_damage_inflicted_slot_1;
     float dr;
+    // Historical-env handicap: slot 0 spawns with energy drawn uniformly from
+    // [hist_energy_min, hist_energy_max] while the frozen opponent starts full,
+    // so the learner practices fighting from behind. Equal values disable it.
+    float hist_energy_min;
+    float hist_energy_max;
     int bot_policy;
     // Optional second-bot policy for bot-vs-bot harnesses (num_agents=0).
     // <0 means both bots use bot_policy (normal train/eval).
@@ -199,6 +209,8 @@ void puf_init(Env* env, Dict* kwargs) {
     env->reward_range_damage_inflicted_slot_1 = robocode_get_float(kwargs,
         "reward_range_damage_inflicted_slot_1", env->reward_range_damage_inflicted);
     env->dr = robocode_get_float(kwargs, "dr", 0.0f);
+    env->hist_energy_min = robocode_get_float(kwargs, "hist_energy_min", 100.0f);
+    env->hist_energy_max = robocode_get_float(kwargs, "hist_energy_max", 100.0f);
     env->bot_policy = dict_get(kwargs, "bot_policy");
     env->bot_policy_1 = (int)robocode_get_float(kwargs, "bot_policy_1", -1.0f);
     env->bot_match_winner = -2;
@@ -221,6 +233,7 @@ void puf_log(Log* log, Dict* out) {
     dict_set(out, "perf", log->perf);
     dict_set(out, "score", log->score);
     dict_set(out, "damage_received", log->damage_received);
+    dict_set(out, "start_energy", log->start_energy);
     dict_set(out, "melee_damage_inflicted", log->melee_damage_inflicted);
     dict_set(out, "damage_taken", log->damage_taken);
     dict_set(out, "range_damage_inflicted", log->range_damage_inflicted);
@@ -258,7 +271,9 @@ void add_log(Robocode* env) {
     // Called at episode end. Finalize damage_received from current energy,
     // then fold per-agent running logs into the aggregate env->log.
     for (int i = 0; i < env->num_agents; i++) {
-        env->logs[i].damage_received = 100.0f - (float)env->robots[i].energy;
+        env->logs[i].damage_received = env->robots[i].start_energy
+            - (float)env->robots[i].energy;
+        env->log.start_energy += env->robots[i].start_energy;
         env->log.perf            += env->logs[i].perf;
         env->log.episode_return  += env->logs[i].episode_return;
         env->log.episode_length  += env->logs[i].episode_length;
@@ -641,7 +656,14 @@ void puf_reset(Robocode* env) {
             robot->gun_heading = 0;
             robot->radar_heading = 0;
             robot->radar_heading_prev = 0;
+            // Only the learner is handicapped, and only against a frozen
+            // opponent: pure-selfplay and vs-bot envs stay symmetric at 100.
             robot->energy = 100.0f;
+            if (idx == 0 && env->tag > 0) {
+                robot->energy = env->hist_energy_min + rand_unit(env)
+                    * (env->hist_energy_max - env->hist_energy_min);
+            }
+            robot->start_energy = robot->energy;
             robot->gun_heat = 3;
             robot->bullet_idx = 0;
             if (idx < env->num_agents) {
