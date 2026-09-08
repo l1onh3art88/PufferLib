@@ -37,7 +37,6 @@
 // Project
 #include "ini.h"
 
-// To investigate: 32f compute? Need to check bf16
 #ifdef PRECISION_FLOAT
 typedef float precision_t;
 constexpr bool USE_BF16 = false;
@@ -62,7 +61,7 @@ int grid_size(int N) {
     return (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
 }
 
-// Exclusive env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--cu). Never both.
+// Compile vs a single env: -DENV_HEADER=ocean/<env>/<env>.h or .cu (--cu)
 #include ENV_HEADER
 
 typedef struct {
@@ -464,7 +463,7 @@ typedef struct {
     Allocator activ_alloc;
     Prec param;
     Float master_weights;
-    Prec* buffer_states;         // [num_buffers]
+    Prec* buffer_states;    // [num_buffers]
     Activations* buf_acts;  // [num_buffers]
 } Policy;
 
@@ -592,14 +591,14 @@ __global__ void rng_init(curandStatePhilox4_32_10_t* states, uint64_t seed, int 
 // Continuous: ignores mask.
 __global__ void sample_logits(
         Prec dec_out,              // (B, logits_dim + 1)
-        Prec logstd,           // (1, od) continuous only; .data null if discrete
+        Prec logstd,               // (1, od) continuous only; .data null if discrete
         int* act_sizes,            // (NUM_ATNS,)
-        float* actions,                       // (B, num_atns) float32 rollout store
-        float* env_actions,                   // (B, num_atns) env dispatch
-        precision_t* logprobs,                // (B,)
-        precision_t* value_out,               // (B,)
+        float* actions,            // (B, num_atns) float32 rollout store
+        float* env_actions,        // (B, num_atns) env dispatch
+        precision_t* logprobs,     // (B,)
+        precision_t* value_out,    // (B,)
         curandStatePhilox4_32_10_t* rng_states,
-        precision_t* action_mask,             // (B, A_total); always allocated
+        precision_t* action_mask,  // (B, A_total); always allocated
         int mask_stride) {
     int B = dec_out.shape[0];
     int fused_cols = dec_out.shape[1];
@@ -801,7 +800,7 @@ static void pufferl_forward_step(PuffeRL* pufferl, int buf, int t,
     ObsTensor* obs_env = &env->obs;
     int n = block_size * obs_env->shape[1];
     Prec obs_dst = puf_slice(rollouts.observations, t, start, block_size);
-    // Env obs → rollout: D2D if same type, else cast (float/uchar → precision_t).
+    // Env obs -> rollout: D2D if same type, else cast (float/uchar → precision_t).
     if (sizeof(obs_t) == sizeof(precision_t)) {
         cudaMemcpyAsync(obs_dst.data,
             obs_env->data + (long)start * obs_env->shape[1],
@@ -1145,9 +1144,14 @@ static void* vec_thread_main(void* arg) {
     float ms = 0.0f;
     while (true) {
         while (__atomic_load_n(state, __ATOMIC_SEQ_CST) != BUF_RUNNING) {
-            if (!__atomic_load_n(&vec->shutdown, __ATOMIC_SEQ_CST)) {
-                continue;
+            if (__atomic_load_n(&vec->shutdown, __ATOMIC_SEQ_CST)) {
+                for (int i = 0; i < NUM_EV; i++) {
+                    cudaEventDestroy(ev[i]);
+                }
+                return NULL;
             }
+        }
+        if (__atomic_load_n(&vec->shutdown, __ATOMIC_SEQ_CST)) {
             for (int i = 0; i < NUM_EV; i++) {
                 cudaEventDestroy(ev[i]);
             }
@@ -1941,7 +1945,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
         int slice = vec->policy_layout[b + 1] - vec->policy_layout[b];
         assert(slice > 0 && "policy has no agents");
 
-        pol->arch = build_arch(pufferl->env_name, input_size, h, L,
+        pol->arch = build_arch(input_size, h, L,
             decoder_output_size, is_continuous, hypers.horizon);
         pol->weights = weights_create(&pol->arch, &pol->params_alloc);
         Allocator* aalloc = pol->frozen ? &pol->activ_alloc : acts;
@@ -2839,10 +2843,18 @@ void run_sweep(Ini* ini, const char* exe_path) {
     }
 }
 
+// Sweep objective: bare names → env/<name>; keys with '/' used as-is.
+static void sweep_metric_key(Ini* ini, char* buf, size_t n) {
+    const char* metric = puf_ini_get_str(ini, "sweep", "metric");
+    snprintf(buf, n, "%s%s", strchr(metric, '/') ? "" : "env/", metric);
+}
+
 // board!=NULL: merge env/* into train last_log (uptime + util/* stay frozen).
 static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         int render, long eval_episodes, Dict* board, int epoch) {
     int match = mode == EVAL_MATCH;
+    char metric_key[128];
+    sweep_metric_key(ini, metric_key, sizeof(metric_key));
     EvalResult result = {0};
     if (!render) {
         Dict wipe = {0};
@@ -2888,7 +2900,7 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
             puf_dashboard_print(ini, p, show, board ? epoch : 0);
         }
         result.score = match ? dict_get(&el, "env/policy_0_score")
-            : dict_get(&el, "env/score");
+            : dict_get(&el, metric_key);
         result.perf = dict_get(&el, "env/perf");
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
@@ -3047,11 +3059,8 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     long local_timesteps = total_timesteps / ctx->world_size;
     long train_epochs = local_timesteps / batch_size;
     long checkpoint_interval = puf_ini_get(ini, "base", "checkpoint_interval");
-    // Sweep objective: bare names → env/<name>; keys with '/' used as-is.
     char target_key[128];
-    const char* metric = puf_ini_get_str(ini, "sweep", "metric");
-    snprintf(target_key, sizeof(target_key), "%s%s",
-        strchr(metric, '/') ? "" : "env/", metric);
+    sweep_metric_key(ini, target_key, sizeof(target_key));
     Dict last_log = {0};
     // At most one history entry per train epoch (+1 final snapshot for log dump).
     PufLogHistory log_history;
@@ -3235,12 +3244,31 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     int pool_eval = !bot_ladder && use_selfplay && max_opp > 0
         && pool_games > 0 && final_checkpoint[0];
     long eval_episodes = puf_ini_get(ini, "base", "eval_episodes");
-    if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0) {
-        EvalResult r = eval_loop(ini, pufferl, EVAL_SCORE, 1, 0, eval_episodes,
-            &last_log, (int)pufferl->epoch);
-        result.score = result.scores[result.points - 1] = r.score;
+    int eval_epoch = (int)pufferl->epoch;
+    char eval_ckpt[4096] = {0};
+    if (final_checkpoint[0]) {
+        snprintf(eval_ckpt, sizeof(eval_ckpt), "%s", final_checkpoint);
     }
+    // Close every rank before rank-0 eval. Eval on the live DP trainer leaves
+    // child vec workers in BUF_RUNNING/BUF_WAITING while rank 0 waitpid()s
+    // (and previously poisoned rank-0 CUDA graphs if children exited early).
     close_pufferl(pufferl);
+    if (ctx->artifact_owner && !bot_ladder && !pool_eval && eval_episodes > 0
+            && eval_ckpt[0]) {
+        puf_ini_put(ini, "base.load_model_path", eval_ckpt);
+        TrainContext eval_ctx = {
+            .rank = 0,
+            .world_size = 1,
+            .gpu_id = ctx->gpu_id,
+            .artifact_owner = 1,
+            .nccl_id = NULL,
+        };
+        PuffeRL* ep = eval_make(ini, &eval_ctx, EVAL_SCORE, 0);
+        EvalResult r = eval_loop(ini, ep, EVAL_SCORE, 1, 0, eval_episodes,
+            &last_log, eval_epoch);
+        result.score = result.scores[result.points - 1] = r.score;
+        close_pufferl(ep);
+    }
 
     char log_path[4096];
     snprintf(log_path, sizeof(log_path), "%s/%s.ini", log_dir, run_id);
@@ -3525,5 +3553,4 @@ int main(int argc, char** argv) {
     puf_ini_free(&ini);
     return 0;
 }
-
 #endif
