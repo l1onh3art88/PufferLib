@@ -9,6 +9,7 @@
 #include <unistd.h> 
 #include "raylib.h"
 typedef uint8_t obs_t;
+#define PUF_HAS_BOT_POLICY
 #include "pufferenv.h"
 
 #define ACT_SIZES {97}
@@ -368,6 +369,29 @@ enum {
     CHESS_MODE_HUMAN_RANDOM = 3,
     CHESS_MODE_MAIA = 4
 };
+// Mode 4 means "1 learner vs 1 scripted opponent"; [env] bot_policy picks which
+// opponent. The old name is kept so existing --env.mode=4 invocations still
+// work, but CHESS_MODE_BOT is what the ladder path means.
+#define CHESS_MODE_BOT CHESS_MODE_MAIA
+
+// Bot ladder, weakest first. These are the [env] bot_policy ids and the rungs
+// of [selfplay] eval_bots. Rung 0 needs no engine; rungs 1+ each spawn one lc0
+// child per env and need their weights file under MAIA_WEIGHTS_DIR.
+enum {
+    BOT_RANDOM    = 0,
+    BOT_MAIA_1100 = 1,
+    BOT_MAIA_1500 = 2,
+    BOT_MAIA_1900 = 3,
+    NUM_CHESS_BOTS
+};
+
+// Weights file per rung, indexed by bot_policy. NULL = no engine needed.
+static const char* const CHESS_BOT_WEIGHTS[NUM_CHESS_BOTS] = {
+    NULL,
+    "maia-1100.pb.gz",
+    "maia-1500.pb.gz",
+    "maia-1900.pb.gz",
+};
 
 #define CHESS_TAG_SELFPLAY 0
 #define CHESS_TAG_HISTORICAL 1
@@ -515,11 +539,28 @@ struct Env {
     Square last_move_from;
     Square last_move_to;
 
-    // CHESS_MODE_MAIA: per-env lc0 subprocess pipes. Initialized lazily on the
+    // Bot ladder rung this env's scripted opponent runs (BOT_* id). Only read
+    // when mode is CHESS_MODE_BOT.
+    int bot_policy;
+
+    // CHESS_MODE_BOT: per-env lc0 subprocess pipes. Initialized lazily on the
     // first opponent move. -1 / 0 means "not yet spawned".
     int maia_pid;
     int maia_stdin_fd;
     int maia_stdout_fd;
+    // bot_policy the live child was spawned for. The ladder swaps bot_policy
+    // between rungs on an already-running env, and each rung is a different
+    // weights file, so a mismatch here forces a respawn.
+    int maia_spawned_for;
+    // Set once the engine is known unusable. The opponent then falls back to
+    // random moves without re-forking per move.
+    int maia_failed;
+    // Consecutive failed round-trips. A search that fails (rather than the
+    // handshake) leaves a healthy-looking child behind -- lc0 loads its weights
+    // lazily, so an unreadable net answers "uci" fine and only dies on "go".
+    // Retiring the child on each such failure would re-fork once per move, so
+    // give up on the engine entirely after a few in a row.
+    int maia_consec_failures;
     // Maia commits its move in one UCI round-trip, but selfplay training shows
     // the learner a 2-step opponent wait (pick + place phases). Splitting
     // Maia's move into 2 c_steps (no-op + commit) keeps the learner's LSTM in
@@ -2074,6 +2115,7 @@ static inline int apply_move_to_env(Chess* env, Move chosen, int* is_timeout) {
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
 
 static void position_to_fen(const Position* pos, char* out) {
     char* p = out;
@@ -2157,11 +2199,36 @@ static int maia_write_all(int fd, const char* buf, int len) {
     return 0;
 }
 
+// How long to wait on any single engine reply. The first search also loads the
+// weights file, which is ~1-2s, so this is deliberately generous.
+static int maia_timeout_ms(void) {
+    const char* s = getenv("MAIA_TIMEOUT_MS");
+    int ms = s ? atoi(s) : 0;
+    return ms > 0 ? ms : 10000;
+}
+
 // Read one line (up to '\n' or buf-1 chars). Returns # bytes (excluding NUL) or
-// -1 on error / EOF. Blocks until a line is available.
+// -1 on error / EOF / timeout. The timeout matters as much as EOF does: lc0 can
+// stay alive without ever answering (unreadable weights file, wedged search),
+// and a bare blocking read would then park this env's worker thread forever and
+// hang the whole eval rather than falling back to a random move.
 static int maia_read_line(int fd, char* buf, int bufsz) {
+    int timeout_ms = maia_timeout_ms();
     int n = 0;
     while (n < bufsz - 1) {
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeout_ms);
+        if (pr == 0) {
+            buf[n] = '\0';
+            return -1;  // engine alive but silent
+        }
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
         char c;
         int r = (int)read(fd, &c, 1);
         if (r == 0) return -1;  // EOF
@@ -2178,27 +2245,79 @@ static int maia_read_line(int fd, char* buf, int bufsz) {
 
 static void maia_close(Chess* env);
 
+// Resolve the weights file for a rung. MAIA_WEIGHTS_PATH pins one net for every
+// rung (single-net debugging, and back-compat with the pre-ladder behaviour);
+// otherwise the rung's entry in CHESS_BOT_WEIGHTS is looked up under
+// MAIA_WEIGHTS_DIR (default "lc0").
+static void maia_weights_for(int bot_policy, char* out, int outsz) {
+    const char* pinned = getenv("MAIA_WEIGHTS_PATH");
+    if (pinned != NULL) {
+        snprintf(out, outsz, "%s", pinned);
+        return;
+    }
+    const char* dir = getenv("MAIA_WEIGHTS_DIR");
+    if (dir == NULL) dir = "lc0";
+    const char* file = (bot_policy > BOT_RANDOM && bot_policy < NUM_CHESS_BOTS)
+        ? CHESS_BOT_WEIGHTS[bot_policy] : CHESS_BOT_WEIGHTS[BOT_MAIA_1100];
+    snprintf(out, outsz, "%s/%s", dir, file);
+}
+
 static void maia_init(Chess* env) {
     if (env->maia_pid > 0) return;  // already spawned
+    if (env->maia_failed) return;   // known-bad engine; stay on the fallback
+
+    // Writing to a pipe whose engine has died raises SIGPIPE, and its default
+    // action terminates the trainer outright -- the failure handling below
+    // never gets to run. Ignore it once so the write returns EPIPE instead and
+    // the round-trip fails into the random-move fallback like any other error.
+    // Benign race: every thread stores the same disposition.
+    static int sigpipe_ignored = 0;
+    if (!sigpipe_ignored) {
+        signal(SIGPIPE, SIG_IGN);
+        sigpipe_ignored = 1;
+    }
 
     const char* lc0_path     = getenv("MAIA_LC0_PATH");
-    const char* weights_path = getenv("MAIA_WEIGHTS_PATH");
     const char* backend_arg  = getenv("MAIA_BACKEND");
-    if (lc0_path == NULL)     lc0_path     = "./lc0";
-    if (weights_path == NULL) weights_path = "lc0/maia-1100.pb.gz";
+    const char* nncache_arg  = getenv("MAIA_NNCACHE");
+    // "./lc0" would be the checkout directory, not the binary; point at the
+    // in-repo build by default and let MAIA_LC0_PATH override.
+    if (lc0_path == NULL)     lc0_path     = "lc0/build/release/lc0";
+    // Default to the CPU backend: the ladder runs one child per env alongside
+    // a training job that owns the GPU, and lc0's default cuda-auto would have
+    // every child grab a CUDA context.
+    if (backend_arg == NULL)  backend_arg  = "eigen";
+    // 2M entries (lc0's default) is ~192MB RSS per child; 200k is ~115MB and
+    // still absorbs the heavily-repeated openings across a ladder's games.
+    if (nncache_arg == NULL)  nncache_arg  = "200000";
+    char weights_path[512];
+    maia_weights_for(env->bot_policy, weights_path, sizeof(weights_path));
+    env->maia_spawned_for = env->bot_policy;
 
     int in_pipe[2], out_pipe[2];
     if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0) {
         fprintf(stderr, "maia_init: pipe() failed\n");
         env->maia_pid = -1;
+        env->maia_failed = 1;
         return;
     }
+    // Mark every end close-on-exec before forking. This is load-bearing, not
+    // hygiene: the ladder spawns one child per env, and without it each new
+    // child inherits the write end of every earlier child's stdin. No engine
+    // would then ever see EOF, so the whole pool outlives the trainer rather
+    // than exiting with it. The child's own ends survive because dup2 clears
+    // CLOEXEC on the destination fd.
+    fcntl(in_pipe[0],  F_SETFD, FD_CLOEXEC);
+    fcntl(in_pipe[1],  F_SETFD, FD_CLOEXEC);
+    fcntl(out_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(out_pipe[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) {
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         fprintf(stderr, "maia_init: fork() failed\n");
         env->maia_pid = -1;
+        env->maia_failed = 1;
         return;
     }
     if (pid == 0) {
@@ -2210,15 +2329,16 @@ static void maia_init(Chess* env) {
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
         close(in_pipe[0]);  close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
-        char weights_arg[512];
+        char weights_arg[sizeof(weights_path) + 16];
+        char backend_buf[128];
+        char nncache_buf[64];
         snprintf(weights_arg, sizeof(weights_arg), "--weights=%s", weights_path);
-        if (backend_arg) {
-            char backend_buf[128];
-            snprintf(backend_buf, sizeof(backend_buf), "--backend=%s", backend_arg);
-            execlp(lc0_path, "lc0", weights_arg, backend_buf, (char*)NULL);
-        } else {
-            execlp(lc0_path, "lc0", weights_arg, (char*)NULL);
-        }
+        snprintf(backend_buf, sizeof(backend_buf), "--backend=%s", backend_arg);
+        snprintf(nncache_buf, sizeof(nncache_buf), "--nncache=%s", nncache_arg);
+        // --threads=1: the trainer already runs one child per env-stepping
+        // worker, so letting each child spawn its own pool just oversubscribes.
+        execlp(lc0_path, "lc0", weights_arg, backend_buf, nncache_buf,
+            "--threads=1", (char*)NULL);
         _exit(127);
     }
     // Parent.
@@ -2232,13 +2352,28 @@ static void maia_init(Chess* env) {
     // until "readyok". Engine init also loads weights so this can take a few
     // seconds the first time.
     char line[1024];
-    if (maia_write_all(env->maia_stdin_fd, "uci\n", 4) < 0) { maia_close(env); return; }
-    while (maia_read_line(env->maia_stdout_fd, line, sizeof(line)) >= 0) {
-        if (strncmp(line, "uciok", 5) == 0) break;
+    int saw_uciok = 0, saw_readyok = 0;
+    if (maia_write_all(env->maia_stdin_fd, "uci\n", 4) < 0) {
+        maia_close(env); env->maia_failed = 1; return;
     }
-    if (maia_write_all(env->maia_stdin_fd, "isready\n", 8) < 0) { maia_close(env); return; }
     while (maia_read_line(env->maia_stdout_fd, line, sizeof(line)) >= 0) {
-        if (strncmp(line, "readyok", 7) == 0) break;
+        if (strncmp(line, "uciok", 5) == 0) { saw_uciok = 1; break; }
+    }
+    if (!saw_uciok) {
+        fprintf(stderr, "maia_init: no uciok from '%s' (weights=%s)\n",
+            lc0_path, weights_path);
+        maia_close(env); env->maia_failed = 1; return;
+    }
+    if (maia_write_all(env->maia_stdin_fd, "isready\n", 8) < 0) {
+        maia_close(env); env->maia_failed = 1; return;
+    }
+    while (maia_read_line(env->maia_stdout_fd, line, sizeof(line)) >= 0) {
+        if (strncmp(line, "readyok", 7) == 0) { saw_readyok = 1; break; }
+    }
+    if (!saw_readyok) {
+        fprintf(stderr, "maia_init: no readyok from '%s' (weights=%s)\n",
+            lc0_path, weights_path);
+        maia_close(env); env->maia_failed = 1; return;
     }
 }
 
@@ -2262,9 +2397,31 @@ static void maia_close(Chess* env) {
     env->maia_pid = 0;
 }
 
+// A round-trip failed: retire the child and, once a few have failed back to
+// back, stop using the engine for this env altogether. Without the counter a
+// net that loads but cannot search re-forks lc0 on every single opponent move.
+#define MAIA_MAX_CONSEC_FAILURES 3
+static Move maia_round_trip_failed(Chess* env) {
+    maia_close(env);
+    env->maia_consec_failures++;
+    if (env->maia_consec_failures >= MAIA_MAX_CONSEC_FAILURES) {
+        env->maia_failed = 1;
+        fprintf(stderr, "maia: engine unusable after %d failed round-trips; "
+            "falling back to random moves for this env\n",
+            env->maia_consec_failures);
+    }
+    return MOVE_NONE;
+}
+
 // Ask Maia for the best move at the current env position. Returns a Move that
 // is guaranteed to be in env->legal_moves (or MOVE_NONE on engine failure).
 static Move maia_get_move(Chess* env) {
+    if (env->maia_failed) return MOVE_NONE;
+    // The ladder swaps bot_policy on a live env between rungs; the child that
+    // is already running holds the previous rung's net, so retire it first.
+    if (env->maia_pid > 0 && env->maia_spawned_for != env->bot_policy) {
+        maia_close(env);
+    }
     if (env->maia_pid <= 0) {
         maia_init(env);
         if (env->maia_pid <= 0) return MOVE_NONE;
@@ -2280,21 +2437,23 @@ static Move maia_get_move(Chess* env) {
     char cmd[256];
     int n = snprintf(cmd, sizeof(cmd), "position fen %s\ngo nodes %d\n", fen, nodes);
     if (maia_write_all(env->maia_stdin_fd, cmd, n) < 0) {
-        maia_close(env);
-        return MOVE_NONE;
+        return maia_round_trip_failed(env);
     }
 
     char line[1024];
     while (1) {
         int len = maia_read_line(env->maia_stdout_fd, line, sizeof(line));
-        if (len < 0) { maia_close(env); return MOVE_NONE; }
+        if (len < 0) return maia_round_trip_failed(env);
         if (strncmp(line, "bestmove ", 9) != 0) continue;
         char uci[8] = {0};
         int j = 9, k = 0;
         while (line[j] && line[j] != ' ' && line[j] != '\n' && line[j] != '\r' && k < 7) {
             uci[k++] = line[j++];
         }
-        return uci_to_move(uci, &env->legal_moves);
+        Move mv = uci_to_move(uci, &env->legal_moves);
+        if (mv == MOVE_NONE) return maia_round_trip_failed(env);
+        env->maia_consec_failures = 0;
+        return mv;
     }
 }
 
@@ -2378,6 +2537,19 @@ static void chess_eval_autostart(Chess* env) {
     }
 }
 #endif
+
+// Bot ladder hook. The trainer sweeps every env to each rung in turn and then
+// calls env_restart, so this runs on a live env that may already own an lc0
+// child for the previous rung. maia_get_move notices the mismatch via
+// maia_spawned_for and respawns; clearing maia_failed gives the new rung a
+// fresh chance in case only the previous rung's weights file was missing.
+static inline void puf_set_bot_policy(Chess* env, int bot_policy) {
+    if (env->bot_policy == bot_policy) return;
+    env->bot_policy = bot_policy;
+    env->maia_failed = 0;
+    env->maia_consec_failures = 0;
+    env->maia_phase = 0;
+}
 
 void puf_reset(Chess* env) {
     chess_sync_agent_ptrs(env);
@@ -2493,33 +2665,41 @@ void puf_step(Chess* env) {
     int is_timeout = 0;
 
     if ((env->mode == CHESS_MODE_RANDOM && env->pos.sideToMove != env->learner_color)
-            || (env->mode == CHESS_MODE_HUMAN_RANDOM && env->pos.sideToMove != env->human_color)) {
+            || (env->mode == CHESS_MODE_HUMAN_RANDOM && env->pos.sideToMove != env->human_color)
+            ) {
         if (env->legal_moves.count > 0) {
             int idx = rand_r(&env->rng) % env->legal_moves.count;
             clear_player_selection(env, mover_idx);
             game_result = apply_move_to_env(env, env->legal_moves.moves[idx].move, &is_timeout);
             move_completed = 1;
         }
-    } else if (env->mode == CHESS_MODE_MAIA && env->pos.sideToMove != env->learner_color) {
+    } else if (env->mode == CHESS_MODE_BOT && env->pos.sideToMove != env->learner_color) {
         if (env->legal_moves.count > 0) {
             if (env->maia_phase == 0) {
-                // First c_step of Maia's "move": no-op so the learner's LSTM
+                // First c_step of the bot's "move": no-op so the learner's LSTM
                 // sees a 2-step opponent wait (matches selfplay's pick+place
-                // cadence the policy was trained on).
+                // cadence the policy was trained on). Every rung uses this same
+                // cadence, including BOT_RANDOM, so a rung's score reflects the
+                // opponent's strength and not a change in step timing.
                 env->maia_phase = 1;
                 move_completed = 1;
             } else {
-                Move maia_mv = maia_get_move(env);
-                if (maia_mv == MOVE_NONE) {
-                    // Engine failure / unparseable bestmove: fall back to random
-                    // so the trial completes. Logged via log.maia_failures so
-                    // Python can flag a degraded eval.
-                    env->log.maia_failures += 1.0f;
+                Move bot_mv = MOVE_NONE;
+                if (env->bot_policy != BOT_RANDOM) {
+                    bot_mv = maia_get_move(env);
+                    if (bot_mv == MOVE_NONE) {
+                        // Engine failure / unparseable bestmove: fall back to
+                        // random so the trial completes. Logged via
+                        // log.maia_failures so Python can flag a degraded eval.
+                        env->log.maia_failures += 1.0f;
+                    }
+                }
+                if (bot_mv == MOVE_NONE) {
                     int idx = rand_r(&env->rng) % env->legal_moves.count;
-                    maia_mv = env->legal_moves.moves[idx].move;
+                    bot_mv = env->legal_moves.moves[idx].move;
                 }
                 clear_player_selection(env, mover_idx);
-                game_result = apply_move_to_env(env, maia_mv, &is_timeout);
+                game_result = apply_move_to_env(env, bot_mv, &is_timeout);
                 env->maia_phase = 0;
                 move_completed = 1;
             }
@@ -3350,9 +3530,13 @@ static void apply_kwargs(Env* env, Dict* kwargs) {
     env->log_pgn_choice_made = 1;
     env->pgn_filename[0] = '\0';
     env->pgn_game_number = 0;
+    env->bot_policy = dict_get(kwargs, "bot_policy");
     env->maia_pid = 0;
     env->maia_stdin_fd = -1;
     env->maia_stdout_fd = -1;
+    env->maia_spawned_for = -1;
+    env->maia_failed = 0;
+    env->maia_consec_failures = 0;
     env->maia_phase = 0;
     strcpy(env->starting_fen, DEFAULT_STARTING_FEN);
 #ifdef PUFFERCPU_EVAL_MAIN

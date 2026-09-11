@@ -2516,7 +2516,12 @@ typedef struct {
 // Bot-ladder parallelism, held fixed so rung scores stay comparable across
 // sweep trials that vary vec.total_agents. selfplay.eval_bot_games / this is
 // the games each env plays; scripted bots keep their kNN across episodes, so
-// one game per env measures only cold bots.
+// one game per env measures only cold bots. [selfplay] eval_bot_envs overrides
+// it for envs whose bot is expensive per-env rather than free: an external
+// engine opponent (chess/Maia spawns one lc0 child per env) wants tens of envs,
+// not thousands. eval_bot_threads likewise raises vec.num_threads for the eval
+// only, since a blocking out-of-process bot is paced by how many envs step at
+// once, not by how many exist.
 #define SELFPLAY_LADDER_ENVS 8192
 
 // One historical opponent ↔ policies[policy_idx] (env tag == policy_idx).
@@ -2899,8 +2904,13 @@ static EvalResult eval_loop(Ini* ini, PuffeRL* p, int mode, int verbose,
         if (verbose) {
             puf_dashboard_print(ini, p, show, board ? epoch : 0);
         }
+        // metric_key may name a trainer-level overlay (selfplay/bot_ladder_perf)
+        // that the env log cannot contain: the ladder computes it *from* these
+        // per-rung evals. Fall back to env/score there rather than exiting; the
+        // ladder scores off result.perf and ignores result.score anyway.
+        DictItem* metric_item = dict_find(&el, metric_key);
         result.score = match ? dict_get(&el, "env/policy_0_score")
-            : dict_get(&el, metric_key);
+            : (metric_item ? metric_item->value : dict_get(&el, "env/score"));
         result.perf = dict_get(&el, "env/perf");
         if (match) {
             result.draw = dict_get(&el, "env/draw_rate");
@@ -3304,11 +3314,20 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             puf_ini_put(ini, ek, over->str);
         }
         // Fixed parallelism; ignore swept train total_agents. Each env plays
-        // bot_games / SELFPLAY_LADDER_ENVS games, so bots face a warmed-up kNN
-        // rather than being re-measured cold once per env.
+        // bot_games / ladder_envs games, so bots face a warmed-up kNN rather
+        // than being re-measured cold once per env.
         char nbuf[32];
-        snprintf(nbuf, sizeof(nbuf), "%d", SELFPLAY_LADDER_ENVS);
+        long ladder_envs = puf_ini_get(ini, "selfplay", "eval_bot_envs");
+        if (ladder_envs <= 0) {
+            ladder_envs = SELFPLAY_LADDER_ENVS;
+        }
+        snprintf(nbuf, sizeof(nbuf), "%ld", ladder_envs);
         puf_ini_put(ini, "vec.total_agents", nbuf);
+        long ladder_threads = puf_ini_get(ini, "selfplay", "eval_bot_threads");
+        if (ladder_threads > 0) {
+            snprintf(nbuf, sizeof(nbuf), "%ld", ladder_threads);
+            puf_ini_put(ini, "vec.num_threads", nbuf);
+        }
         double ladder[SELFPLAY_MAX_LADDER];
         int rungs = puf_ini_get_list(ini, "selfplay", "eval_bots", ladder,
             SELFPLAY_MAX_LADDER);
