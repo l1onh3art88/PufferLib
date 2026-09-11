@@ -70,12 +70,3 @@ static inline float bf16_to_f32(bf16 b) {
     memcpy(&f, &bits, 4);
     return f;
 }
-
-#if defined(__AVX2__)
-static inline void store_f32x8_as_bf16(bf16* dst, __m256 v) {
-    __m256i vi = _mm256_srli_epi32(_mm256_castps_si256(v), 16);
-    __m128i lo = _mm256_castsi256_si128(vi);
-    __m128i hi = _mm256_extracti128_si256(vi, 1);
-    _mm_storeu_si128((__m128i*)dst, _mm_packus_epi32(lo, hi));
-}
-#endif
