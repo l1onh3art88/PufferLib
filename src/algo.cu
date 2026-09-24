@@ -1224,6 +1224,11 @@ struct TrainGraph {
     Prec mb_action_mask; // view (B, T, mask_size)
     Prec mb_imp;         // scratch
     Prec mb_gae_v;       // scratch: live V in, overwritten with returns
+    Prec mb_adv_div;     // archive KL return advantage (empty if unused)
+    Prec mb_q_logp;      // frozen ref log q_eps, (B,T,A)
+    Prec mb_inv_len;     // 1/T_e on completed episode steps
+    float beta_direct;
+    float beta_return;
 };
 
 void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T) {
@@ -1296,6 +1301,9 @@ struct PPOGraphArgs {
     const precision_t* advantages;
     const precision_t* values;
     const precision_t* returns;
+    const precision_t* adv_div;
+    const precision_t* q_logp;
+    const precision_t* inv_len;
 };
 
 struct PPOKernelArgs {
@@ -1312,6 +1320,8 @@ struct PPOKernelArgs {
     const float* ent_coef;  // device ptr — host by-value bakes into CUDA graphs
     int T_seq, A_total, N;
     bool is_continuous;
+    float beta_direct;
+    float beta_return;
 };
 
 struct PPOBufs {
@@ -1522,6 +1532,20 @@ __global__ void ppo_loss_compute(
         if (pg_loss2 > pg_loss1 && (ratio <= clip_lo || ratio >= clip_hi)) {
             d_ratio = 0.0f;
         }
+        float loss_div = 0.0f;
+        if (g.adv_div && a.beta_return != 0.0f) {
+            float ad = to_float(g.adv_div[nt]);
+            float wd = -ad;
+            float pd1 = wd * ratio;
+            float pd2 = wd * ratio_clipped;
+            float pdiv = fmaxf(pd1, pd2);
+            loss_div = a.beta_return * pdiv * inv_NT;
+            float dr = wd * inv_NT;
+            if (pd2 > pd1 && (ratio <= clip_lo || ratio >= clip_hi)) {
+                dr = 0.0f;
+            }
+            d_ratio += a.beta_return * dr;
+        }
         float d_new_logp = d_ratio * ratio;
         float total_entropy = 0.0f;
 
@@ -1560,9 +1584,18 @@ __global__ void ppo_loss_compute(
 #endif
                 int act = (int)g.actions[nt * a.num_atns + h];
                 float ent = 0.0f;
+                float d_head = 0.0f;
+                int use_direct = g.q_logp && a.beta_direct != 0.0f && g.inv_len;
+                float inv_len = use_direct ? to_float(g.inv_len[nt]) : 0.0f;
+                float scale = use_direct ? -a.beta_direct * inv_NT * inv_len : 0.0f;
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
-                    ent -= __expf(logp) * logp;
+                    float p = __expf(logp);
+                    ent -= p * logp;
+                    if (use_direct) {
+                        float lq = to_float(g.q_logp[at_base + logits_offset + j]);
+                        d_head += p * (logp - lq);
+                    }
                 }
                 total_entropy += ent;
 #ifdef PUFFER_NETHACK
@@ -1580,16 +1613,23 @@ __global__ void ppo_loss_compute(
                 for (int j = 0; j < A; ++j) {
                     float logp = a.grad_logits[at_base + logits_offset + j];
                     float p = __expf(logp);
-                    a.grad_logits[at_base + logits_offset + j] =
-                        ((j == act ? 1.0f : 0.0f) - p) * d_logp
+                    float gpg = ((j == act ? 1.0f : 0.0f) - p) * d_logp
                         + d_entropy_term * p * (-ent - logp);
+                    if (use_direct) {
+                        float lq = to_float(g.q_logp[at_base + logits_offset + j]);
+                        gpg += scale * p * (logp - lq - d_head);
+                    }
+                    a.grad_logits[at_base + logits_offset + j] = gpg;
+                }
+                if (use_direct) {
+                    loss_div += -a.beta_direct * d_head * inv_len * inv_NT;
                 }
                 logits_offset += A;
             }
         }
 
         float thread_loss = (pg_loss + a.vf_coef * v_loss
-            - ent_coef * total_entropy) * inv_NT;
+            - ent_coef * total_entropy) * inv_NT + loss_div;
 
         block_losses[LOSS_PG][tid] = pg_loss * inv_NT;
         block_losses[LOSS_VF][tid] = v_loss * inv_NT;
@@ -1642,6 +1682,9 @@ void ppo_loss_fwd_bwd(
         .advantages = graph.mb_advantages.data,
         .values = graph.mb_values.data,
         .returns = graph.mb_returns.data,
+        .adv_div = graph.mb_adv_div.data,
+        .q_logp = graph.mb_q_logp.data,
+        .inv_len = graph.mb_inv_len.data,
     };
 
     PPOKernelArgs args = {
@@ -1659,6 +1702,8 @@ void ppo_loss_fwd_bwd(
         .ent_coef = ent_coef,
         .T_seq = T, .A_total = A_total, .N = N,
         .is_continuous = is_continuous,
+        .beta_direct = graph.beta_direct,
+        .beta_return = graph.beta_return,
     };
     ppo_loss_compute<<<ppo_grid, PPO_THREADS, 0, stream>>>(
             bufs.ppo_partials.data, args, graph_args);
@@ -1743,5 +1788,98 @@ __global__ void puff_advantage(const precision_t* values,
         }
         adv_st(advantages + base, adv);
         adv_st(returns + base, ret);
+    }
+}
+
+// KL(p||q_eps) summed over independent categorical heads. q_eps mixes
+// (1-eps)*softmax(q) with eps * uniform over legal actions.
+__global__ void archive_kl_heads(
+        const precision_t* __restrict__ p_logits,
+        const precision_t* __restrict__ q_logits,
+        const precision_t* __restrict__ mask,
+        const int* __restrict__ act_sizes,
+        float* __restrict__ kl_out,
+        precision_t* __restrict__ q_logp_out,
+        float eps, int B, int A_total) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= B) {
+        return;
+    }
+    int lb = i * (A_total + 1);
+    int mb = i * A_total;
+    float kl = 0.0f;
+    int off = 0;
+    for (int h = 0; h < NUM_ATNS; h++) {
+        int A = act_sizes[h];
+        float pc[PPO_MAX_HEAD_A];
+        float qc[PPO_MAX_HEAD_A];
+        float lse_p = ppo_discrete_logsumexp(
+            p_logits, lb, off, A, mask, mb, pc);
+        float lse_q = ppo_discrete_logsumexp(
+            q_logits, lb, off, A, mask, mb, qc);
+        int nlegal = 0;
+        for (int a = 0; a < A; a++) {
+            if (to_float(mask[mb + off + a]) != 0.0f) {
+                nlegal++;
+            }
+        }
+        float u = nlegal > 0 ? 1.0f / (float)nlegal : 0.0f;
+        float d = 0.0f;
+        for (int a = 0; a < A; a++) {
+            if (to_float(mask[mb + off + a]) == 0.0f) {
+                if (q_logp_out) {
+                    q_logp_out[mb + off + a] = from_float(-1.0e4f);
+                }
+                continue;
+            }
+            float lp = pc[a] - lse_p;
+            float p = __expf(lp);
+            float q = (1.0f - eps) * __expf(qc[a] - lse_q) + eps * u;
+            float lq = __logf(fmaxf(q, 1.0e-8f));
+            d += p * (lp - lq);
+            if (q_logp_out) {
+                q_logp_out[mb + off + a] = from_float(lq);
+            }
+        }
+        kl += d;
+        off += A;
+    }
+    kl_out[i] = kl;
+}
+
+// Completed episodes inside one horizon: A_div = mean_t KL - baseline,
+// inv_len = 1/T_e. Incomplete tails stay 0.
+__global__ void archive_kl_episodes(
+        const float* __restrict__ kl,
+        const precision_t* __restrict__ terminals,
+        precision_t* __restrict__ adv_div,
+        precision_t* __restrict__ inv_len,
+        float baseline, int T, int B) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= B) {
+        return;
+    }
+    for (int t = 0; t < T; t++) {
+        adv_div[t * B + b] = from_float(0.0f);
+        inv_len[t * B + b] = from_float(0.0f);
+    }
+    int t0 = 0;
+    for (int t = 0; t < T; t++) {
+        if (to_float(terminals[t * B + b]) <= 0.5f) {
+            continue;
+        }
+        int Te = t - t0 + 1;
+        float s = 0.0f;
+        for (int u = t0; u <= t; u++) {
+            s += kl[u * B + b];
+        }
+        float R = s / (float)Te;
+        float A = R - baseline;
+        float inv = 1.0f / (float)Te;
+        for (int u = t0; u <= t; u++) {
+            adv_div[u * B + b] = from_float(A);
+            inv_len[u * B + b] = from_float(inv);
+        }
+        t0 = t + 1;
     }
 }

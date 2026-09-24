@@ -343,8 +343,7 @@ static void load_env(const char* env, int full_dataset, Table* out) {
     }
 
     int cost_col = table_col(out, "uptime");
-    // Selfplay envs: prefer policy-0 win rate over damage/margin aggregates.
-    int score_col = table_col(out, "env/policy_0_score");
+    int score_col = table_col(out, "selfplay/bot_ladder_perf");
     if (score_col < 0) {
         score_col = table_col(out, "env/score");
     }
@@ -389,7 +388,6 @@ static void write_env(FILE* fp, const char* env, Table* table) {
 
     fprintf(fp, "\n[%s]\n", env);
     for (int c = 0; c < table->cols; c++) {
-        // Search-space bounds bloat the cache and are unused by constellation.
         if (strncmp(table->labels[c], "sweep/", 6) == 0) {
             continue;
         }
@@ -1343,6 +1341,10 @@ int main(void) {
             Table* table = &data.tables[i];
             x = table_col(table, hyper_key[fig_x_idx]);
             y = table_col(table, hyper_key[fig_y_idx]);
+            int ladder = table_col(table, "selfplay/bot_ladder_perf");
+            if (fig_y_idx == 4 && ladder >= 0) {
+                y = ladder;
+            }
             z = use_3d ? table_col(table, hyper_key[fig_z_idx - 1]) : -1;
             if (fig_color_idx != 0) {
                 c = table_col(table, hyper_key[fig_color_idx - 1]);

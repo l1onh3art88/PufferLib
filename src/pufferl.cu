@@ -522,6 +522,9 @@ typedef struct {
 typedef struct PuffeRL {
     Policy* policies;        // [num_policies]; policies[0] trainable, rest frozen
     int num_policies;
+    int n_primary;
+    int primary_off;
+    int agents_per_buf;
     Weights actor_weights; // async rollout snapshot of policies[0]; unused when async=0
     Activations train_activs;
     Allocator weight_alloc;      // async actor weights
@@ -564,6 +567,30 @@ typedef struct PuffeRL {
     ulong seed;
     curandStatePhilox4_32_10_t** rng_states;  // per-buffer persistent RNG states [num_buffers]
     char env_name[64];  // For policy arch rebuild at create.
+    int ak_n;
+    float ak_beta_direct;
+    float ak_beta_return;
+    float ak_smooth;
+    float ak_baseline;
+    int ak_k_star;
+    int ak_A;
+    Policy ak_pol[4];
+    Prec ak_p_logits;
+    Prec ak_q_logits[4];
+    float* ak_kl[4];
+    float* ak_kl_star;
+    Prec ak_adv_div;
+    Prec ak_inv_len;
+    Prec ak_q_logp;
+    float ak_D[4];
+    float ak_R_mean;
+    int ak_online;
+    Activations* ak_learn_acts;
+    Prec* ak_learn_st;
+    Allocator ak_alloc;
+    Prec ak_adv_train;
+    Prec ak_inv_train;
+    Prec ak_q_train;
 } PuffeRL;
 
 // Infer path: sample + forward, then vec workers.
@@ -756,6 +783,25 @@ __global__ void zero_term_state(Prec state, Float terminals,
         return;
     }
     long i = state_elem_idx(layer, (int)state.shape[1], state_start + rel, h, H);
+    state.data[i] = from_float(0.0f);
+}
+
+__global__ void zero_term_prec(Prec state, const precision_t* terminals,
+        int count) {
+    int L = state.shape[0];
+    int H = state.shape[2];
+    int total = L * count * H;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int h = idx % H;
+    int rel = (idx / H) % count;
+    int layer = idx / (count * H);
+    if (to_float(terminals[rel]) == 0.0f) {
+        return;
+    }
+    long i = state_elem_idx(layer, (int)state.shape[1], rel, h, H);
     state.data[i] = from_float(0.0f);
 }
 
@@ -1435,6 +1481,61 @@ __global__ void transpose_102(float* dst, const float* src, int A, int B, int C)
 }
 #endif
 
+// src (T, B_full, C) → dst (n_pri*n_buf, T, C), taking [p0, p0+n_pri) per buffer.
+__global__ void transpose_102_primary(
+        precision_t* dst, const precision_t* src,
+        int T, int B_full, int C, int apb, int p0, int n_pri) {
+    int n_buf = B_full / apb;
+    int n_pri_tot = n_buf * n_pri;
+    int total = n_pri_tot * T * C;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int g = idx / (T * C);
+    int rem = idx % (T * C);
+    int t = rem / C;
+    int c = rem % C;
+    int src_a = (g / n_pri) * apb + p0 + (g % n_pri);
+    dst[idx] = src[(t * B_full + src_a) * C + c];
+}
+
+#if !defined(PRECISION_FLOAT)
+__global__ void transpose_102_primary(
+        float* dst, const float* src,
+        int T, int B_full, int C, int apb, int p0, int n_pri) {
+    int n_buf = B_full / apb;
+    int n_pri_tot = n_buf * n_pri;
+    int total = n_pri_tot * T * C;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int g = idx / (T * C);
+    int rem = idx % (T * C);
+    int t = rem / C;
+    int c = rem % C;
+    int src_a = (g / n_pri) * apb + p0 + (g % n_pri);
+    dst[idx] = src[(t * B_full + src_a) * C + c];
+}
+#endif
+
+__global__ void compact_primary_state(
+        precision_t* dst, const precision_t* src,
+        int L, int B_full, int H, int apb, int p0, int n_pri) {
+    int n_pri_tot = (B_full / apb) * n_pri;
+    int total = L * n_pri_tot * H;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int h = idx % H;
+    int g = (idx / H) % n_pri_tot;
+    int layer = idx / (H * n_pri_tot);
+    int src_a = (g / n_pri) * apb + p0 + (g % n_pri);
+    dst[idx] = src[(layer * B_full + src_a) * H + h];
+}
+
 // Cosine decay base → min over t in [0, T). Double for t/T (float loses
 // precision past 2^24). Caller passes epoch and total train epochs.
 float cosine_annealing(float base, float min_v, long t, long T) {
@@ -1457,6 +1558,318 @@ __global__ void puf_stamp(unsigned long long* dst) {
     *dst = t;
 }
 
+static void master_weights_setup(Float* mw, Prec* param,
+        bool cast_now, cudaStream_t stream);
+void puf_load_weights_into(Float dst, Prec params,
+        cudaStream_t stream, const char* path);
+
+static int archive_kl_parse_refs(const char* s, char out[4][4096]) {
+    int n = 0;
+    if (!s || !s[0] || strcmp(s, "None") == 0) {
+        return 0;
+    }
+    const char* p = s;
+    while (*p && n < 4) {
+        while (*p == ' ' || *p == ',') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        const char* e = p;
+        while (*e && *e != ',') {
+            e++;
+        }
+        int len = (int)(e - p);
+        while (len > 0 && p[len - 1] == ' ') {
+            len--;
+        }
+        if (len > 0 && len < 4096) {
+            memcpy(out[n], p, len);
+            out[n][len] = 0;
+            n++;
+        }
+        p = e;
+    }
+    return n;
+}
+
+static void archive_kl_init(PuffeRL* p, Ini* ini, int act_n) {
+    p->ak_beta_direct = puf_ini_get(ini, "archive_kl", "beta_direct");
+    p->ak_beta_return = puf_ini_get(ini, "archive_kl", "beta_return");
+    p->ak_online = (int)puf_ini_get(ini, "archive_kl", "online");
+    p->ak_smooth = puf_ini_get(ini, "archive_kl", "ref_smooth");
+    if (p->ak_smooth <= 0.0f) {
+        p->ak_smooth = 1.0e-4f;
+    }
+    char paths[4][4096];
+    int n_listed = archive_kl_parse_refs(
+        puf_ini_get_str(ini, "archive_kl", "refs"), paths);
+    if (p->ak_beta_direct == 0.0f && p->ak_beta_return == 0.0f) {
+        p->ak_n = 0;
+        return;
+    }
+    p->ak_n = n_listed;
+    int T = p->hypers.horizon;
+    int B = p->hypers.total_agents;
+    int A = act_n;
+    p->ak_A = A;
+    long TB = (long)T * B;
+    cudaMalloc((void**)&p->ak_p_logits.data, TB * (A + 1) * sizeof(precision_t));
+    p->ak_p_logits.shape[0] = T;
+    p->ak_p_logits.shape[1] = B;
+    p->ak_p_logits.shape[2] = A + 1;
+    p->ak_p_logits.shape[3] = 0;
+    cudaMalloc((void**)&p->ak_kl_star, TB * sizeof(float));
+    cudaMalloc((void**)&p->ak_adv_div.data, TB * sizeof(precision_t));
+    p->ak_adv_div.shape[0] = T;
+    p->ak_adv_div.shape[1] = B;
+    cudaMalloc((void**)&p->ak_inv_len.data, TB * sizeof(precision_t));
+    p->ak_inv_len.shape[0] = T;
+    p->ak_inv_len.shape[1] = B;
+    cudaMalloc((void**)&p->ak_q_logp.data, TB * A * sizeof(precision_t));
+    p->ak_q_logp.shape[0] = T;
+    p->ak_q_logp.shape[1] = B;
+    p->ak_q_logp.shape[2] = A;
+    int n_pri = p->vec->policy_layout[1] - p->vec->policy_layout[0];
+    int h = p->hypers.hidden_size;
+    int L = p->hypers.num_layers;
+    int nb = p->hypers.num_buffers;
+    for (int k = 0; k < 4; k++) {
+        Policy* pol = &p->ak_pol[k];
+        pol->frozen = true;
+        pol->arch = build_arch(OBS_SIZE, h, L, act_n, p->is_continuous, T);
+        pol->weights = weights_create(&pol->arch, &pol->params_alloc);
+        pol->buf_acts = (Activations*)calloc(1, nb * sizeof(Activations));
+        pol->buffer_states = (Prec*)calloc(1, nb * sizeof(Prec));
+        for (int i = 0; i < nb; i++) {
+            pol->buf_acts[i] = arch_reg_rollout(
+                &pol->arch, pol->weights, &pol->activ_alloc, n_pri);
+            pol->buffer_states[i] = {.shape = {L, n_pri, h}};
+            alloc_register(&pol->activ_alloc, &pol->buffer_states[i]);
+        }
+        alloc_create(&pol->params_alloc);
+        alloc_create(&pol->activ_alloc);
+        pol->param = {
+            .data = (precision_t*)pol->params_alloc.mem,
+            .shape = {pol->params_alloc.total_elems},
+        };
+        master_weights_setup(&pol->master_weights, &pol->param,
+            false, p->default_stream);
+        if (k < n_listed) {
+            puf_load_weights_into(pol->master_weights, pol->param,
+                p->default_stream, paths[k]);
+        }
+        cudaMalloc((void**)&p->ak_kl[k], TB * sizeof(float));
+        cudaMalloc((void**)&p->ak_q_logits[k].data,
+            TB * A * sizeof(precision_t));
+        p->ak_q_logits[k].shape[0] = T;
+        p->ak_q_logits[k].shape[1] = B;
+        p->ak_q_logits[k].shape[2] = A;
+    }
+    p->ak_learn_acts = (Activations*)calloc(1, nb * sizeof(Activations));
+    p->ak_learn_st = (Prec*)calloc(1, nb * sizeof(Prec));
+    Policy* prim = &p->policies[0];
+    for (int i = 0; i < nb; i++) {
+        p->ak_learn_acts[i] = arch_reg_rollout(
+            &prim->arch, prim->weights, &p->ak_alloc, n_pri);
+        p->ak_learn_st[i] = {.shape = {L, n_pri, h}};
+        alloc_register(&p->ak_alloc, &p->ak_learn_st[i]);
+    }
+    alloc_create(&p->ak_alloc);
+    int np = p->n_primary;
+    long Tnp = (long)T * np;
+    cudaMalloc((void**)&p->ak_adv_train.data, Tnp * sizeof(precision_t));
+    p->ak_adv_train.shape[0] = np;
+    p->ak_adv_train.shape[1] = T;
+    cudaMalloc((void**)&p->ak_inv_train.data, Tnp * sizeof(precision_t));
+    p->ak_inv_train.shape[0] = np;
+    p->ak_inv_train.shape[1] = T;
+    cudaMalloc((void**)&p->ak_q_train.data, Tnp * A * sizeof(precision_t));
+    p->ak_q_train.shape[0] = np;
+    p->ak_q_train.shape[1] = T;
+    p->ak_q_train.shape[2] = A;
+    cudaMemset(p->ak_adv_div.data, 0, TB * sizeof(precision_t));
+    cudaMemset(p->ak_inv_len.data, 0, TB * sizeof(precision_t));
+    cudaMemset(p->ak_q_logp.data, 0, TB * A * sizeof(precision_t));
+    cudaMemset(p->ak_adv_train.data, 0, Tnp * sizeof(precision_t));
+    cudaMemset(p->ak_inv_train.data, 0, Tnp * sizeof(precision_t));
+    cudaMemset(p->ak_q_train.data, 0, Tnp * A * sizeof(precision_t));
+    cudaDeviceSynchronize();
+}
+
+static int archive_kl_admit(PuffeRL* p, const char* dir, const char* skip) {
+    if (!p->ak_online || (p->ak_beta_direct == 0.0f && p->ak_beta_return == 0.0f)) {
+        return 0;
+    }
+    DIR* dp = opendir(dir);
+    if (!dp) {
+        return 0;
+    }
+    char paths[64][4096];
+    long steps[64];
+    int n = 0;
+    struct dirent* ent;
+    while ((ent = readdir(dp)) && n < 64) {
+        const char* name = ent->d_name;
+        int len = (int)strlen(name);
+        if (len < 5 || strcmp(name + len - 4, ".bin") != 0) {
+            continue;
+        }
+        snprintf(paths[n], sizeof(paths[n]), "%s/%s", dir, name);
+        if (skip && strcmp(paths[n], skip) == 0) {
+            continue;
+        }
+        steps[n] = strtol(name, NULL, 10);
+        if (steps[n] <= 0) {
+            continue;
+        }
+        n++;
+    }
+    closedir(dp);
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (steps[j] > steps[i]) {
+                long ts = steps[i];
+                steps[i] = steps[j];
+                steps[j] = ts;
+                char tmp[4096];
+                memcpy(tmp, paths[i], 4096);
+                memcpy(paths[i], paths[j], 4096);
+                memcpy(paths[j], tmp, 4096);
+            }
+        }
+    }
+    int take = n < 4 ? n : 4;
+    for (int k = 0; k < take; k++) {
+        puf_load_weights_into(p->ak_pol[k].master_weights, p->ak_pol[k].param,
+            p->default_stream, paths[k]);
+        int nb = p->hypers.num_buffers;
+        for (int i = 0; i < nb; i++) {
+            cudaMemset(p->ak_pol[k].buffer_states[i].data, 0,
+                numel(p->ak_pol[k].buffer_states[i].shape) * sizeof(precision_t));
+        }
+    }
+    p->ak_n = take;
+    cudaDeviceSynchronize();
+    return take;
+}
+
+static void archive_kl_collect(PuffeRL* p, RolloutBuf src) {
+    if (p->ak_n <= 0) {
+        return;
+    }
+    int T = src.observations.shape[0];
+    int B = src.observations.shape[1];
+    int A = p->ak_A;
+    int* layout = p->vec->policy_layout;
+    int off = layout[0];
+    int n_pri = layout[1] - off;
+    int apb = p->hypers.total_agents / p->hypers.num_buffers;
+    int nb = p->hypers.num_buffers;
+    int L = p->hypers.num_layers;
+    int H = p->hypers.hidden_size;
+    cudaStream_t stream = p->train_stream;
+    int slot = p->hypers.async ? p->async_ready_slot : 0;
+    Policy* prim = &p->policies[0];
+    Weights* lw = p->hypers.async ? &p->actor_weights : &prim->weights;
+    for (int buf = 0; buf < nb; buf++) {
+        int sub = buf * apb + off;
+        Prec dst = p->ak_learn_st[buf];
+        if (p->hypers.reset_every_horizon || src.initial_states.data == NULL) {
+            cudaMemsetAsync(dst.data, 0,
+                numel(dst.shape) * sizeof(precision_t), stream);
+        } else {
+            Prec full = init_slot(src.initial_states, slot);
+            for (int layer = 0; layer < L; layer++) {
+                cudaMemcpyAsync(
+                    dst.data + (long)layer * n_pri * H,
+                    full.data + ((long)layer * B + sub) * H,
+                    (long)n_pri * H * sizeof(precision_t),
+                    cudaMemcpyDeviceToDevice, stream);
+            }
+        }
+    }
+    for (int t = 0; t < T; t++) {
+        for (int buf = 0; buf < nb; buf++) {
+            int sub = buf * apb + off;
+            Prec obs = puf_slice(src.observations, t, sub, n_pri);
+            Prec term = puf_slice(src.terminals, t, sub, n_pri);
+            Prec mask = puf_slice(src.action_mask, t, sub, n_pri);
+            int state_n = L * n_pri * H;
+            zero_term_prec<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                p->ak_learn_st[buf], term.data, n_pri);
+            Prec pdec = arch_forward(&prim->arch, *lw,
+                p->ak_learn_acts[buf], obs, p->ak_learn_st[buf], stream);
+            cudaMemcpyAsync(
+                p->ak_p_logits.data + ((long)t * B + sub) * (A + 1),
+                pdec.data, (long)n_pri * (A + 1) * sizeof(precision_t),
+                cudaMemcpyDeviceToDevice, stream);
+            for (int k = 0; k < p->ak_n; k++) {
+                Policy* rp = &p->ak_pol[k];
+                zero_term_prec<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                    rp->buffer_states[buf], term.data, n_pri);
+                Prec qdec = arch_forward(&rp->arch, rp->weights,
+                    rp->buf_acts[buf], obs, rp->buffer_states[buf], stream);
+                archive_kl_heads<<<grid_size(n_pri), BLOCK_SIZE, 0, stream>>>(
+                    pdec.data,
+                    qdec.data, mask.data, p->act_sizes,
+                    p->ak_kl[k] + t * B + sub,
+                    p->ak_q_logits[k].data + ((long)t * B + sub) * A,
+                    p->ak_smooth, n_pri, A);
+            }
+        }
+    }
+    cudaStreamSynchronize(stream);
+    precision_t* term_h = (precision_t*)malloc((long)T * B * sizeof(precision_t));
+    cudaMemcpy(term_h, src.terminals.data, (long)T * B * sizeof(precision_t),
+        cudaMemcpyDeviceToHost);
+    float best = 1.0e30f;
+    p->ak_k_star = 0;
+    for (int k = 0; k < p->ak_n; k++) {
+        float* h = (float*)malloc((long)T * B * sizeof(float));
+        cudaMemcpy(h, p->ak_kl[k], (long)T * B * sizeof(float),
+            cudaMemcpyDeviceToHost);
+        double s = 0;
+        long n = 0;
+        for (int buf = 0; buf < nb; buf++) {
+            int sub = buf * apb + off;
+            for (int b = 0; b < n_pri; b++) {
+                int t0 = 0;
+                for (int t = 0; t < T; t++) {
+                    if (to_float(term_h[t * B + sub + b]) <= 0.5f) {
+                        continue;
+                    }
+                    int Te = t - t0 + 1;
+                    for (int u = t0; u <= t; u++) {
+                        s += h[u * B + sub + b];
+                    }
+                    n += Te;
+                    t0 = t + 1;
+                }
+            }
+        }
+        p->ak_D[k] = n ? (float)(s / n) : 0.0f;
+        if (p->ak_D[k] < best) {
+            best = p->ak_D[k];
+            p->ak_k_star = k;
+        }
+        free(h);
+    }
+    free(term_h);
+    int ks = p->ak_k_star;
+    cudaMemcpy(p->ak_kl_star, p->ak_kl[ks],
+        (long)T * B * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaMemcpy(p->ak_q_logp.data, p->ak_q_logits[ks].data,
+        (long)T * B * A * sizeof(precision_t), cudaMemcpyDeviceToDevice);
+    archive_kl_episodes<<<grid_size(B), BLOCK_SIZE, 0, stream>>>(
+        p->ak_kl_star, src.terminals.data, p->ak_adv_div.data,
+        p->ak_inv_len.data, p->ak_baseline, T, B);
+    cudaStreamSynchronize(stream);
+    p->ak_R_mean = p->ak_D[ks];
+    p->ak_baseline = 0.99f * p->ak_baseline + 0.01f * p->ak_R_mean;
+}
+
 static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         cudaStream_t stream) {
     Hypers* hypers = &pufferl->hypers;
@@ -1466,23 +1879,42 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
 
     int T = src.observations.shape[0];
     int B = src.observations.shape[1];
+    int n_pri = pufferl->n_primary;
+    int apb = pufferl->agents_per_buf;
+    int p0 = pufferl->primary_off;
+    int n_pri_buf = pufferl->vec->policy_layout[1] - pufferl->vec->policy_layout[0];
     int obs_size = (int)src.observations.shape[2];
     int num_atns = (int)src.actions.shape[2];
     int mask_c = src.action_mask.shape[2];
-    transpose_102<<<grid_size(T * B * obs_size), BLOCK_SIZE, 0, stream>>>(
-        rollouts->observations.data, src.observations.data, T, B, obs_size);
-    transpose_102<<<grid_size(T * B * num_atns), BLOCK_SIZE, 0, stream>>>(
-        rollouts->actions.data, src.actions.data, T, B, num_atns);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->logprobs.data, src.logprobs.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->rewards.data, src.rewards.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->terminals.data, src.terminals.data, T, B, 1);
-    transpose_102<<<grid_size(T * B), BLOCK_SIZE, 0, stream>>>(
-        rollouts->values.data, src.values.data, T, B, 1);
-    transpose_102<<<grid_size(T * B * mask_c), BLOCK_SIZE, 0, stream>>>(
-        rollouts->action_mask.data, src.action_mask.data, T, B, mask_c);
+    transpose_102_primary<<<grid_size(T * n_pri * obs_size), BLOCK_SIZE, 0, stream>>>(
+        rollouts->observations.data, src.observations.data,
+        T, B, obs_size, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri * num_atns), BLOCK_SIZE, 0, stream>>>(
+        rollouts->actions.data, src.actions.data,
+        T, B, num_atns, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+        rollouts->logprobs.data, src.logprobs.data, T, B, 1, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+        rollouts->rewards.data, src.rewards.data, T, B, 1, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+        rollouts->terminals.data, src.terminals.data, T, B, 1, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+        rollouts->values.data, src.values.data, T, B, 1, apb, p0, n_pri_buf);
+    transpose_102_primary<<<grid_size(T * n_pri * mask_c), BLOCK_SIZE, 0, stream>>>(
+        rollouts->action_mask.data, src.action_mask.data,
+        T, B, mask_c, apb, p0, n_pri_buf);
+    if (pufferl->ak_beta_direct != 0.0f || pufferl->ak_beta_return != 0.0f) {
+        int A = pufferl->ak_A;
+        transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+            pufferl->ak_adv_train.data, pufferl->ak_adv_div.data,
+            T, B, 1, apb, p0, n_pri_buf);
+        transpose_102_primary<<<grid_size(T * n_pri), BLOCK_SIZE, 0, stream>>>(
+            pufferl->ak_inv_train.data, pufferl->ak_inv_len.data,
+            T, B, 1, apb, p0, n_pri_buf);
+        transpose_102_primary<<<grid_size(T * n_pri * A), BLOCK_SIZE, 0, stream>>>(
+            pufferl->ak_q_train.data, pufferl->ak_q_logp.data,
+            T, B, A, apb, p0, n_pri_buf);
+    }
 
     clamp_precision_kernel<<<grid_size(
         numel(rollouts->rewards.shape)), BLOCK_SIZE, 0, stream>>>(
@@ -1493,23 +1925,26 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
             numel(pufferl->train_state.shape) * sizeof(precision_t), stream);
     } else {
         Prec slot_st = init_slot(src.initial_states, slot);
-        cudaMemcpyAsync(pufferl->train_state.data, slot_st.data,
-            numel(pufferl->train_state.shape) * sizeof(precision_t),
-            cudaMemcpyDeviceToDevice, stream);
+        int L = (int)pufferl->train_state.shape[0];
+        int H = (int)pufferl->train_state.shape[2];
+        compact_primary_state<<<grid_size(L * n_pri * H), BLOCK_SIZE, 0, stream>>>(
+            pufferl->train_state.data, slot_st.data,
+            L, B, H, apb, p0, n_pri_buf);
     }
     puf_stamp<<<1, 1, 0, stream>>>(st + TE_MID);
 
-    int batch_size = hypers->total_agents * hypers->horizon;
+    int batch_size = n_pri * hypers->horizon;
     int mb_segs = hypers->minibatch_size / hypers->horizon;
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     int n_rows = (int)rollouts->observations.shape[0];
+    int span = n_rows - n_rows % mb_segs;
     int Nmb = (int)pufferl->train_buf.mb_advantages.shape[0];
     int Tmb = (int)pufferl->train_buf.mb_advantages.shape[1];
     constexpr int ADV_THREADS = 64;
     int adv_grid = (Nmb + ADV_THREADS - 1) / ADV_THREADS;
     Policy* primary = &pufferl->policies[0];
     for (int mb = 0; mb < total_minibatches; ++mb) {
-        int dest_off = (mb * mb_segs) % n_rows;
+        int dest_off = (mb * mb_segs) % span;
         TrainGraph graph = pufferl->train_buf;
         graph.mb_obs = slice_rows(rollouts->observations, dest_off, Nmb);
         graph.mb_actions = slice_rows(rollouts->actions, dest_off, Nmb);
@@ -1519,6 +1954,13 @@ static void train_epoch_gpu(PuffeRL* pufferl, RolloutBuf src, int slot,
         graph.mb_values = slice_rows(rollouts->values, dest_off, Nmb);
         graph.mb_action_mask = slice_rows(rollouts->action_mask, dest_off, Nmb);
         graph.mb_state = pufferl->train_state;
+        if (pufferl->ak_beta_direct != 0.0f || pufferl->ak_beta_return != 0.0f) {
+            graph.mb_adv_div = slice_rows(pufferl->ak_adv_train, dest_off, Nmb);
+            graph.mb_inv_len = slice_rows(pufferl->ak_inv_train, dest_off, Nmb);
+            graph.mb_q_logp = slice_rows(pufferl->ak_q_train, dest_off, Nmb);
+            graph.beta_direct = pufferl->ak_beta_direct;
+            graph.beta_return = pufferl->ak_beta_return;
+        }
         DecoderWeights* dw_train = (DecoderWeights*)primary->weights.decoder;
         Prec p_logstd = {};
         if (dw_train->continuous) {
@@ -1602,6 +2044,7 @@ void train_impl(PuffeRL* pufferl, RolloutBuf* src_arg) {
         sizeof(float), cudaMemcpyHostToDevice, train_stream);
 
     int slot = hypers->async ? pufferl->async_ready_slot : 0;
+    archive_kl_collect(pufferl, src);
     int total_minibatches = hypers->replay_ratio * batch_size / hypers->minibatch_size;
     bool first = hypers->cudagraphs && pufferl->train_cudagraph[slot] == NULL;
     profile_begin("train_forward_backward", hypers->profile);
@@ -1730,6 +2173,15 @@ void puf_save_weights(PuffeRL* p, const char* path) {
     assert(fp && "failed to open weights for writing");
     assert(fwrite(buf, 1, nbytes, fp) == (size_t)nbytes
         && "failed to write weights");
+    int64_t epoch = p->epoch;
+    int64_t step = p->global_step;
+    assert(fwrite(&epoch, sizeof(epoch), 1, fp) == 1);
+    assert(fwrite(&step, sizeof(step), 1, fp) == 1);
+    int64_t nmb = numel(p->muon.mb.shape);
+    char* mb = (char*)malloc(nmb * sizeof(float));
+    cudaMemcpy(mb, p->muon.mb.data, nmb * sizeof(float), cudaMemcpyDeviceToHost);
+    assert(fwrite(mb, sizeof(float), nmb, fp) == (size_t)nmb);
+    free(mb);
     fclose(fp);
     free(buf);
     assert(rename(tmp, path) == 0 && "failed to publish weights");
@@ -1759,6 +2211,40 @@ void pufferl_load_policy(PuffeRL* pufferl, int i, const char* path) {
     puf_load_weights_into(pol->master_weights, pol->param,
         pufferl->default_stream, path);
     cudaDeviceSynchronize();
+}
+
+static void puf_load_train_state(PuffeRL* p, const char* path) {
+    int64_t nbytes = numel(p->policies[0].master_weights.shape) * sizeof(float);
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        return;
+    }
+    if (fseek(fp, nbytes, SEEK_SET) != 0) {
+        fclose(fp);
+        return;
+    }
+    int64_t epoch = 0, step = 0;
+    if (fread(&epoch, sizeof(epoch), 1, fp) != 1
+            || fread(&step, sizeof(step), 1, fp) != 1) {
+        fclose(fp);
+        return;
+    }
+    int64_t nmb = numel(p->muon.mb.shape);
+    char* mb = (char*)malloc(nmb * sizeof(float));
+    if (fread(mb, sizeof(float), nmb, fp) != (size_t)nmb) {
+        free(mb);
+        fclose(fp);
+        return;
+    }
+    cudaMemcpy(p->muon.mb.data, mb, nmb * sizeof(float), cudaMemcpyHostToDevice);
+    free(mb);
+    fclose(fp);
+    p->epoch = epoch;
+    p->global_step = step;
+    if (p->hypers.async) {
+        puf_copy(&p->actor_param, &p->policies[0].param, p->default_stream);
+        cudaStreamSynchronize(p->default_stream);
+    }
 }
 
 // fp32 master weights: alias param buffer in float mode; separate fp32 copy in bf16.
@@ -1916,6 +2402,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     int B_TT = minibatch_segments * hypers.horizon;
     int horizon = hypers.horizon;
     int agents_per_buf = total_agents / num_buffers;
+    pufferl->agents_per_buf = agents_per_buf;
+    pufferl->primary_off = vec->policy_layout[0];
+    pufferl->n_primary = (vec->policy_layout[1] - vec->policy_layout[0])
+        * num_buffers;
 
     // Dedicated learner stream (always non-default; nonblocking when async).
     if (hypers.async) {
@@ -1982,10 +2472,10 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     }
     register_train_buffers(pufferl->train_buf, acts, minibatch_segments, horizon);
     register_rollout_buffers(&pufferl->train_rollouts,
-        acts, total_agents, horizon, input_size, num_action_heads, act_n);
+        acts, pufferl->n_primary, horizon, input_size, num_action_heads, act_n);
     register_ppo_buffers(pufferl->ppo_bufs, acts, minibatch_segments,
         hypers.horizon, decoder_output_size, is_continuous);
-    pufferl->train_state = {.shape = {num_layers, total_agents, hidden_size}};
+    pufferl->train_state = {.shape = {num_layers, pufferl->n_primary, hidden_size}};
     alloc_register(acts, &pufferl->train_state);
 
     cudaMalloc((void**)&pufferl->rng_offset, (num_buffers + 1) * sizeof(long));
@@ -2087,6 +2577,7 @@ PuffeRL* create_pufferl(Ini* ini, TrainContext* ctx) {
     pufferl->last_log_step = 0;
 
     dict_clear(&vec_kwargs);
+    archive_kl_init(pufferl, ini, act_n);
     return pufferl;
 }
 
@@ -2959,6 +3450,7 @@ static PuffeRL* eval_make(Ini* ini, TrainContext* ctx, int mode, int render) {
         const char* path = puf_checkpoint_path_key(ini, "load_model_path", buf, sizeof(buf));
         if (path) {
             pufferl_load_policy(p, 0, path);
+            puf_load_train_state(p, path);
         }
     }
     return p;
@@ -3027,6 +3519,13 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     }
 
     PuffeRL* pufferl = create_pufferl(ini, ctx);
+    char load_buf[4096];
+    const char* load_path = puf_checkpoint_path_key(ini, "load_model_path",
+        load_buf, sizeof(load_buf));
+    if (load_path) {
+        pufferl_load_policy(pufferl, 0, load_path);
+        puf_load_train_state(pufferl, load_path);
+    }
     Selfplay selfplay = {0};
     if (use_selfplay) {
         char initial_checkpoint[4096];
@@ -3045,6 +3544,25 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         long current_step = pufferl->global_step * pufferl->hypers.world_size;
 
         selfplay_add_checkpoint(&selfplay, initial_checkpoint);
+        const char* pool_str = puf_ini_get_str(ini, "selfplay", "seed_pool");
+        if (pool_str && pool_str[0] && strcmp(pool_str, "None") != 0) {
+            const char* p = pool_str;
+            while (*p) {
+                while (*p == ' ' || *p == ',') p++;
+                if (!*p) break;
+                const char* e = p;
+                while (*e && *e != ',') e++;
+                int len = (int)(e - p);
+                while (len > 0 && p[len - 1] == ' ') len--;
+                if (len > 0 && len < SELFPLAY_PATH_MAX) {
+                    char path[SELFPLAY_PATH_MAX];
+                    memcpy(path, p, len);
+                    path[len] = 0;
+                    selfplay_add_checkpoint(&selfplay, path);
+                }
+                p = e;
+            }
+        }
         for (int s = 0; s < selfplay.num_hist; s++) {
             SelfplayHist* hist = &selfplay.hist[s];
             hist->policy_idx = s + 1;
@@ -3068,7 +3586,7 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
     TrainResult result = {0};
     char final_checkpoint[4096] = {0};
 
-    for (long epoch = 0; epoch < train_epochs; epoch++) {
+    for (long epoch = pufferl->epoch; epoch < train_epochs; epoch++) {
         if (pufferl->hypers.async) {
             // Cleanba 2-slot: warmup fills slot 0; then collect into write
             // while training the other slot (exactly one epoch old).
@@ -3120,6 +3638,9 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
         if (use_selfplay && saved_checkpoint[0]) {
             selfplay_add_checkpoint(&selfplay, saved_checkpoint);
         }
+        if (saved_checkpoint[0]) {
+            archive_kl_admit(pufferl, checkpoint_dir, saved_checkpoint);
+        }
 
         // Opponent swap mid-episode: treat as truncate + reset (not boundary wait).
         if (use_selfplay && selfplay.opp_timeout_steps > 0) {
@@ -3163,6 +3684,16 @@ TrainResult run_train(Ini* ini, TrainContext* ctx) {
             dict_set(&new_log, LOSS_NAMES[i], losses_host[i] * inv_n);
         }
         cudaMemset(pufferl->losses, 0, NUM_LOSSES * sizeof(float));
+        if (pufferl->ak_n > 0) {
+            dict_set(&new_log, "archive_kl/k_star", (double)pufferl->ak_k_star);
+            dict_set(&new_log, "archive_kl/R", (double)pufferl->ak_R_mean);
+            dict_set(&new_log, "archive_kl/smooth", (double)pufferl->ak_smooth);
+            for (int k = 0; k < pufferl->ak_n; k++) {
+                char key[32];
+                snprintf(key, sizeof(key), "archive_kl/D_%d", k);
+                dict_set(&new_log, key, (double)pufferl->ak_D[k]);
+            }
+        }
 
         log_util(pufferl, &new_log);
 
