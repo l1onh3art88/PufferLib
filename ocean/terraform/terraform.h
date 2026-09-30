@@ -704,16 +704,6 @@ void puf_step(Terraform* env) {
         if (dozer->y >= env->size) {
             dozer->y = env->size - 1;
         }
-
-        // Teleportitis
-        if (env->tick % 512 == 0) {
-             do {
-                 env->dozers[i].x = rand_r(&env->rng) % env->size;
-                 env->dozers[i].y = rand_r(&env->rng) % env->size;
-                 env->stuck_count[i] = 0;
-             } while (env->map[map_idx(env, env->dozers[i].x, env->dozers[i].y)] != 0.0f);
-        }
- 
     }
     int marked_to_skip[env->num_agents];
     memset(marked_to_skip, 0, env->num_agents*sizeof(int));
